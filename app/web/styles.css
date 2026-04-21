@@ -884,8 +884,11 @@ a { color: inherit; }
   font-weight: 800;
 }
 .avatar {
+  flex: 0 0 34px;
+  min-width: 34px;
   width: 34px;
   height: 34px;
+  aspect-ratio: 1 / 1;
   background: linear-gradient(160deg, #12a18c 0%, #0e6a61 100%);
   color: #f8fffd;
   font-size: 14px;
