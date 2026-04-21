@@ -2,8 +2,10 @@ import app.db.session as session_module
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy import inspect
+from sqlalchemy.exc import OperationalError
 
 from app.db.session import _is_sqlite_url
+from app.db.session import _build_connect_args
 from app.db.session import _should_run_legacy_init
 
 
@@ -19,6 +21,16 @@ from app.db.session import _should_run_legacy_init
 )
 def test_is_sqlite_url_recognizes_only_sqlite_urls(database_url: str, expected: bool):
     assert _is_sqlite_url(database_url) is expected
+
+
+def test_build_connect_args_uses_sqlite_thread_flag():
+    assert _build_connect_args("sqlite:///./local.db", 5) == {"check_same_thread": False}
+
+
+def test_build_connect_args_uses_connect_timeout_for_postgresql():
+    assert _build_connect_args("postgresql+psycopg://user:pass@localhost:5432/caibao", 5) == {
+        "connect_timeout": 5
+    }
 
 
 def test_legacy_init_cannot_be_enabled_for_postgresql():
@@ -50,6 +62,18 @@ def test_legacy_init_defaults_to_false_for_postgresql_in_dev():
         )
         is False
     )
+
+
+def test_init_db_wraps_database_connection_errors(monkeypatch):
+    monkeypatch.setattr(session_module, "_should_run_legacy_init", lambda *_: False)
+
+    def _raise_operational_error():
+        raise OperationalError("SELECT 1", {}, Exception("boom"))
+
+    monkeypatch.setattr(session_module, "_ensure_schema_is_alembic_head", _raise_operational_error)
+
+    with pytest.raises(RuntimeError, match="Database connection failed during application startup"):
+        session_module.init_db()
 
 
 def test_ensure_phase1_columns_adds_auth_columns_to_legacy_users_table(tmp_path, monkeypatch):

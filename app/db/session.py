@@ -2,12 +2,14 @@ import hashlib
 from collections.abc import Generator
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine
 from sqlalchemy import inspect
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
@@ -18,10 +20,18 @@ def _is_sqlite_url(database_url: str) -> bool:
     return database_url.strip().lower().startswith("sqlite")
 
 
+def _build_connect_args(database_url: str, connect_timeout_seconds: int | None) -> dict[str, Any]:
+    if _is_sqlite_url(database_url):
+        return {"check_same_thread": False}
+    if connect_timeout_seconds is None or connect_timeout_seconds <= 0:
+        return {}
+    return {"connect_timeout": int(connect_timeout_seconds)}
+
+
 settings = get_settings()
 
 is_sqlite = _is_sqlite_url(settings.database_url)
-connect_args = {"check_same_thread": False} if is_sqlite else {}
+connect_args = _build_connect_args(settings.database_url, settings.db_connect_timeout_seconds)
 
 engine = create_engine(
     settings.database_url,
@@ -47,30 +57,37 @@ def get_db_session() -> Generator[Session, None, None]:
 
 
 def init_db() -> None:
-    from app.models import (  # noqa: F401
-        answer_favorite,
-        chat_history,
-        chunk_embedding,
-        conclusion,
-        conversation,
-        document,
-        document_chunk,
-        embedding_model_config,
-        incident,
-        llm_model_config,
-        memory_card,
-        memory_card_embedding,
-        project_space,
-        team,
-        user,
-    )
+    try:
+        from app.models import (  # noqa: F401
+            answer_favorite,
+            chat_history,
+            chunk_embedding,
+            conclusion,
+            conversation,
+            document,
+            document_chunk,
+            embedding_model_config,
+            incident,
+            llm_model_config,
+            memory_card,
+            memory_card_embedding,
+            project_space,
+            team,
+            user,
+        )
 
-    if _should_run_legacy_init(settings.database_url, settings.app_env, settings.db_legacy_init_enabled):
-        Base.metadata.create_all(bind=engine)
-        _ensure_phase1_columns()
-        return
+        if _should_run_legacy_init(settings.database_url, settings.app_env, settings.db_legacy_init_enabled):
+            Base.metadata.create_all(bind=engine)
+            _ensure_phase1_columns()
+            return
 
-    _ensure_schema_is_alembic_head()
+        _ensure_schema_is_alembic_head()
+    except OperationalError as exc:
+        raise RuntimeError(
+            "Database connection failed during application startup. "
+            "Check DATABASE_URL in .env. For local development, either start PostgreSQL "
+            "or switch DATABASE_URL to a SQLite URL such as 'sqlite:///./CaiBao.db'."
+        ) from exc
 
 
 def _should_run_legacy_init(database_url: str, app_env: str, explicit: bool | None) -> bool:

@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     app_env: str = "dev"
     api_prefix: str = "/api/v1"
     database_url: str
+    db_connect_timeout_seconds: int = 5
     auth_jwt_secret: str = "dev-auth-secret-change-me"
     auth_jwt_algorithm: str = "HS256"
     auth_access_token_ttl_minutes: int = 15
