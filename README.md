@@ -4,6 +4,78 @@
   <img src="./caibao_pic.png" alt="CaiBao 项目预览" width="720">
 </p>
 
+## 快速开始
+
+### 本地 Python 运行
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Windows PowerShell 可将激活命令替换为：
+
+```powershell
+.venv\Scripts\Activate.ps1
+Copy-Item .env.example .env
+```
+
+启动后可访问：
+
+- 前端首页：`http://localhost:8000/`
+- 健康检查：`http://localhost:8000/api/v1/health`
+
+## Docker 运行
+
+### 1. 准备环境变量
+
+```bash
+cp .env.example .env
+```
+
+至少建议修改以下配置后再启动：
+
+- `AUTH_JWT_SECRET`
+- `POSTGRES_PASSWORD`
+- `LLM_API_KEY`（如果你要接真实模型）
+
+### 2. 启动服务
+
+```bash
+docker compose up --build -d
+```
+
+默认会启动两项服务：
+
+- `postgres`：PostgreSQL 16
+- `caibao-api`：FastAPI + Alembic 自动迁移
+
+### 3. 常用命令
+
+```bash
+docker compose ps
+docker compose logs -f caibao-api
+docker compose down
+```
+
+如需连同数据库卷一起清理：
+
+```bash
+docker compose down -v
+```
+
+当前 Docker 镜像已经补齐：
+
+- PostgreSQL 运行环境
+- Alembic 启动迁移
+- `/data` 持久化卷
+- 容器健康检查
+- 非 root 用户运行
+- `tesseract-ocr` + `tesseract-ocr-chi-sim`，支持容器内中文 OCR
+
 ## changelogs
 
 - **v0.1.0**：后端 MVP + 前端基础页面

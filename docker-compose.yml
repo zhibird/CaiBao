@@ -1,13 +1,13 @@
 services:
   postgres:
-    image: postgres:16
+    image: postgres:16-alpine
     container_name: caibao-postgres
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-caibao}
       POSTGRES_USER: ${POSTGRES_USER:-caibao}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-caibao}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - caibao_postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -23,24 +23,61 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: caibao-api
+    init: true
     depends_on:
       postgres:
         condition: service_healthy
     ports:
-      - "8000:8000"
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
     environment:
-      APP_ENV: prod
+      APP_NAME: "${APP_NAME:-CaiBao}"
+      APP_VERSION: "${APP_VERSION:-0.13.0}"
+      APP_ENV: "${APP_ENV:-prod}"
+      API_PREFIX: "${API_PREFIX:-/api/v1}"
       DB_LEGACY_INIT_ENABLED: "false"
       PYTHONPATH: /app
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-caibao}:${POSTGRES_PASSWORD:-caibao}@postgres:5432/${POSTGRES_DB:-caibao}
+      DATABASE_URL: "postgresql+psycopg://${POSTGRES_USER:-caibao}:${POSTGRES_PASSWORD:-caibao}@postgres:5432/${POSTGRES_DB:-caibao}"
       UPLOAD_ROOT_DIR: /data/uploads
-      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
-      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
-      LLM_API_KEY: ${LLM_API_KEY:-}
-      LLM_MODEL: ${LLM_MODEL:-gpt-4.1-mini}
-      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.2}
-      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-512}
-      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-30}
+      UPLOAD_MAX_FILE_SIZE_MB: "${UPLOAD_MAX_FILE_SIZE_MB:-20}"
+      AUTH_JWT_SECRET: "${AUTH_JWT_SECRET:-change-me-before-production}"
+      AUTH_JWT_ALGORITHM: "${AUTH_JWT_ALGORITHM:-HS256}"
+      AUTH_ACCESS_TOKEN_TTL_MINUTES: "${AUTH_ACCESS_TOKEN_TTL_MINUTES:-15}"
+      AUTH_REFRESH_TOKEN_TTL_DAYS: "${AUTH_REFRESH_TOKEN_TTL_DAYS:-14}"
+      AUTH_COOKIE_SECURE: "${AUTH_COOKIE_SECURE:-false}"
+      AUTH_COOKIE_DOMAIN: "${AUTH_COOKIE_DOMAIN:-}"
+      AUTH_COOKIE_SAMESITE: "${AUTH_COOKIE_SAMESITE:-lax}"
+      AUTH_ACCESS_COOKIE_NAME: "${AUTH_ACCESS_COOKIE_NAME:-caibao_access_token}"
+      AUTH_REFRESH_COOKIE_NAME: "${AUTH_REFRESH_COOKIE_NAME:-caibao_refresh_token}"
+      DEV_ADMIN_ENABLED: "${DEV_ADMIN_ENABLED:-true}"
+      DEV_ADMIN_ACCOUNT_ID: "${DEV_ADMIN_ACCOUNT_ID:-dev_admin}"
+      DEV_ADMIN_DISPLAY_NAME: "${DEV_ADMIN_DISPLAY_NAME:-Developer Admin}"
+      DEV_ADMIN_TOKEN: "${DEV_ADMIN_TOKEN:-dev-admin-token}"
+      LLM_PROVIDER: "${LLM_PROVIDER:-mock}"
+      LLM_BASE_URL: "${LLM_BASE_URL:-https://api.openai.com/v1}"
+      LLM_API_KEY: "${LLM_API_KEY:-}"
+      LLM_MODEL: "${LLM_MODEL:-gpt-4.1-mini}"
+      LLM_TEMPERATURE: "${LLM_TEMPERATURE:-0.2}"
+      LLM_MAX_TOKENS: "${LLM_MAX_TOKENS:-2048}"
+      LLM_TIMEOUT_SECONDS: "${LLM_TIMEOUT_SECONDS:-30}"
+      EMBEDDING_PROVIDER: "${EMBEDDING_PROVIDER:-mock}"
+      EMBEDDING_BASE_URL: "${EMBEDDING_BASE_URL:-https://api.openai.com/v1}"
+      EMBEDDING_API_KEY: "${EMBEDDING_API_KEY:-}"
+      EMBEDDING_MODEL: "${EMBEDDING_MODEL:-text-embedding-3-small}"
+      EMBEDDING_MOCK_DIM: "${EMBEDDING_MOCK_DIM:-256}"
+      EMBEDDING_BATCH_SIZE: "${EMBEDDING_BATCH_SIZE:-32}"
+      EMBEDDING_TIMEOUT_SECONDS: "${EMBEDDING_TIMEOUT_SECONDS:-30}"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health', timeout=3).read()
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
     volumes:
       - caibao_data:/data
     restart: unless-stopped
