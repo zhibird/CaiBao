@@ -153,6 +153,8 @@ function bindElements() {
   els.addModelBtn = document.getElementById("addModelBtn");
   els.addEmbeddingBtn = document.getElementById("addEmbeddingBtn");
   els.modelSelect = document.getElementById("settingsModelSelect");
+  els.quickModelSelect = document.getElementById("quickModelSelect");
+  els.quickModelManageBtn = document.getElementById("quickModelManageBtn");
   els.embeddingSelect = document.getElementById("settingsEmbeddingSelect");
   els.refreshAllBtn = document.getElementById("refreshAllBtn");
   els.heroTitle = document.getElementById("heroTitle");
@@ -355,8 +357,16 @@ function bindEvents() {
 
   if (els.modelSelect) {
     els.modelSelect.addEventListener("change", () => {
-      handleModelChange().catch((error) => showToast(error.message, true));
+      handleModelChange(els.modelSelect).catch((error) => showToast(error.message, true));
     });
+  }
+  if (els.quickModelSelect) {
+    els.quickModelSelect.addEventListener("change", () => {
+      handleModelChange(els.quickModelSelect).catch((error) => showToast(error.message, true));
+    });
+  }
+  if (els.quickModelManageBtn) {
+    els.quickModelManageBtn.addEventListener("click", openSettingsModal);
   }
   if (els.embeddingSelect) {
     els.embeddingSelect.addEventListener("change", () => {
@@ -4440,22 +4450,15 @@ function refreshWorkspaceUi() {
 }
 
 function initModelOptions() {
-  if (!els.modelSelect) {
-    return;
-  }
   const configuredModels = state.modelConfigs.map((item) => item.model_name);
   const allModels = dedupeStrings([DEFAULT_MODEL_ID, NONE_MODEL_ID, ...configuredModels]);
-  els.modelSelect.innerHTML = "";
-
-  for (const model of allModels) {
-    const option = document.createElement("option");
-    option.value = model;
-    option.textContent = formatModelOptionLabel(model);
-    els.modelSelect.appendChild(option);
+  if (!els.modelSelect && !els.quickModelSelect) {
+    return;
   }
-
+  syncOptionSelect(els.modelSelect, allModels, formatModelOptionLabel);
+  syncOptionSelect(els.quickModelSelect, allModels, formatModelOptionLabel);
   state.selectedModel = allModels.includes(state.selectedModel) ? state.selectedModel : DEFAULT_MODEL_ID;
-  els.modelSelect.value = state.selectedModel;
+  syncSelectedModelControls();
   persistSelectedModel();
   refreshWorkspaceUi();
 }
@@ -4481,13 +4484,36 @@ function initEmbeddingOptions() {
   refreshWorkspaceUi();
 }
 
-async function handleModelChange() {
-  if (!els.modelSelect) {
+function syncOptionSelect(selectEl, values, formatLabel) {
+  if (!selectEl) {
     return;
   }
-  const selected = els.modelSelect.value;
+  selectEl.innerHTML = "";
+  for (const value of values) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = formatLabel(value);
+    selectEl.appendChild(option);
+  }
+}
+
+function syncSelectedModelControls() {
+  if (els.modelSelect) {
+    els.modelSelect.value = state.selectedModel;
+  }
+  if (els.quickModelSelect) {
+    els.quickModelSelect.value = state.selectedModel;
+  }
+}
+
+async function handleModelChange(sourceSelect = els.modelSelect || els.quickModelSelect) {
+  if (!sourceSelect) {
+    return;
+  }
+  const selected = sourceSelect.value;
   state.selectedModel = selected;
   persistSelectedModel();
+  syncSelectedModelControls();
   if (selected === DEFAULT_MODEL_ID) {
     showToast("当前使用系统默认回答模型");
   } else if (selected === NONE_MODEL_ID) {

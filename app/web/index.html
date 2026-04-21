@@ -193,6 +193,11 @@
 
         <section class="composer-zone composer-dock">
           <div id="composerContextRow" class="composer-context-row">
+            <div class="composer-model-switcher" aria-label="Model switcher">
+              <span class="composer-model-switcher-label">回答模型</span>
+              <select id="quickModelSelect" class="composer-model-select" aria-label="切换回答模型"></select>
+              <button id="quickModelManageBtn" class="ghost-btn compact-btn composer-model-manage-btn" type="button">模型设置</button>
+            </div>
             <div id="composerPresence" class="composer-status-pill">尚未设置工作台</div>
             <div id="composerScope" class="composer-status-pill">资料范围 · 0 个文件</div>
             <div id="composerSession" class="composer-status-pill">智能配置 · 默认</div>
@@ -342,6 +347,7 @@
     <div class="modal-card modal-card-wide settings-modal-card">
       <div class="modal-head settings-modal-head">
         <div class="settings-modal-copy">
+          <p class="modal-tip settings-modal-quick-tip">主界面支持快速切换回答模型，这里集中管理默认模型、向量模型和密钥配置。</p>
           <h2 id="settingsTitle">工作台设置</h2>
           <p class="modal-tip">主界面默认不展示模型和密钥配置，需要时再来这里集中调整。</p>
         </div>

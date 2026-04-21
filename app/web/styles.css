@@ -549,6 +549,46 @@ a { color: inherit; }
   background: rgba(255, 255, 255, 0.88);
 }
 
+.composer-model-switcher {
+  order: 10;
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 46px;
+  padding: 6px;
+  border: 1px solid rgba(20, 41, 52, 0.08);
+  border-radius: 18px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.92) 0%, rgba(241, 249, 246, 0.92) 100%);
+  box-shadow: 0 10px 24px rgba(19, 37, 45, 0.05);
+}
+
+.composer-model-switcher-label {
+  padding: 0 6px 0 8px;
+  color: #55707f;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.composer-model-select {
+  min-width: clamp(180px, 24vw, 280px);
+  margin: 0;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.94);
+  color: #21404e;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.composer-model-manage-btn {
+  min-height: 34px;
+  padding-inline: 12px;
+  white-space: nowrap;
+}
+
 .composer-zone {
   transition: background 0.22s ease, padding 0.22s ease;
 }
@@ -1909,7 +1949,16 @@ select:focus, input:focus, textarea:focus { border-color: rgba(13, 127, 112, 0.3
   gap: 16px;
 }
 .settings-modal-head { margin-bottom: 4px; }
-.settings-modal-copy { max-width: 48ch; }
+.settings-modal-copy {
+  display: flex;
+  flex-direction: column;
+  max-width: 48ch;
+}
+.settings-modal-copy .modal-tip:not(.settings-modal-quick-tip) { display: none; }
+.settings-modal-quick-tip {
+  order: 2;
+  margin: 8px 0 0;
+}
 .modal-close { flex: 0 0 auto; }
 .modal-tip { margin: 6px 0 14px; font-size: 13px; }
 .auth-mode-switch {
@@ -2670,6 +2719,15 @@ select:focus, input:focus, textarea:focus { border-color: rgba(13, 127, 112, 0.3
   .message-avatar { width: 34px; height: 34px; flex-basis: 34px; font-size: 13px; }
   .message-column { width: min(100%, calc(100% - 44px)); }
   .favorite-card { padding: 16px; }
+  .composer-model-switcher {
+    width: 100%;
+    margin-left: 0;
+    flex-wrap: wrap;
+  }
+  .composer-model-select {
+    flex: 1 1 180px;
+    min-width: 0;
+  }
   .composer-footnote { flex-direction: column; }
   .source-pill { min-width: 100%; max-width: 100%; }
 }
@@ -2679,6 +2737,8 @@ select:focus, input:focus, textarea:focus { border-color: rgba(13, 127, 112, 0.3
   .workspace-title { font-size: 22px; }
   #heroTitle { font-size: 32px; }
   .composer-status-pill { width: 100%; }
+  .composer-model-switcher { justify-content: space-between; }
+  .composer-model-manage-btn { width: 100%; }
   .settings-grid { grid-template-columns: 1fr; }
   .composer-dock { padding-inline: 16px; }
   .surface-panel { padding: 16px; border-radius: 22px; }
