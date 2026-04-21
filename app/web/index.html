@@ -230,9 +230,13 @@
           <div class="composer">
             <button id="toggleImportBtn" class="icon-btn" type="button" title="Add attachment">+</button>
             <div class="composer-input-shell">
-              <textarea id="messageInput" rows="1" placeholder="Type your request. Press Enter to send, Shift+Enter for newline."></textarea>
-              <div class="composer-footnote">
-                <span id="composerHint">Use the dock to chat first; attach files only when needed.</span>
+              <textarea id="messageInput" rows="1" placeholder="有问题，尽管问"></textarea>
+              <div class="composer-input-toolbar">
+                <div class="composer-model-switcher composer-model-switcher-inline" aria-label="Model switcher">
+                  <span class="composer-model-switcher-label">模型</span>
+                  <select id="quickModelSelectInline" class="composer-model-select" aria-label="切换回答模型"></select>
+                  <button id="quickModelManageBtnInline" class="ghost-btn compact-btn composer-model-manage-btn" type="button">设置</button>
+                </div>
                 <span class="composer-shortcut">Enter Send / Shift+Enter New line</span>
               </div>
             </div>

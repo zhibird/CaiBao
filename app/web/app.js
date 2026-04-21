@@ -155,6 +155,8 @@ function bindElements() {
   els.modelSelect = document.getElementById("settingsModelSelect");
   els.quickModelSelect = document.getElementById("quickModelSelect");
   els.quickModelManageBtn = document.getElementById("quickModelManageBtn");
+  els.quickModelSelectInline = document.getElementById("quickModelSelectInline");
+  els.quickModelManageBtnInline = document.getElementById("quickModelManageBtnInline");
   els.embeddingSelect = document.getElementById("settingsEmbeddingSelect");
   els.refreshAllBtn = document.getElementById("refreshAllBtn");
   els.heroTitle = document.getElementById("heroTitle");
@@ -365,8 +367,16 @@ function bindEvents() {
       handleModelChange(els.quickModelSelect).catch((error) => showToast(error.message, true));
     });
   }
+  if (els.quickModelSelectInline) {
+    els.quickModelSelectInline.addEventListener("change", () => {
+      handleModelChange(els.quickModelSelectInline).catch((error) => showToast(error.message, true));
+    });
+  }
   if (els.quickModelManageBtn) {
     els.quickModelManageBtn.addEventListener("click", openSettingsModal);
+  }
+  if (els.quickModelManageBtnInline) {
+    els.quickModelManageBtnInline.addEventListener("click", openSettingsModal);
   }
   if (els.embeddingSelect) {
     els.embeddingSelect.addEventListener("change", () => {
@@ -4424,7 +4434,7 @@ function refreshWorkspaceUi() {
     els.composerScope.textContent = `资料范围 · ${scope.label}`;
   }
   if (els.composerSession) {
-    els.composerSession.textContent = `智能配置 · ${getAiConfigurationSummary()}`;
+    els.composerSession.textContent = `回答模型 · ${formatModelDisplayName(state.selectedModel)}`;
   }
   if (els.composerHint) {
     if (state.importing) {
@@ -4452,11 +4462,12 @@ function refreshWorkspaceUi() {
 function initModelOptions() {
   const configuredModels = state.modelConfigs.map((item) => item.model_name);
   const allModels = dedupeStrings([DEFAULT_MODEL_ID, NONE_MODEL_ID, ...configuredModels]);
-  if (!els.modelSelect && !els.quickModelSelect) {
+  if (!els.modelSelect && !els.quickModelSelect && !els.quickModelSelectInline) {
     return;
   }
   syncOptionSelect(els.modelSelect, allModels, formatModelOptionLabel);
   syncOptionSelect(els.quickModelSelect, allModels, formatModelOptionLabel);
+  syncOptionSelect(els.quickModelSelectInline, allModels, formatModelOptionLabel);
   state.selectedModel = allModels.includes(state.selectedModel) ? state.selectedModel : DEFAULT_MODEL_ID;
   syncSelectedModelControls();
   persistSelectedModel();
@@ -4504,9 +4515,12 @@ function syncSelectedModelControls() {
   if (els.quickModelSelect) {
     els.quickModelSelect.value = state.selectedModel;
   }
+  if (els.quickModelSelectInline) {
+    els.quickModelSelectInline.value = state.selectedModel;
+  }
 }
 
-async function handleModelChange(sourceSelect = els.modelSelect || els.quickModelSelect) {
+async function handleModelChange(sourceSelect = els.quickModelSelectInline || els.modelSelect || els.quickModelSelect) {
   if (!sourceSelect) {
     return;
   }
