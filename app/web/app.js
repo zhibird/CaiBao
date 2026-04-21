@@ -2824,21 +2824,6 @@ function renderAttachmentStrip() {
 
   els.attachmentStrip.classList.remove("hidden");
 
-  const helper = document.createElement("div");
-  helper.className = "attachment-helper";
-  const readyCount = getReadyDocumentCount();
-  const processingCount = getProcessingDocumentCount();
-  if (state.chatMode === CHAT_MODE_DOCS && state.selectedDocumentIds.length) {
-    helper.textContent = `已自动接入资料：本轮已选 ${state.selectedDocumentIds.length} 个文件，发送时只检索这些文件。`;
-  } else if (!readyCount) {
-    helper.textContent = processingCount
-      ? `当前有 ${processingCount} 个文件处理中。你现在也可以先直接聊天，完成后会自动可检索。`
-      : "当前还没有 ready 文件。你也可以先直接聊天，上传资料后再增强回答。";
-  } else {
-    helper.textContent = `已自动接入本会话全部 ${readyCount} 个 ready 文件。单击附件缩小范围，双击可预览。`;
-  }
-  els.attachmentStrip.appendChild(helper);
-
   const list = document.createElement("div");
   list.className = "attachment-list";
 
