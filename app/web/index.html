@@ -110,6 +110,8 @@
             <div class="workspace-switch-strip">
               <div class="workspace-nav-tabs" role="tablist" aria-label="Workspace views">
                 <button id="chatWorkspaceBtn" class="workspace-top-switch-btn active" type="button" aria-pressed="true" aria-label="聊天工作台" title="聊天工作台">聊天</button>
+                <button id="agentModeBtn" class="workspace-top-switch-btn" type="button" aria-pressed="false" aria-label="Agent 执行模式" title="Agent 执行模式">Agent</button>
+                <button id="agentAppsWorkspaceBtn" class="workspace-top-switch-btn" type="button" aria-pressed="false" aria-label="Agent 应用工作台" title="Agent 应用工作台">应用</button>
                 <button id="favoritesWorkspaceBtn" class="workspace-top-switch-btn" type="button" aria-pressed="false" aria-label="收藏夹工作台" title="收藏夹工作台">收藏夹</button>
               </div>
             </div>
@@ -185,6 +187,67 @@
                     Select a saved item to view details and follow-up actions.
                   </div>
                   <div id="favoriteDetailContent" class="favorite-detail-content hidden"></div>
+                </section>
+              </div>
+            </section>
+
+            <section id="agentAppsPanel" class="workspace-panel agent-apps-panel hidden">
+              <div class="agent-apps-layout">
+                <aside class="agent-apps-list-pane">
+                  <div class="agent-apps-panel-head">
+                    <div>
+                      <div class="hero-kicker">Agent App Builder</div>
+                      <h2 class="agent-apps-panel-title">把知识、工具和工作流组装成可发布的 Agent 应用。</h2>
+                    </div>
+                    <button id="createAgentAppBtn" class="primary-btn compact-primary-btn" type="button">新建应用</button>
+                  </div>
+                  <div id="agentAppList" class="agent-app-list"></div>
+                </aside>
+
+                <section class="agent-app-detail-pane">
+                  <form id="agentAppForm" class="agent-app-form">
+                    <div class="agent-app-form-grid">
+                      <label class="field">
+                        <span>应用名称</span>
+                        <input id="agentAppNameInput" type="text" maxlength="128" placeholder="运维值班助手" />
+                      </label>
+                      <label class="field">
+                        <span>运行模式</span>
+                        <select id="agentAppModeSelect">
+                          <option value="agent_auto">自动 Agent</option>
+                          <option value="workflow">工作流</option>
+                        </select>
+                      </label>
+                    </div>
+                    <label class="field">
+                      <span>系统提示词</span>
+                      <textarea id="agentAppPromptInput" rows="5" placeholder="你是企业运维知识 Agent，回答要引用资料，危险动作必须确认。"></textarea>
+                    </label>
+                    <div class="agent-tool-panel">
+                      <div class="agent-tool-panel-head">
+                        <strong>内置工具</strong>
+                        <span>危险工具默认需要确认</span>
+                      </div>
+                      <div id="agentAppToolsList" class="agent-tool-list"></div>
+                    </div>
+                    <label class="field">
+                      <span>Workflow JSON</span>
+                      <textarea id="agentAppWorkflowInput" rows="6" placeholder='{"nodes":[{"type":"retrieval","title":"查处理手册"},{"type":"tool_call","tool_name":"create_incident","arguments":{"title":"数据库 CPU 告警","severity":"P1"}},{"type":"final"}]}'></textarea>
+                    </label>
+                    <div class="agent-app-actions">
+                      <button id="saveAgentAppBtn" class="primary-btn compact-primary-btn" type="submit">保存应用</button>
+                      <button id="publishAgentAppBtn" class="ghost-btn compact-btn" type="button">发布版本</button>
+                    </div>
+                  </form>
+
+                  <div class="agent-app-test-panel">
+                    <div class="agent-tool-panel-head">
+                      <strong>一键测试</strong>
+                      <span id="agentAppDetailMeta">选择应用后可调用 /apps/{app_id}/invoke</span>
+                    </div>
+                    <textarea id="agentAppTaskInput" rows="3" placeholder="数据库 CPU 告警了，查处理手册，判断是否要升级为 P1；如果需要，创建 incident，并把处理结论沉淀到知识库。"></textarea>
+                    <button id="invokeAgentAppBtn" class="primary-btn compact-primary-btn" type="button">测试运行</button>
+                  </div>
                 </section>
               </div>
             </section>

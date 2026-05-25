@@ -59,6 +59,10 @@ def get_db_session() -> Generator[Session, None, None]:
 def init_db() -> None:
     try:
         from app.models import (  # noqa: F401
+            agent_app,
+            agent_app_version,
+            agent_run,
+            agent_step,
             answer_favorite,
             chat_history,
             chunk_embedding,
@@ -176,6 +180,18 @@ def _ensure_phase1_columns() -> None:
         if "status" not in document_cols:
             with engine.begin() as conn:
                 conn.exec_driver_sql("ALTER TABLE documents ADD COLUMN status VARCHAR(16) DEFAULT 'pending'")
+
+    if "agent_runs" in table_names:
+        agent_run_cols = {item["name"] for item in inspector.get_columns("agent_runs")}
+        if "app_id" not in agent_run_cols:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("ALTER TABLE agent_runs ADD COLUMN app_id VARCHAR(36)")
+        if "app_version" not in agent_run_cols:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("ALTER TABLE agent_runs ADD COLUMN app_version INTEGER")
+        if "trigger_channel" not in agent_run_cols:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("ALTER TABLE agent_runs ADD COLUMN trigger_channel VARCHAR(32) DEFAULT 'agent'")
         if "mime_type" not in document_cols:
             with engine.begin() as conn:
                 conn.exec_driver_sql("ALTER TABLE documents ADD COLUMN mime_type VARCHAR(128)")

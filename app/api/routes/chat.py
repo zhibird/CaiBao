@@ -160,8 +160,8 @@ def edit_chat_history_message(
         )
 
         channel = message.channel.strip().lower()
-        if channel == "action":
-            raise DomainValidationError("Action messages do not support editing.")
+        if channel in {"action", "agent"}:
+            raise DomainValidationError("Action and agent messages do not support editing.")
 
         if channel == "echo":
             echo_payload = ChatEchoRequest(

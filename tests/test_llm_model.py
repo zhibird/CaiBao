@@ -75,3 +75,24 @@ def test_llm_model_config_can_be_deleted(client) -> None:
     list_after = client.get("/api/v1/llm/models")
     assert list_after.status_code == 200
     assert list_after.json()["items"] == []
+
+
+def test_llm_model_base_url_strips_endpoint_suffixes(client) -> None:
+    suffix = uuid4().hex[:8]
+    register_workspace_user(
+        client,
+        prefix=f"llm_suffix_{suffix}",
+        display_name="LLM Suffix User",
+    )
+
+    response = client.post(
+        "/api/v1/llm/models",
+        json={
+            "model_name": "doubao-1",
+            "base_url": "https://ark.cn-beijing.volces.com/api/v3/responses/chat/completions",
+            "api_key": "sk-test-1234",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["base_url"] == "https://ark.cn-beijing.volces.com/api/v3"

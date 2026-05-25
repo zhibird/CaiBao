@@ -10,6 +10,7 @@ import httpx
 
 from app.core.config import Settings, get_settings
 from app.core.exceptions import DomainValidationError
+from app.services.model_base_url import normalize_openai_compatible_base_url
 
 
 @dataclass(frozen=True)
@@ -513,7 +514,7 @@ class LLMService:
         api_key: str,
         timeout_seconds: float,
     ) -> httpx.Response:
-        normalized_base_url = base_url.rstrip("/")
+        normalized_base_url = normalize_openai_compatible_base_url(base_url)
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
