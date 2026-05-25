@@ -67,12 +67,16 @@ class ToolService:
         limit = self._parse_limit(arguments.get("limit", 5))
         space_id = self._optional_space_id(team_id=team_id, user_id=user_id, arguments=arguments)
 
-        like_query = f"%{query}%"
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like_query = f"%{escaped}%"
         stmt = select(Document).where(
             Document.team_id == team_id,
             Document.retrieval_enabled.is_(True),
             Document.status.in_(["ready", "uploaded"]),
-            or_(Document.source_name.ilike(like_query), Document.content.ilike(like_query)),
+            or_(
+                Document.source_name.ilike(like_query, escape="\\"),
+                Document.content.ilike(like_query, escape="\\"),
+            ),
         )
         if space_id is not None:
             stmt = stmt.where(Document.space_id == space_id)

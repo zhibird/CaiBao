@@ -2472,8 +2472,8 @@ async function editHistoryMessage(messageId, currentText, channel) {
   if (!messageId) {
     return;
   }
-  if (channel === "action") {
-    showToast("工具调用消息不支持编辑", true);
+  if (channel === "action" || channel === "agent") {
+    showToast("工具调用和 Agent 消息不支持编辑", true);
     return;
   }
 
@@ -3725,13 +3725,11 @@ async function handleSend() {
         user_id: state.userId,
         team_id: state.teamId,
         conversation_id: state.conversationId,
+        space_id: getActiveSpaceId(),
         task: question,
         top_k: 5,
         dry_run: false,
         confirm_dangerous_actions: false,
-        include_memory: true,
-        include_library: usingDocumentScope,
-        include_conclusions: false,
         embedding_model: state.selectedEmbedding || DEFAULT_EMBEDDING_ID,
       }
       : {

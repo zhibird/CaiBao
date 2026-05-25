@@ -999,6 +999,8 @@ class AgentService:
         return calls
 
     def _extract_sources_from_steps(self, steps: list[AgentStep]) -> list[ChatSource]:
+        all_sources: list[ChatSource] = []
+        seen_ids: set[str] = set()
         for step in steps:
             if step.step_type != "retrieval":
                 continue
@@ -1006,12 +1008,13 @@ class AgentService:
             raw_sources = output.get("sources")
             if not isinstance(raw_sources, list):
                 continue
-            sources: list[ChatSource] = []
             for item in raw_sources:
                 if isinstance(item, dict):
-                    sources.append(ChatSource.model_validate(item))
-            return sources
-        return []
+                    source = ChatSource.model_validate(item)
+                    if source.document_id and source.document_id not in seen_ids:
+                        seen_ids.add(source.document_id)
+                        all_sources.append(source)
+        return all_sources
 
     def _to_json(self, payload: object) -> str:
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
