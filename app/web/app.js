@@ -5394,7 +5394,8 @@ function sleep(ms) {
 
 function normalizeStatus(status) {
   const normalized = String(status || "uploaded").trim().toLowerCase();
-  if (["pending", "uploaded", "parsing", "chunking", "indexing", "ready", "failed", "deleted"].includes(normalized)) {
+  if (["pending", "uploaded", "parsing", "chunking", "indexing", "ready", "failed", "deleted",
+       "completed", "requires_confirmation", "partial_success", "running", "skipped"].includes(normalized)) {
     return normalized;
   }
   return "uploaded";

@@ -349,7 +349,11 @@ class AgentService:
                 continue
 
             if node_type == "tool_call":
-                call = self._tool_call_from_workflow_node(node=node, space_id=space_id, task=payload.task)
+                try:
+                    call = self._tool_call_from_workflow_node(node=node, space_id=space_id, task=payload.task)
+                except DomainValidationError as exc:
+                    tool_errors.append(f"{title}: {exc}")
+                    continue
                 call_results, call_skipped, call_errors, tool_status = self._execute_tool_calls(
                     calls=[call],
                     team_id=team_id,
