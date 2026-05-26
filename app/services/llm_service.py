@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import base64
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 import re
+from typing import Any, Iterator
 from urllib.parse import urlparse
 
 import httpx
 
 from app.core.config import Settings, get_settings
 from app.core.exceptions import DomainValidationError
+from app.services.model_base_url import normalize_openai_compatible_base_url
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,23 @@ class AssistantContentPart:
 class LLMAnswer:
     answer: str
     content_parts: tuple[AssistantContentPart, ...] = ()
+
+
+@dataclass(frozen=True)
+class LLMCompletionResult:
+    assistant_text: str
+    tool_calls: list[dict[str, object]] = field(default_factory=list)
+    finish_reason: str | None = None
+    raw_message: dict[str, object] | None = None
+    usage: dict[str, object] | None = None
+    model: str | None = None
+
+
+@dataclass(frozen=True)
+class LLMStreamChunk:
+    delta_text: str | None = None
+    tool_call_deltas: list[dict[str, object]] = field(default_factory=list)
+    finish_reason: str | None = None
 
 
 class LLMService:
@@ -110,6 +129,398 @@ class LLMService:
             fallback_text_context=fallback_text_context,
             conversation_messages=conversation_messages,
         )
+
+    # ------------------------------------------------------------------
+    # Low-level generic interfaces (Phase 1: tool-calling + streaming)
+    # ------------------------------------------------------------------
+
+    def complete_chat(
+        self,
+        *,
+        messages: list[dict[str, object]],
+        model: str | None = None,
+        base_url: str = "",
+        api_key: str = "",
+        tools: list[dict[str, object]] | None = None,
+        tool_choice: str = "auto",
+        force_mock: bool = False,
+    ) -> LLMCompletionResult:
+        """Non-streaming chat completion with optional tool calling."""
+        if force_mock:
+            return self._mock_complete(messages)
+
+        runtime = self._resolve_runtime(base_url=base_url, api_key=api_key)
+        if runtime is None:
+            return self._mock_complete(messages)
+
+        payload = self._build_payload(
+            model=model,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+        selected_model = str(model or self.settings.llm_model).strip()
+
+        try:
+            response = self._post_chat_completion(
+                payload=payload,
+                base_url=runtime[0],
+                api_key=runtime[1],
+                timeout_seconds=self.settings.llm_timeout_seconds,
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = self._extract_http_error_detail(exc.response)
+            if self._detect_tools_unsupported(detail):
+                raise DomainValidationError(f"LLM_TOOLS_UNSUPPORTED: {detail}") from exc
+            raise DomainValidationError(f"LLM request failed: {detail}") from exc
+        except httpx.HTTPError as exc:
+            raise DomainValidationError(f"LLM request failed: {exc}") from exc
+
+        body = response.json()
+        return self._parse_completion(body, model=selected_model)
+
+    def stream_chat(
+        self,
+        *,
+        messages: list[dict[str, object]],
+        model: str | None = None,
+        base_url: str = "",
+        api_key: str = "",
+        tools: list[dict[str, object]] | None = None,
+        tool_choice: str = "auto",
+        force_mock: bool = False,
+    ) -> Iterator[LLMStreamChunk]:
+        """Streaming chat completion yielding LLMStreamChunk events."""
+        if force_mock:
+            yield from self._mock_stream(messages)
+            return
+
+        runtime = self._resolve_runtime(base_url=base_url, api_key=api_key)
+        if runtime is None:
+            yield from self._mock_stream(messages)
+            return
+
+        payload = self._build_payload(
+            model=model,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            stream=True,
+        )
+
+        try:
+            with self._post_chat_completion_stream(
+                payload=payload,
+                base_url=runtime[0],
+                api_key=runtime[1],
+                timeout_seconds=self.settings.llm_timeout_seconds,
+            ) as response:
+                response.raise_for_status()
+                yield from self._consume_sse_stream(response)
+        except httpx.HTTPStatusError as exc:
+            detail = self._extract_http_error_detail(exc.response)
+            if self._detect_stream_unsupported(detail):
+                raise DomainValidationError(f"LLM_STREAM_UNSUPPORTED: {detail}") from exc
+            raise DomainValidationError(f"LLM request failed: {detail}") from exc
+        except httpx.HTTPError as exc:
+            raise DomainValidationError(f"LLM request failed: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    # Tool parsing
+    # ------------------------------------------------------------------
+
+    def _parse_tool_calls(self, message: dict[str, object]) -> list[dict[str, object]]:
+        """Parse tool_calls from an assistant message, normalizing arguments from JSON strings."""
+        raw_calls = message.get("tool_calls")
+        if not isinstance(raw_calls, list):
+            return []
+
+        parsed: list[dict[str, object]] = []
+        for tc in raw_calls:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function")
+            if not isinstance(fn, dict):
+                continue
+            name = fn.get("name")
+            raw_args = fn.get("arguments")
+            if isinstance(raw_args, str):
+                try:
+                    args = __import__("json").loads(raw_args)
+                except (TypeError, ValueError):
+                    args = raw_args
+            elif isinstance(raw_args, dict):
+                args = raw_args
+            else:
+                args = {}
+
+            parsed.append({
+                "id": tc.get("id"),
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": args,
+                },
+            })
+        return parsed
+
+    def _parse_completion(
+        self,
+        body: dict[str, object],
+        *,
+        model: str,
+    ) -> LLMCompletionResult:
+        try:
+            choice = body["choices"][0]  # type: ignore[index]
+            message = choice["message"]  # type: ignore[index]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise DomainValidationError("LLM response format is invalid.") from exc
+
+        assistant_text = ""
+        if isinstance(message, dict):
+            content = message.get("content", "")
+            assistant_text = str(content) if content is not None else ""
+
+        tool_calls = self._parse_tool_calls(message) if isinstance(message, dict) else []
+        finish_reason = str(choice.get("finish_reason", "")).strip() or None if isinstance(choice, dict) else None
+        usage: dict[str, object] | None = None
+        raw_usage = body.get("usage")
+        if isinstance(raw_usage, dict):
+            usage = raw_usage
+
+        return LLMCompletionResult(
+            assistant_text=assistant_text,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+            raw_message=message if isinstance(message, dict) else None,
+            usage=usage,
+            model=model,
+        )
+
+    def _consume_sse_stream(
+        self,
+        response: httpx.Response,
+    ) -> Iterator[LLMStreamChunk]:
+        """Consume SSE streaming response, yielding LLMStreamChunk events.
+
+        Compatible with both httpx.stream() (returns bytes lines) and
+        older buffered responses (where iter_lines may return str).
+        """
+        tool_index: dict[str, int] = {}
+        accumulated_tool_args: dict[str, str] = {}
+        accumulated_tool_names: dict[str, str] = {}
+        finished = False
+
+        for raw_line in response.iter_lines():
+            if finished:
+                break
+            if isinstance(raw_line, bytes):
+                line = raw_line.decode("utf-8", errors="replace").strip()
+            else:
+                line = str(raw_line).strip()
+            if not line or line.startswith(":"):
+                continue
+            if line == "data: [DONE]":
+                finished = True
+                continue
+            if not line.startswith("data: "):
+                continue
+
+            data_str = line.removeprefix("data: ")
+            try:
+                data = __import__("json").loads(data_str)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+
+            try:
+                choice = data["choices"][0]  # type: ignore[index]
+            except (KeyError, IndexError, TypeError):
+                continue
+
+            delta = choice.get("delta", {}) if isinstance(choice, dict) else {}
+            finish_reason = str(choice.get("finish_reason", "")).strip() or None if isinstance(choice, dict) else None
+
+            delta_text = None
+            if isinstance(delta, dict):
+                content = delta.get("content", "")
+                if content:
+                    delta_text = str(content)
+
+            tool_deltas: list[dict[str, object]] = []
+            if isinstance(delta, dict) and "tool_calls" in delta:
+                raw_tool_deltas = delta["tool_calls"]
+                if isinstance(raw_tool_deltas, list):
+                    for tc in raw_tool_deltas:
+                        if not isinstance(tc, dict):
+                            continue
+                        idx = tc.get("index")
+                        if idx is None:
+                            continue
+                        key = str(idx)
+                        if key not in tool_index:
+                            tool_index[key] = len(tool_index)
+                        fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                        fn_name = fn.get("name", "")
+                        if fn_name:
+                            accumulated_tool_names[key] = str(fn_name)
+                        fn_args = fn.get("arguments", "")
+                        if fn_args:
+                            accumulated_tool_args[key] = accumulated_tool_args.get(key, "") + str(fn_args)
+                        tool_deltas.append({
+                            "index": int(idx),
+                            "function": {"name": fn_name, "arguments": fn_args},
+                        })
+
+            if delta_text or tool_deltas or finish_reason:
+                yield LLMStreamChunk(
+                    delta_text=delta_text,
+                    tool_call_deltas=tool_deltas,
+                    finish_reason=finish_reason,
+                )
+
+    def finalize_tool_calls_from_stream(
+        self,
+        accumulated_names: dict[str, str],
+        accumulated_args: dict[str, str],
+        ordered_indices: dict[str, int],
+    ) -> list[dict[str, object]]:
+        """After streaming ends, build final tool_calls from accumulated deltas."""
+        result: list[dict[str, object]] = []
+        seen: list[tuple[int, str, dict[str, object]]] = []
+        for key, idx in ordered_indices.items():
+            name = accumulated_names.get(key, "")
+            args_str = accumulated_args.get(key, "")
+            try:
+                args = __import__("json").loads(args_str)
+            except (TypeError, ValueError):
+                args = {}
+            seen.append((idx, name, args))
+        seen.sort(key=lambda x: x[0])
+
+        # Build ids matching index-based convention
+        for _, name, args in seen:
+            import uuid
+            result.append({
+                "id": f"call_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": {"name": name, "arguments": args},
+            })
+        return result
+
+    def _mock_complete(self, messages: list[dict[str, object]]) -> LLMCompletionResult:
+        last_user = ""
+        has_tool_result = False
+        for msg in reversed(messages):
+            role = str(msg.get("role", "")).strip().lower()
+            if role == "tool":
+                has_tool_result = True
+            if role == "user":
+                last_user = str(msg.get("content", ""))
+                break
+
+        # When a tool result was already received, respond with text instead of more tools
+        if has_tool_result:
+            return LLMCompletionResult(
+                assistant_text=f"[Mock Agent] Tool completed for: {last_user[:200]}",
+                model="mock",
+            )
+
+        import uuid
+
+        # Lightweight keyword-based mock tool calling for dev/test realism
+        tool_calls: list[dict[str, object]] = []
+        task = last_user
+
+        if any(kw in task for kw in ["create incident", "incident", "创建 incident", "创建 incident",
+                                       "创建事件", "新建事件", "创建故障", "告警", "故障", "事故"]):
+            if "不要创建" not in task and "do not create" not in task.lower():
+                severity = "P2"
+                import re
+                p_match = re.search(r"\bP([0-9])\b", task, re.IGNORECASE)
+                if p_match:
+                    severity = f"P{p_match.group(1)}" .upper()
+                elif any(t in task.lower() for t in ["critical", "紧急", "严重", "宕机"]):
+                    severity = "P1"
+                elif any(t in task.lower() for t in ["minor", "低优先级", "轻微"]):
+                    severity = "P3"
+                title_match = re.search(r"(?:：|:)\s*(.+)", task)
+                title = title_match.group(1)[:255] if title_match else task[:255]
+                tool_calls.append({
+                    "id": f"call_{uuid.uuid4().hex[:12]}",
+                    "type": "function",
+                    "function": {"name": "create_incident", "arguments": {"title": title, "severity": severity}},
+                })
+
+        if any(kw in task for kw in ["search knowledge", "知识库", "runbook", "手册", "查资料"]):
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": {"name": "search_knowledge", "arguments": {"query": task, "limit": 5}},
+            })
+
+        if any(kw in task for kw in ["recent document", "list documents", "最近文档", "查看文档", "列出文档", "查文档"]):
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": {"name": "list_recent_documents", "arguments": {"limit": 5}},
+            })
+
+        if any(kw in task for kw in ["create memory", "memory card", "记忆卡", "长期记忆", "沉淀记忆"]):
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": {"name": "create_memory_card", "arguments": {"title": task[:128], "content": task}},
+            })
+
+        if any(kw in task for kw in ["promote to conclusion", "create conclusion", "沉淀结论", "保存结论"]):
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": {"name": "promote_to_conclusion", "arguments": {"title": task[:128], "content": task}},
+            })
+
+        if any(kw in task for kw in ["incident report", "postmortem", "事件报告", "处理报告"]):
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": {"name": "generate_incident_report", "arguments": {"incident_summary": task}},
+            })
+
+        assistant_text = ""
+        if not tool_calls:
+            assistant_text = f"[Mock Agent] {last_user}" if last_user else "[Mock Agent] No user input."
+        return LLMCompletionResult(
+            assistant_text=assistant_text,
+            tool_calls=tool_calls,
+            finish_reason="tool_calls" if tool_calls else "stop",
+            model="mock",
+        )
+
+    def _mock_stream(self, messages: list[dict[str, object]]) -> Iterator[LLMStreamChunk]:
+        last_user = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                last_user = str(msg.get("content", ""))
+                break
+        answer = f"[Mock Agent] {last_user}" if last_user else "[Mock Agent] No user input."
+        yield LLMStreamChunk(delta_text=answer, finish_reason="stop")
+
+    def _detect_tools_unsupported(self, error_detail: str) -> bool:
+        normalized = error_detail.lower()
+        keywords = ["tools", "tool_choice", "function calling", "does not support"]
+        return any(kw in normalized for kw in keywords)
+
+    def _detect_stream_unsupported(self, error_detail: str) -> bool:
+        normalized = error_detail.lower()
+        keywords = ["stream", "streaming"]
+        return any(kw in normalized for kw in keywords)
+
+    # ------------------------------------------------------------------
+    # Existing methods (unchanged)
+    # ------------------------------------------------------------------
 
     def _mock_answer(self, question: str, hits: list[dict[str, object]]) -> LLMAnswer:
         if not hits:
@@ -211,14 +622,30 @@ class LLMService:
                 )
             raise
 
-    def _build_payload(self, model: str | None, messages: list[dict[str, object]]) -> dict[str, object]:
+    def _build_payload(
+        self,
+        model: str | None,
+        messages: list[dict[str, object]],
+        *,
+        tools: list[dict[str, object]] | None = None,
+        tool_choice: str = "auto",
+        stream: bool = False,
+    ) -> dict[str, object]:
         selected_model = model.strip() if model else self.settings.llm_model
-        return {
+        payload: dict[str, object] = {
             "model": selected_model,
             "messages": messages,
             "temperature": self.settings.llm_temperature,
             "max_tokens": self.settings.llm_max_tokens,
         }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = tool_choice
+            payload["parallel_tool_calls"] = False
+        if stream:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
+        return payload
 
     def _request_chat_answer(
         self,
@@ -513,12 +940,37 @@ class LLMService:
         api_key: str,
         timeout_seconds: float,
     ) -> httpx.Response:
-        normalized_base_url = base_url.rstrip("/")
+        normalized_base_url = normalize_openai_compatible_base_url(base_url)
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
         return httpx.post(
+            f"{normalized_base_url}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=timeout_seconds,
+        )
+
+    def _post_chat_completion_stream(
+        self,
+        payload: dict[str, object],
+        *,
+        base_url: str,
+        api_key: str,
+        timeout_seconds: float,
+    ):
+        """Streaming HTTP request that returns a context-managed response for SSE consumption."""
+        normalized_base_url = normalize_openai_compatible_base_url(base_url)
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload["stream"] = True
+        if "stream_options" not in payload:
+            payload["stream_options"] = {"include_usage": True}
+        return httpx.stream(
+            "POST",
             f"{normalized_base_url}/chat/completions",
             headers=headers,
             json=payload,
@@ -613,8 +1065,11 @@ class LLMService:
         except (KeyError, IndexError, TypeError) as exc:
             raise DomainValidationError("LLM response format is invalid.") from exc
 
+        # Tool-only responses (no content) are valid; return empty text answer.
+        has_tool_calls = isinstance(message, dict) and bool(message.get("tool_calls"))
+
         parts = self._extract_content_parts(message)
-        if not parts:
+        if not parts and not has_tool_calls:
             raise DomainValidationError("LLM returned an empty answer.")
         answer = "".join(part.text or "" for part in parts if part.type == "text")
         finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else None

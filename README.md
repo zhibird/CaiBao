@@ -1,8 +1,127 @@
+# CaiBao Dify-lite Agent App 工作台
+
+CaiBao 是一个面向企业运维与知识管理场景的 Dify-lite Agent 应用搭建平台。用户可以创建 Agent App，配置提示词、模型、知识库、工具插件和轻量 workflow，通过工作台或 API 调用，并查看执行 trace、版本快照与 Agent/App Eval 报告。
+
 ## 项目预览
 
 <p align="center">
   <img src="./caibao_pic.png" alt="CaiBao 项目预览" width="720">
 </p>
+
+## 核心能力
+
+- **Agent App Builder**：`/api/v1/apps` 支持创建、更新、发布和调用可配置 Agent 应用。
+- **LLM Function Calling Agent**：`agent_auto` 已升级为 OpenAI-compatible tools / `tool_calls` 驱动的多轮工具循环，保留关键词 fallback。
+- **SSE 流式执行**：`/api/v1/agent/runs` 创建 queued run，`/api/v1/agent/runs/{run_id}/stream` 实时输出 LLM delta、工具状态、确认请求和最终结果。
+- **LLM Router**：支持 planner / fast / vision 三类模型路由配置，当前 Agent 执行主链路已接入 planner 路由，fast / vision 作为后续专用步骤接入点保留。
+- **Knowledge Base**：复用项目空间、资料库、结论与记忆卡，在 Agent 执行前注入可追溯上下文。
+- **Tool Plugin Registry**：统一描述工具名称、展示名、参数 schema、输出 schema、handler、权限范围和危险等级。
+- **Workflow Execution**：支持 `agent_auto` 自动规划模式，以及 `workflow` 节点顺序执行模式。
+- **Trace / Observability**：每次运行都会落库 `agent_runs` / `agent_steps`，记录计划、检索、工具调用、观察结果、错误与耗时。
+- **Safety Boundary**：`create_incident`、`create_memory_card`、`promote_to_conclusion` 等写入工具默认需要确认；`dry_run=true` 不产生副作用。
+- **Agent Eval + App Eval**：保留原 Agent Eval，并新增 App 级评测集与报告脚本。
+
+## Dify-lite 架构
+
+```mermaid
+flowchart LR
+    A["Frontend Workbench"] --> B["Agent App API"]
+    B --> C["AgentAppService"]
+    C --> D["App Config + Version Snapshot"]
+    C --> E["AgentService Planner / Workflow Runner"]
+    E --> F["RAG / Memory / Library"]
+    E --> G["Tool Plugin Registry"]
+    G --> H["ToolService Executor"]
+    E --> I["Trace Store"]
+    F --> J["Final Answer + Sources"]
+    H --> J
+    I --> J
+```
+
+## API 示例
+
+创建并发布一个 Agent App：
+
+```bash
+curl -X POST "http://localhost:8000/api/v1/apps" \
+  -H "Content-Type: application/json" \
+  -b "your-auth-cookie" \
+  -d '{
+    "name": "运维值班助手",
+    "mode": "agent_auto",
+    "system_prompt": "你是企业运维知识 Agent，回答要基于资料，危险动作必须确认。",
+    "tool_config": {
+      "enabled_tools": ["search_knowledge", "list_recent_documents", "create_incident"],
+      "dangerous_requires_confirmation": true
+    }
+  }'
+```
+
+```bash
+curl -X POST "http://localhost:8000/api/v1/apps/your_app_id/publish" \
+  -H "Content-Type: application/json" \
+  -b "your-auth-cookie" \
+  -d '{"notes": "baseline"}'
+```
+
+调用已配置的 Agent App：
+
+```bash
+curl -X POST "http://localhost:8000/api/v1/apps/your_app_id/invoke" \
+  -H "Content-Type: application/json" \
+  -b "your-auth-cookie" \
+  -d '{
+    "conversation_id": "your_conversation_id",
+    "task": "数据库 CPU 告警了，查处理手册，判断是否要升级为 P1；如果需要，创建 incident。",
+    "include_memory": true,
+    "include_library": true
+  }'
+```
+
+兼容保留原始 Agent 入口：
+
+```bash
+curl -X POST "http://localhost:8000/api/v1/agent/run" \
+  -H "Content-Type: application/json" \
+  -b "your-auth-cookie" \
+  -d '{
+    "conversation_id": "your_conversation_id",
+    "task": "查最近文档，并创建一个 P1 incident：数据库 CPU 告警",
+    "include_memory": true,
+    "include_library": true,
+    "dry_run": false
+  }'
+```
+
+流式执行 Agent：
+
+```bash
+curl -X POST "http://localhost:8000/api/v1/agent/runs" \
+  -H "Content-Type: application/json" \
+  -b "your-auth-cookie" \
+  -d '{
+    "conversation_id": "your_conversation_id",
+    "task": "查最近文档，判断数据库 CPU 告警是否需要升级为 P1 incident",
+    "include_memory": true,
+    "include_library": true
+  }'
+```
+
+返回 `run_id` 与 `stream_url` 后，可通过 SSE 订阅：
+
+```bash
+curl -N "http://localhost:8000/api/v1/agent/runs/your_run_id/stream" \
+  -b "your-auth-cookie"
+```
+
+默认返回 `requires_confirmation`，不会直接创建危险动作。确认后执行：
+
+```bash
+curl -X POST "http://localhost:8000/api/v1/agent/runs/your_run_id/confirm" \
+  -H "Content-Type: application/json" \
+  -b "your-auth-cookie" \
+  -d '{}'
+```
 
 ## 快速开始
 
@@ -109,6 +228,47 @@ docker compose down -v
 
 ## changelogs
 
+## Agent Eval
+
+```bash
+python scripts/agent_eval.py \
+  --base-url http://127.0.0.1:8000 \
+  --user-id agent_eval_user \
+  --password Str0ngPass! \
+  --register \
+  --dataset docs/agent_eval/dataset_minimal.json \
+  --output-dir docs/agent_eval/run \
+  --output-prefix eval_v1
+```
+
+输出：
+
+- `eval_v1_summary.json`
+- `eval_v1_traces.json`
+- `eval_v1_report.md`
+
+App 级评测：
+
+```bash
+python scripts/agent_app_eval.py \
+  --base-url http://127.0.0.1:8000 \
+  --user-id agent_app_eval_user \
+  --password Str0ngPass! \
+  --register \
+  --dataset docs/agent_eval/apps/ops_agent.json \
+  --output-dir docs/agent_eval/run \
+  --output-prefix app_eval_v1
+```
+
+App Eval 指标包含 `task_success_rate`、`tool_selection_accuracy`、`parameter_accuracy`、`grounded_answer_rate`、`dangerous_action_block_rate`、`avg_latency_ms` 和 `avg_steps`。
+
+可写进简历的表述：
+
+- 设计并实现 Dify-lite Agent App 工作台，支持应用配置、版本发布、RAG 检索、工具插件、轻量 workflow 与执行 trace。
+- 构建 Agent Eval + App Eval 双评测体系，覆盖纯问答、工具调用、混合任务、dry-run 与危险动作阻断，自动输出任务完成率、工具选择准确率和危险动作阻断率。
+- 基于 FastAPI、SQLAlchemy、Alembic 和 Docker 实现可本地复现的企业知识 Agent 平台，支持 API 发布与前端演示闭环。
+
+- **v0.19.0**：完成 Agent 引擎现代化 Phase 1，升级为 Function Calling 工具循环与 SSE 流式执行，并补齐 LLM Router、危险工具确认、App 工作台与 App Eval。
 - **v0.1.0**：后端 MVP + 前端基础页面
 - **v0.2.0**：会话管理（引入会话 `conversation_id`，实现会话隔离、删除）
 - **v0.3.0**：支持会话重命名、消息删除、用户发送的对话消息重新编辑

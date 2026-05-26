@@ -473,10 +473,12 @@ def test_homepage_keeps_workspace_switch_visible(client) -> None:
     assert 'class="workspace-top-nav"' not in html
     assert 'class="workspace-switch-strip"' in html
     assert ">聊天<" in html
+    assert ">Agent<" in html
     assert ">收藏夹<" in html
     assert ">Admin<" not in html
     assert ">前往开发者管理台<" in html
     assert 'id="chatWorkspaceBtn"' in html
+    assert 'id="agentModeBtn"' in html
     assert 'id="favoritesWorkspaceBtn"' in html
     assert 'class="workspace-top-switch-btn active"' in html
     assert 'id="refreshAllBtn" class="workspace-refresh-btn"' in html
@@ -577,6 +579,20 @@ def test_favorite_workflow_supports_toggle_and_secondary_actions(client) -> None
     assert "function removeFavoriteMemory(" in script
     assert "function archiveFavoriteConclusion(" in script
     assert "function removeFavoriteLibraryDocument(" in script
+
+
+def test_frontend_agent_mode_calls_agent_run_and_renders_trace(client) -> None:
+    script = _get_web_app_script(client)
+    css = _get_web_styles(client)
+
+    assert "agentMode:" in script
+    assert "els.agentModeBtn" in script
+    assert ('"/agent/run"' in script or '"/agent/runs"' in script)
+    assert "confirmAgentRun" in script
+    assert "/agent/runs/${encodeURIComponent(runId)}/confirm" in script
+    assert "renderAgentTrace" in script
+    assert "Agent 执行轨迹" in script
+    assert ".agent-trace-box" in css
 
 
 def test_admin_uses_enterprise_command_bar_and_panel_grid(client) -> None:
@@ -764,6 +780,18 @@ def test_homepage_keeps_preview_auth_and_settings_surfaces_while_using_recall_sh
     assert "openAuthModal(AUTH_MODE_LOGIN)" in script
     assert "syncAutoChatMode()" in script
     assert "doc.error_message || doc.error_code" in script
+
+
+def test_frontend_exposes_agent_app_builder(client) -> None:
+    html = _get_web_index(client)
+    script = _get_web_app_script(client)
+
+    assert 'id="agentAppsWorkspaceBtn"' in html
+    assert 'id="agentAppsPanel"' in html
+    assert "WORKSPACE_VIEW_AGENT_APPS" in script
+    assert "loadAgentApps" in script
+    assert 'apiRequest("/apps"' in script
+    assert "/invoke" in script
 
 
 def test_frontend_ignores_archived_conclusions_in_favorites_workspace(client) -> None:

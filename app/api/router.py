@@ -1,6 +1,8 @@
 from fastapi import APIRouter
 
 from app.api.routes.admin import router as admin_router
+from app.api.routes.agent import router as agent_router
+from app.api.routes.apps import router as apps_router
 from app.api.routes.auth import router as auth_router
 from app.api.routes.chat import router as chat_router
 from app.api.routes.conclusion import router as conclusion_router
@@ -32,5 +34,7 @@ api_router.include_router(embedding_model_router, tags=["embedding-models"])
 api_router.include_router(document_router, tags=["documents"])
 api_router.include_router(retrieval_router, tags=["retrieval"])
 api_router.include_router(chat_router, tags=["chat"])
+api_router.include_router(agent_router, tags=["agent"])
+api_router.include_router(apps_router, tags=["apps"])
 api_router.include_router(favorite_router, tags=["favorites"])
 api_router.include_router(conclusion_router, tags=["conclusions"])

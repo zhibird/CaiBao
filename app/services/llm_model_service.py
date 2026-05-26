@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from urllib.parse import urlparse
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -10,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.core.exceptions import DomainValidationError, EntityNotFoundError
 from app.models.llm_model_config import LLMModelConfig
+from app.services.model_base_url import normalize_openai_compatible_base_url
 from app.services.user_service import UserService
 
 
@@ -138,8 +138,4 @@ class LLMModelService:
 
     @staticmethod
     def _normalize_base_url(raw: str) -> str:
-        value = raw.strip().rstrip("/")
-        parsed = urlparse(value)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise DomainValidationError("base_url must be a valid http(s) URL.")
-        return value
+        return normalize_openai_compatible_base_url(raw)

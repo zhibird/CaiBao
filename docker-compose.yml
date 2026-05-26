@@ -31,7 +31,7 @@ services:
       - "127.0.0.1:${APP_PORT:-8000}:8000"
     environment:
       APP_NAME: "${APP_NAME:-CaiBao}"
-      APP_VERSION: "${APP_VERSION:-0.18.0}"
+      APP_VERSION: "${APP_VERSION:-0.19.0}"
       APP_ENV: "${APP_ENV:-prod}"
       API_PREFIX: "${API_PREFIX:-/api/v1}"
       DB_LEGACY_INIT_ENABLED: "false"

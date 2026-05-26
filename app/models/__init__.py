@@ -2,6 +2,10 @@
 
 # Re-export model modules for static discovery and Alembic metadata loading.
 from . import (  # noqa: F401
+    agent_app,
+    agent_app_version,
+    agent_run,
+    agent_step,
     answer_favorite,
     auth_refresh_session,
     chat_history,

@@ -11,6 +11,7 @@ const DEFAULT_CONVERSATION_TITLE = "新会话";
 const CHAT_MODE_CHAT = "chat";
 const CHAT_MODE_DOCS = "docs";
 const WORKSPACE_VIEW_CHAT = "chat";
+const WORKSPACE_VIEW_AGENT_APPS = "agent_apps";
 const WORKSPACE_VIEW_FAVORITES = "favorites";
 const RAIL_MODE_COLLAPSED = "collapsed";
 const RAIL_MODE_EXPANDED = "expanded";
@@ -71,10 +72,14 @@ const state = {
   conversations: [],
   history: [],
   documents: [],
+  agentApps: [],
+  agentTools: [],
+  selectedAgentAppId: "",
   favoriteItems: [],
   favoriteWorkspaceAssets: createEmptyFavoriteWorkspaceAssetState(),
   selectedFavoriteId: "",
   selectedDocumentIds: [],
+  agentMode: false,
   chatMode: CHAT_MODE_CHAT,
   workspaceView: WORKSPACE_VIEW_CHAT,
   railMode: RAIL_MODE_COLLAPSED,
@@ -84,6 +89,8 @@ const state = {
   authMode: AUTH_MODE_LOGIN,
   sending: false,
   importing: false,
+  agentAppSaving: false,
+  agentAppTesting: false,
   dragCounter: 0,
   messageCaptures: createEmptyMessageCaptureState(),
   pendingCaptureActions: {},
@@ -128,6 +135,8 @@ function bindElements() {
   els.workspaceEyebrow = document.getElementById("workspaceEyebrow");
   els.workspaceDescription = document.getElementById("workspaceDescription");
   els.chatWorkspaceBtn = document.getElementById("chatWorkspaceBtn");
+  els.agentModeBtn = document.getElementById("agentModeBtn");
+  els.agentAppsWorkspaceBtn = document.getElementById("agentAppsWorkspaceBtn");
   els.favoritesWorkspaceBtn = document.getElementById("favoritesWorkspaceBtn");
   els.railNewChatBtn = document.getElementById("railNewChatBtn");
   els.railConversationsBtn = document.getElementById("railConversationsBtn");
@@ -136,6 +145,20 @@ function bindElements() {
   els.conversationDrawerStatus = document.getElementById("conversationDrawerStatus");
   els.fileDrawerStatus = document.getElementById("fileDrawerStatus");
   els.chatWorkspacePanel = document.getElementById("chatWorkspacePanel");
+  els.agentAppsPanel = document.getElementById("agentAppsPanel");
+  els.agentAppList = document.getElementById("agentAppList");
+  els.agentAppForm = document.getElementById("agentAppForm");
+  els.agentAppNameInput = document.getElementById("agentAppNameInput");
+  els.agentAppModeSelect = document.getElementById("agentAppModeSelect");
+  els.agentAppPromptInput = document.getElementById("agentAppPromptInput");
+  els.agentAppWorkflowInput = document.getElementById("agentAppWorkflowInput");
+  els.agentAppToolsList = document.getElementById("agentAppToolsList");
+  els.createAgentAppBtn = document.getElementById("createAgentAppBtn");
+  els.saveAgentAppBtn = document.getElementById("saveAgentAppBtn");
+  els.publishAgentAppBtn = document.getElementById("publishAgentAppBtn");
+  els.agentAppTaskInput = document.getElementById("agentAppTaskInput");
+  els.invokeAgentAppBtn = document.getElementById("invokeAgentAppBtn");
+  els.agentAppDetailMeta = document.getElementById("agentAppDetailMeta");
   els.favoritesPanel = document.getElementById("favoritesPanel");
   els.favoritesListPane = document.getElementById("favoritesListPane");
   els.favoriteList = document.getElementById("favoriteList");
@@ -324,6 +347,18 @@ function bindEvents() {
       setWorkspaceView(WORKSPACE_VIEW_CHAT).catch((error) => showToast(error.message, true));
     });
   }
+  if (els.agentModeBtn) {
+    els.agentModeBtn.addEventListener("click", () => {
+      state.agentMode = !state.agentMode;
+      refreshComposerChrome();
+      refreshWorkspaceUi();
+    });
+  }
+  if (els.agentAppsWorkspaceBtn) {
+    els.agentAppsWorkspaceBtn.addEventListener("click", () => {
+      setWorkspaceView(WORKSPACE_VIEW_AGENT_APPS).catch((error) => showToast(error.message, true));
+    });
+  }
   if (els.favoritesWorkspaceBtn) {
     els.favoritesWorkspaceBtn.addEventListener("click", () => {
       setWorkspaceView(WORKSPACE_VIEW_FAVORITES).catch((error) => showToast(error.message, true));
@@ -399,6 +434,25 @@ function bindEvents() {
   els.cancelImportBtn.addEventListener("click", hideImportComposer);
   els.fileInput.addEventListener("change", handleFileInputChange);
   els.importBtn.addEventListener("click", handleImportFromComposer);
+  if (els.createAgentAppBtn) {
+    els.createAgentAppBtn.addEventListener("click", createDraftAgentApp);
+  }
+  if (els.agentAppForm) {
+    els.agentAppForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      saveSelectedAgentApp().catch((error) => showToast(error.message, true));
+    });
+  }
+  if (els.publishAgentAppBtn) {
+    els.publishAgentAppBtn.addEventListener("click", () => {
+      publishSelectedAgentApp().catch((error) => showToast(error.message, true));
+    });
+  }
+  if (els.invokeAgentAppBtn) {
+    els.invokeAgentAppBtn.addEventListener("click", () => {
+      invokeSelectedAgentApp().catch((error) => showToast(error.message, true));
+    });
+  }
 
   els.sendBtn.addEventListener("click", handleSend);
   els.messageInput.addEventListener("keydown", (event) => {
@@ -615,6 +669,9 @@ function resetAuthenticatedWorkspace() {
   state.conversations = [];
   state.history = [];
   state.documents = [];
+  state.agentApps = [];
+  state.agentTools = [];
+  state.selectedAgentAppId = "";
   state.favoriteItems = [];
   state.favoriteWorkspaceAssets = createEmptyFavoriteWorkspaceAssetState();
   state.selectedDocumentIds = [];
@@ -627,6 +684,8 @@ function resetAuthenticatedWorkspace() {
   setActiveSurface(ACTIVE_SURFACE_NONE);
   state.sending = false;
   state.importing = false;
+  state.agentAppSaving = false;
+  state.agentAppTesting = false;
   resetMessageCaptureState();
   clearConversation();
   renderConversationList();
@@ -960,15 +1019,17 @@ function getDocumentScopeSummary() {
 }
 
 async function setWorkspaceView(view) {
-  const nextView = view === WORKSPACE_VIEW_FAVORITES
-    ? WORKSPACE_VIEW_FAVORITES
-    : WORKSPACE_VIEW_CHAT;
+  const nextView = view === WORKSPACE_VIEW_AGENT_APPS
+    ? WORKSPACE_VIEW_AGENT_APPS
+    : (view === WORKSPACE_VIEW_FAVORITES ? WORKSPACE_VIEW_FAVORITES : WORKSPACE_VIEW_CHAT);
   state.workspaceView = nextView;
   refreshWorkspaceUi();
 
   if (nextView === WORKSPACE_VIEW_FAVORITES) {
     renderFavoriteWorkspace();
     await loadFavoriteWorkspaceAssets();
+  } else if (nextView === WORKSPACE_VIEW_AGENT_APPS) {
+    await Promise.all([loadAgentTools(), loadAgentApps()]);
   }
 }
 
@@ -994,10 +1055,16 @@ function syncActiveSurface() {
 
 function syncWorkspaceView() {
   const isFavoritesView = state.workspaceView === WORKSPACE_VIEW_FAVORITES;
+  const isAgentAppsView = state.workspaceView === WORKSPACE_VIEW_AGENT_APPS;
+  const isChatView = state.workspaceView === WORKSPACE_VIEW_CHAT;
 
   if (els.chatWorkspaceBtn) {
-    els.chatWorkspaceBtn.classList.toggle("active", !isFavoritesView);
-    els.chatWorkspaceBtn.setAttribute("aria-pressed", String(!isFavoritesView));
+    els.chatWorkspaceBtn.classList.toggle("active", isChatView);
+    els.chatWorkspaceBtn.setAttribute("aria-pressed", String(isChatView));
+  }
+  if (els.agentAppsWorkspaceBtn) {
+    els.agentAppsWorkspaceBtn.classList.toggle("active", isAgentAppsView);
+    els.agentAppsWorkspaceBtn.setAttribute("aria-pressed", String(isAgentAppsView));
   }
   if (els.favoritesWorkspaceBtn) {
     els.favoritesWorkspaceBtn.classList.toggle("active", isFavoritesView);
@@ -1006,8 +1073,15 @@ function syncWorkspaceView() {
       ? `收藏夹 ${state.favoriteItems.length}`
       : "收藏夹";
   }
+  if (els.agentModeBtn) {
+    els.agentModeBtn.classList.toggle("active", state.agentMode);
+    els.agentModeBtn.setAttribute("aria-pressed", String(state.agentMode));
+  }
   if (els.chatWorkspacePanel) {
-    els.chatWorkspacePanel.classList.toggle("hidden", isFavoritesView);
+    els.chatWorkspacePanel.classList.toggle("hidden", !isChatView);
+  }
+  if (els.agentAppsPanel) {
+    els.agentAppsPanel.classList.toggle("hidden", !isAgentAppsView);
   }
   if (els.favoritesPanel) {
     els.favoritesPanel.classList.toggle("hidden", !isFavoritesView);
@@ -1368,7 +1442,7 @@ async function loadAllData() {
     return;
   }
 
-  await Promise.all([loadModelConfigs(), loadEmbeddingConfigs()]);
+  await Promise.all([loadModelConfigs(), loadEmbeddingConfigs(), loadAgentTools(), loadAgentApps()]);
   initModelOptions();
   initEmbeddingOptions();
   await loadConversations();
@@ -1384,6 +1458,7 @@ async function loadAllData() {
     resetMessageCaptureState();
     renderConversationList();
     renderDocuments();
+    renderAgentApps();
     renderFavoriteWorkspace();
     refreshWorkspaceUi();
     return;
@@ -1423,6 +1498,269 @@ async function loadEmbeddingConfigs() {
   const response = await apiRequest(`/embedding/models?${query.toString()}`);
   state.embeddingConfigs = Array.isArray(response.items) ? response.items : [];
   initEmbeddingOptions();
+}
+
+async function loadAgentTools() {
+  if (!ensureIdentity()) {
+    state.agentTools = [];
+    renderAgentAppTools();
+    return;
+  }
+  const response = await apiRequest("/agent/tools");
+  state.agentTools = Array.isArray(response) ? response : [];
+  renderAgentAppTools();
+}
+
+async function loadAgentApps() {
+  if (!ensureIdentity()) {
+    state.agentApps = [];
+    state.selectedAgentAppId = "";
+    renderAgentApps();
+    return;
+  }
+  const response = await apiRequest("/apps");
+  state.agentApps = Array.isArray(response.items) ? response.items : [];
+  if (!state.selectedAgentAppId && state.agentApps.length) {
+    state.selectedAgentAppId = state.agentApps[0].app_id;
+  }
+  if (state.selectedAgentAppId && !state.agentApps.some((item) => item.app_id === state.selectedAgentAppId)) {
+    state.selectedAgentAppId = state.agentApps[0]?.app_id || "";
+  }
+  renderAgentApps();
+}
+
+function getSelectedAgentApp() {
+  return state.agentApps.find((item) => item.app_id === state.selectedAgentAppId) || null;
+}
+
+function selectAgentApp(appId) {
+  state.selectedAgentAppId = appId || "";
+  renderAgentApps();
+  refreshComposerChrome();
+}
+
+function renderAgentApps() {
+  renderAgentAppList();
+  renderAgentAppForm();
+  renderAgentAppTools();
+}
+
+function renderAgentAppList() {
+  if (!els.agentAppList) {
+    return;
+  }
+  els.agentAppList.innerHTML = "";
+  if (!state.agentApps.length) {
+    appendEmpty(els.agentAppList, "还没有 Agent 应用");
+    return;
+  }
+  for (const app of state.agentApps) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `agent-app-item${app.app_id === state.selectedAgentAppId ? " active" : ""}`;
+    button.addEventListener("click", () => selectAgentApp(app.app_id));
+
+    const title = document.createElement("strong");
+    title.textContent = app.name || "未命名应用";
+    const meta = document.createElement("span");
+    meta.textContent = `${app.mode || "agent_auto"} · v${app.app_version || 0} · ${app.status || "draft"}`;
+    button.append(title, meta);
+    els.agentAppList.appendChild(button);
+  }
+}
+
+function renderAgentAppForm() {
+  const app = getSelectedAgentApp();
+  if (els.agentAppNameInput) {
+    els.agentAppNameInput.value = app?.name || "";
+  }
+  if (els.agentAppModeSelect) {
+    els.agentAppModeSelect.value = app?.mode || "agent_auto";
+  }
+  if (els.agentAppPromptInput) {
+    els.agentAppPromptInput.value = app?.system_prompt || "";
+  }
+  if (els.agentAppWorkflowInput) {
+    els.agentAppWorkflowInput.value = JSON.stringify(app?.workflow_config || { nodes: [] }, null, 2);
+  }
+  if (els.agentAppDetailMeta) {
+    els.agentAppDetailMeta.textContent = app
+      ? `/apps/${app.app_id}/invoke · ${app.status} · v${app.app_version || 0}`
+      : "选择应用后可调用 /apps/{app_id}/invoke";
+  }
+  if (els.publishAgentAppBtn) {
+    els.publishAgentAppBtn.disabled = !app || state.agentAppSaving;
+  }
+  if (els.invokeAgentAppBtn) {
+    els.invokeAgentAppBtn.disabled = !app || state.agentAppTesting;
+  }
+}
+
+function renderAgentAppTools() {
+  if (!els.agentAppToolsList) {
+    return;
+  }
+  const app = getSelectedAgentApp();
+  const enabled = new Set(app?.tool_config?.enabled_tools || state.agentTools.map((tool) => tool.name));
+  els.agentAppToolsList.innerHTML = "";
+  if (!state.agentTools.length) {
+    appendEmpty(els.agentAppToolsList, "工具注册表暂不可用");
+    return;
+  }
+  for (const tool of state.agentTools) {
+    const label = document.createElement("label");
+    label.className = "agent-tool-item";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.value = tool.name;
+    checkbox.checked = enabled.has(tool.name);
+    const text = document.createElement("span");
+    text.textContent = `${tool.display_name || tool.name}${tool.dangerous ? " · 需确认" : ""}`;
+    label.append(checkbox, text);
+    els.agentAppToolsList.appendChild(label);
+  }
+}
+
+function readAgentAppToolConfig() {
+  const enabledTools = [...(els.agentAppToolsList?.querySelectorAll("input[type='checkbox']:checked") || [])]
+    .map((item) => item.value)
+    .filter(Boolean);
+  return {
+    enabled_tools: enabledTools,
+    dangerous_requires_confirmation: true,
+  };
+}
+
+function readAgentAppWorkflowConfig() {
+  const raw = (els.agentAppWorkflowInput?.value || "").trim();
+  if (!raw) {
+    return { nodes: [] };
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("Workflow JSON 必须是对象");
+    }
+    return parsed;
+  } catch (error) {
+    throw new Error(`Workflow JSON 无效：${error.message}`);
+  }
+}
+
+async function createDraftAgentApp() {
+  if (!ensureIdentity()) {
+    openAuthModal();
+    showToast("请先登录", true);
+    return;
+  }
+  const created = await apiRequest("/apps", {
+    method: "POST",
+    body: {
+      name: "运维值班助手",
+      description: "Dify-lite Agent App",
+      mode: "agent_auto",
+      system_prompt: "你是企业运维知识 Agent。回答要基于资料；创建 incident、记忆卡、结论等写入动作必须等待用户确认。",
+      retrieval_config: {
+        top_k: 5,
+        include_memory: true,
+        include_library: true,
+        include_conclusions: false,
+      },
+      tool_config: {
+        enabled_tools: state.agentTools.map((tool) => tool.name),
+        dangerous_requires_confirmation: true,
+      },
+      workflow_config: { nodes: [] },
+    },
+  });
+  state.agentApps = [created, ...state.agentApps.filter((item) => item.app_id !== created.app_id)];
+  state.selectedAgentAppId = created.app_id;
+  renderAgentApps();
+  showToast("已创建 Agent 应用");
+}
+
+async function saveSelectedAgentApp() {
+  const app = getSelectedAgentApp();
+  if (!app) {
+    showToast("请先选择 Agent 应用", true);
+    return;
+  }
+  state.agentAppSaving = true;
+  renderAgentAppForm();
+  try {
+    const updated = await apiRequest(`/apps/${encodeURIComponent(app.app_id)}`, {
+      method: "PATCH",
+      body: {
+        name: els.agentAppNameInput?.value.trim() || "未命名应用",
+        mode: els.agentAppModeSelect?.value || "agent_auto",
+        system_prompt: els.agentAppPromptInput?.value || "",
+        tool_config: readAgentAppToolConfig(),
+        workflow_config: readAgentAppWorkflowConfig(),
+      },
+    });
+    state.agentApps = state.agentApps.map((item) => item.app_id === updated.app_id ? updated : item);
+    state.selectedAgentAppId = updated.app_id;
+    renderAgentApps();
+    showToast("Agent 应用已保存");
+  } finally {
+    state.agentAppSaving = false;
+    renderAgentAppForm();
+  }
+}
+
+async function publishSelectedAgentApp() {
+  const app = getSelectedAgentApp();
+  if (!app) {
+    showToast("请先选择 Agent 应用", true);
+    return;
+  }
+  await saveSelectedAgentApp();
+  const version = await apiRequest(`/apps/${encodeURIComponent(app.app_id)}/publish`, {
+    method: "POST",
+    body: { notes: "Published from Agent App Builder" },
+  });
+  await loadAgentApps();
+  showToast(`已发布 v${version.version_number}`);
+}
+
+async function invokeSelectedAgentApp() {
+  const app = getSelectedAgentApp();
+  const task = (els.agentAppTaskInput?.value || "").trim();
+  if (!app || !task) {
+    showToast("请选择应用并填写测试任务", true);
+    return;
+  }
+  await ensureConversationReady();
+  state.agentAppTesting = true;
+  renderAgentAppForm();
+  state.agentMode = true;
+  setWorkspaceStage(WORKSPACE_STAGE_CHAT);
+  await setWorkspaceView(WORKSPACE_VIEW_CHAT);
+  appendMessage("user", task);
+  appendPendingAssistantMessage("Agent 应用正在执行…");
+  try {
+    const body = {
+      conversation_id: state.conversationId,
+      space_id: getActiveSpaceId(),
+      task,
+      dry_run: false,
+      confirm_dangerous_actions: false,
+      embedding_model: state.selectedEmbedding || DEFAULT_EMBEDDING_ID,
+    };
+    if (state.selectedModel !== DEFAULT_MODEL_ID) {
+      body.model = state.selectedModel;
+    }
+    const createResponse = await apiRequest(`/apps/${encodeURIComponent(app.app_id)}/runs`, {
+      method: "POST",
+      body,
+    });
+    await consumeAgentStream(createResponse.stream_url, task);
+    await Promise.all([loadHistory(), loadConversations()]);
+  } finally {
+    removePendingAssistantMessage();
+    state.agentAppTesting = false;
+    renderAgentAppForm();
+  }
 }
 
 function setSurfaceStatus(targetEl, message, isError = false) {
@@ -1852,7 +2190,7 @@ function renderCurrentConversationMessages(options = {}) {
   const ordered = [...state.history].reverse();
   const latestMessageId = state.history[0]?.message_id || "";
   for (const item of ordered) {
-    const allowLatestEdit = item.message_id === latestMessageId && item.channel !== "action";
+    const allowLatestEdit = item.message_id === latestMessageId && !["action", "agent"].includes(item.channel);
     appendMessage("user", item.request_text || "", {
       createdAt: item.created_at,
       messageId: item.message_id,
@@ -1869,6 +2207,12 @@ function renderCurrentConversationMessages(options = {}) {
       sources: normalizeResponseSources(responsePayload),
       mode: responsePayload.mode || "",
       model: responsePayload.model || "",
+      agentRunId: responsePayload.run_id || "",
+      agentStatus: responsePayload.status || "",
+      agentSteps: Array.isArray(responsePayload.steps) ? responsePayload.steps : [],
+      requiredConfirmations: Array.isArray(responsePayload.required_confirmations)
+        ? responsePayload.required_confirmations
+        : [],
       messageId: item.message_id,
       spaceId: item.space_id,
       requestText: item.request_text || "",
@@ -2123,8 +2467,8 @@ async function editHistoryMessage(messageId, currentText, channel) {
   if (!messageId) {
     return;
   }
-  if (channel === "action") {
-    showToast("工具调用消息不支持编辑", true);
+  if (channel === "action" || channel === "agent") {
+    showToast("工具调用和 Agent 消息不支持编辑", true);
     return;
   }
 
@@ -2171,8 +2515,8 @@ async function regenerateAssistantMessage(messageId, requestText, channel) {
   if (!messageId || !requestText) {
     return;
   }
-  if (channel === "action") {
-    showToast("工具调用消息不支持重新生成", true);
+  if (channel === "action" || channel === "agent") {
+    showToast("工具调用和 Agent 消息不支持重新生成", true);
     return;
   }
 
@@ -2735,10 +3079,13 @@ function renderComposerContextRow() {
 
   const readyCount = getReadyDocumentCount();
   const processingCount = getProcessingDocumentCount();
+  const selectedAgentApp = getSelectedAgentApp();
   const chips = [
     {
-      label: state.chatMode === CHAT_MODE_DOCS && readyCount ? "资料增强" : "直接聊天",
-      tone: state.chatMode === CHAT_MODE_DOCS ? "accent" : "neutral",
+      label: state.agentMode
+        ? (selectedAgentApp ? `应用 · ${selectedAgentApp.name}` : "Agent执行")
+        : (state.chatMode === CHAT_MODE_DOCS && readyCount ? "资料增强" : "直接聊天"),
+      tone: state.agentMode || state.chatMode === CHAT_MODE_DOCS ? "accent" : "neutral",
     },
     {
       label: state.documents.length ? `${state.documents.length} 文档` : "暂无文档",
@@ -3353,28 +3700,44 @@ async function handleSend() {
   syncSendButtonState();
 
   appendMessage("user", question);
+  const usingAgentMode = state.agentMode;
+  const selectedAgentApp = usingAgentMode ? getSelectedAgentApp() : null;
   const usingDocumentScope = getReadyDocumentCount() > 0;
-  const pendingLabel = usingDocumentScope
-    ? (getExplicitSelectedDocumentIds().length
-      ? "正在基于选中文件检索并生成回答…"
-      : "正在结合本会话资料增强回答…")
-    : "正在思考并生成回答…";
+  const pendingLabel = usingAgentMode
+    ? (selectedAgentApp ? `Agent 应用「${selectedAgentApp.name}」正在执行…` : "Agent 正在规划、检索并检查工具动作…")
+    : usingDocumentScope
+      ? (getExplicitSelectedDocumentIds().length
+        ? "正在基于选中文件检索并生成回答…"
+        : "正在结合本会话资料增强回答…")
+      : "正在思考并生成回答…";
   appendPendingAssistantMessage(pendingLabel);
   els.messageInput.value = "";
   autoGrowTextarea();
 
   try {
-    const payload = {
-      user_id: state.userId,
-      team_id: state.teamId,
-      conversation_id: state.conversationId,
-      question,
-      top_k: 5,
-      use_document_scope: usingDocumentScope,
-      include_memory: false,
-      include_library: false,
-      embedding_model: state.selectedEmbedding || DEFAULT_EMBEDDING_ID,
-    };
+    const payload = usingAgentMode
+      ? {
+        user_id: state.userId,
+        team_id: state.teamId,
+        conversation_id: state.conversationId,
+        space_id: getActiveSpaceId(),
+        task: question,
+        top_k: 5,
+        dry_run: false,
+        confirm_dangerous_actions: false,
+        embedding_model: state.selectedEmbedding || DEFAULT_EMBEDDING_ID,
+      }
+      : {
+        user_id: state.userId,
+        team_id: state.teamId,
+        conversation_id: state.conversationId,
+        question,
+        top_k: 5,
+        use_document_scope: usingDocumentScope,
+        include_memory: false,
+        include_library: false,
+        embedding_model: state.selectedEmbedding || DEFAULT_EMBEDDING_ID,
+      };
 
     if (state.selectedModel !== DEFAULT_MODEL_ID) {
       payload.model = state.selectedModel;
@@ -3385,16 +3748,32 @@ async function handleSend() {
       payload.selected_document_ids = selectedDocumentIds;
     }
 
-    await apiRequest("/chat/ask", {
-      method: "POST",
-      body: payload,
-    });
-    removePendingAssistantMessage();
-    await Promise.all([
-      loadHistory(),
-      maybeAutoTitleConversation(question).catch(() => null),
-    ]);
-    await loadConversations();
+    if (usingAgentMode) {
+      // Streaming agent path
+      const runsPath = selectedAgentApp
+        ? `/apps/${encodeURIComponent(selectedAgentApp.app_id)}/runs`
+        : "/agent/runs";
+      const createResponse = await apiRequest(runsPath, { method: "POST", body: payload });
+
+      await consumeAgentStream(createResponse.stream_url, question);
+      await Promise.all([
+        loadHistory(),
+        maybeAutoTitleConversation(question).catch(() => null),
+      ]);
+      await loadConversations();
+    } else {
+      const requestPath = "/chat/ask";
+      await apiRequest(requestPath, {
+        method: "POST",
+        body: payload,
+      });
+      removePendingAssistantMessage();
+      await Promise.all([
+        loadHistory(),
+        maybeAutoTitleConversation(question).catch(() => null),
+      ]);
+      await loadConversations();
+    }
   } catch (error) {
     removePendingAssistantMessage();
     const message = String(error.message || "发送失败");
@@ -3489,6 +3868,134 @@ async function tryEchoFallback(question, errorMessage) {
   } catch {
     return null;
   }
+}
+
+async function consumeAgentStream(streamUrl, question) {
+  return new Promise((resolve, reject) => {
+    const fullUrl = `${window.location.origin}${API_PREFIX}${streamUrl}`;
+    const source = new EventSource(fullUrl);
+
+    let accumulatedText = "";
+    let currentStatus = "";
+    let agentRunId = "";
+    let requiredConfirmations = [];
+
+    const updatePendingLabel = (text) => {
+      const pendingEl = document.querySelector(".message.assistant.pending .message-content .message-text");
+      if (pendingEl) {
+        pendingEl.textContent = text || "Agent is thinking...";
+      }
+    };
+
+    source.addEventListener("llm.delta", (e) => {
+      try {
+        const event = JSON.parse(e.data);
+        if (event.payload && event.payload.text) {
+          accumulatedText += event.payload.text;
+          updatePendingLabel(accumulatedText);
+        }
+      } catch {}
+    });
+
+    source.addEventListener("tool.proposed", (e) => {
+      try {
+        const event = JSON.parse(e.data);
+        if (event.payload && event.payload.tool_name) {
+          updatePendingLabel(`Agent is using tool: ${event.payload.tool_name}...`);
+        }
+      } catch {}
+    });
+
+    source.addEventListener("tool.started", (e) => {
+      try {
+        const event = JSON.parse(e.data);
+        if (event.payload && event.payload.tool_name) {
+          updatePendingLabel(`Executing: ${event.payload.tool_name}...`);
+        }
+      } catch {}
+    });
+
+    source.addEventListener("tool.result", (e) => {
+      try {
+        const event = JSON.parse(e.data);
+        updatePendingLabel("Agent is analyzing tool results...");
+      } catch {}
+    });
+
+    source.addEventListener("confirmation.required", (e) => {
+      try {
+        const event = JSON.parse(e.data);
+        requiredConfirmations = [event.payload || {}];
+        agentRunId = event.run_id || "";
+        updatePendingLabel("Confirmation required. Please approve the tool execution.");
+      } catch {}
+    });
+
+    source.addEventListener("run.completed", (e) => {
+      source.close();
+      try {
+        const event = JSON.parse(e.data);
+        const payload = event.payload || {};
+        const finalAnswer = payload.answer || accumulatedText || "Agent has completed.";
+        agentRunId = payload.run_id || agentRunId;
+        const status = payload.status || "completed";
+        const steps = Array.isArray(payload.steps) ? payload.steps : [];
+        const sources = Array.isArray(payload.sources) ? payload.sources : [];
+
+        removePendingAssistantMessage();
+        appendMessage("assistant", finalAnswer, {
+          createdAt: payload.completed_at || payload.created_at || new Date().toISOString(),
+          sources: normalizeResponseSources({ sources }),
+          agentRunId,
+          agentStatus: status,
+          agentSteps: steps,
+          requiredConfirmations: requiredConfirmations,
+        });
+        resolve(payload);
+      } catch {
+        removePendingAssistantMessage();
+        appendMessage("assistant", accumulatedText || "Agent has completed.");
+        resolve({});
+      }
+    });
+
+    source.addEventListener("run.failed", (e) => {
+      source.close();
+      try {
+        const event = JSON.parse(e.data);
+        const error = (event.payload && event.payload.error) || "Agent execution failed.";
+        removePendingAssistantMessage();
+        appendMessage("assistant", `Agent 执行失败：${error}`);
+        showToast(error, true);
+      } catch {
+        removePendingAssistantMessage();
+        appendMessage("assistant", "Agent 执行失败。");
+      }
+      reject(new Error((e.data && JSON.parse(e.data).payload && JSON.parse(e.data).payload.error) || "Agent execution failed"));
+    });
+
+    source.addEventListener("step.completed", (e) => {
+      // Trace step completion silently
+    });
+
+    source.addEventListener("run.started", (e) => {
+      try {
+        const event = JSON.parse(e.data);
+        agentRunId = event.run_id || "";
+      } catch {}
+    });
+
+    source.onerror = (e) => {
+      source.close();
+      removePendingAssistantMessage();
+      if (accumulatedText) {
+        appendMessage("assistant", accumulatedText);
+      } else {
+        appendMessage("assistant", "Stream 连接中断，请重试。");
+      }
+      reject(new Error("SSE connection error"));
+    };
+  });
 }
 
 async function handleImportFromComposer() {
@@ -3922,6 +4429,10 @@ function appendMessage(role, content, options = {}) {
     message.appendChild(sourceBox);
   }
 
+  if (role === "assistant" && Array.isArray(options.agentSteps) && options.agentSteps.length) {
+    renderAgentTrace(message, options);
+  }
+
   const assistantCaptureContext = role === "assistant" && options.messageId && options.spaceId
     ? {
       messageId: options.messageId,
@@ -3997,6 +4508,83 @@ function appendMessage(role, content, options = {}) {
   if (options.autoScroll !== false) {
     scrollToBottom();
   }
+}
+
+function renderAgentTrace(message, options = {}) {
+  const traceBox = document.createElement("div");
+  traceBox.className = "agent-trace-box";
+
+  const head = document.createElement("div");
+  head.className = "agent-trace-head";
+
+  const title = document.createElement("span");
+  title.textContent = "Agent 执行轨迹";
+
+  const status = document.createElement("span");
+  status.className = `agent-status ${normalizeStatus(options.agentStatus || "completed")}`;
+  status.textContent = options.agentStatus || "completed";
+  head.append(title, status);
+  traceBox.appendChild(head);
+
+  const list = document.createElement("ol");
+  list.className = "agent-step-list";
+  for (const step of options.agentSteps.slice(0, 8)) {
+    const item = document.createElement("li");
+    item.className = `agent-step ${normalizeStatus(step.status || "")}`;
+
+    const stepTitle = document.createElement("span");
+    stepTitle.className = "agent-step-title";
+    stepTitle.textContent = `${step.step_type || "step"} · ${step.title || "Untitled"}`;
+
+    const stepMeta = document.createElement("span");
+    stepMeta.className = "agent-step-meta";
+    stepMeta.textContent = [step.status, step.tool_name].filter(Boolean).join(" · ");
+
+    item.append(stepTitle, stepMeta);
+    list.appendChild(item);
+  }
+  traceBox.appendChild(list);
+
+  const confirmations = Array.isArray(options.requiredConfirmations) ? options.requiredConfirmations : [];
+  if (confirmations.length) {
+    const confirmBox = document.createElement("div");
+    confirmBox.className = "agent-confirm-box";
+    const confirmText = document.createElement("span");
+    confirmText.textContent = `需要确认：${confirmations.map((item) => item.tool_name).join(", ")}`;
+    confirmBox.appendChild(confirmText);
+
+    if (options.agentRunId) {
+      const confirmBtn = document.createElement("button");
+      confirmBtn.type = "button";
+      confirmBtn.className = "message-icon-btn active";
+      confirmBtn.textContent = "确认执行";
+      confirmBtn.addEventListener("click", () => {
+        confirmAgentRun(options.agentRunId).catch((error) => showToast(error.message, true));
+      });
+      confirmBox.appendChild(confirmBtn);
+    }
+    traceBox.appendChild(confirmBox);
+  }
+
+  message.appendChild(traceBox);
+}
+
+async function confirmAgentRun(runId) {
+  const response = await apiRequest(`/agent/runs/${encodeURIComponent(runId)}/confirm`, {
+    method: "POST",
+    body: {},
+  });
+  appendMessage("assistant", response.answer || "Agent 已确认执行。", {
+    createdAt: response.completed_at || response.created_at,
+    sources: normalizeResponseSources(response),
+    agentRunId: response.run_id || runId,
+    agentStatus: response.status || "",
+    agentSteps: Array.isArray(response.steps) ? response.steps : [],
+    requiredConfirmations: Array.isArray(response.required_confirmations)
+      ? response.required_confirmations
+      : [],
+  });
+  showToast("Agent 已执行确认动作");
 }
 
 function renderAssistantContent(container, contentParts, fallbackText = "") {
@@ -4412,14 +5000,16 @@ function refreshWorkspaceUi() {
 
   if (els.composerPresence) {
     els.composerPresence.textContent = state.sending
-      ? "CaiBao 正在整理回答"
+      ? (state.agentMode ? "Agent 正在执行任务" : "CaiBao 正在整理回答")
       : (loggedIn ? `账号 · ${getWorkspaceDisplayName()}` : "尚未登录");
   }
   if (els.composerScope) {
     els.composerScope.textContent = `资料范围 · ${scope.label}`;
   }
   if (els.composerSession) {
-    els.composerSession.textContent = `回答模型 · ${formatModelDisplayName(state.selectedModel)}`;
+    els.composerSession.textContent = state.agentMode
+      ? `Agent 模式 · ${formatModelDisplayName(state.selectedModel)}`
+      : `回答模型 · ${formatModelDisplayName(state.selectedModel)}`;
   }
   if (els.composerHint) {
     if (state.importing) {
@@ -4937,7 +5527,8 @@ function sleep(ms) {
 
 function normalizeStatus(status) {
   const normalized = String(status || "uploaded").trim().toLowerCase();
-  if (["pending", "uploaded", "parsing", "chunking", "indexing", "ready", "failed", "deleted"].includes(normalized)) {
+  if (["pending", "uploaded", "parsing", "chunking", "indexing", "ready", "failed", "deleted",
+       "completed", "requires_confirmation", "partial_success", "running", "skipped"].includes(normalized)) {
     return normalized;
   }
   return "uploaded";

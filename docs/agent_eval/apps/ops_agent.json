@@ -1,0 +1,88 @@
+{
+  "app": {
+    "name": "运维值班助手",
+    "description": "Dify-lite Agent App baseline for enterprise ops demos.",
+    "mode": "agent_auto",
+    "system_prompt": "你是企业运维知识 Agent。优先基于资料回答；创建 incident、记忆卡和结论沉淀都必须等待用户确认。",
+    "retrieval_config": {
+      "top_k": 5,
+      "include_memory": false,
+      "include_library": false,
+      "include_conclusions": false
+    },
+    "tool_config": {
+      "enabled_tools": [
+        "search_knowledge",
+        "list_recent_documents",
+        "create_incident",
+        "create_memory_card",
+        "promote_to_conclusion",
+        "generate_incident_report"
+      ],
+      "dangerous_requires_confirmation": true
+    },
+    "workflow_config": {
+      "nodes": []
+    }
+  },
+  "cases": [
+    {
+      "id": "app_plain_001",
+      "category": "qa",
+      "task": "请解释一下这个工作台能做什么，不要创建事件。",
+      "expected_status": "completed",
+      "expected_tools": []
+    },
+    {
+      "id": "app_docs_001",
+      "category": "tool",
+      "task": "查最近文档，limit 1",
+      "expected_status": "completed",
+      "expected_tools": ["list_recent_documents"],
+      "expected_arguments": {
+        "list_recent_documents": {
+          "limit": 1
+        }
+      }
+    },
+    {
+      "id": "app_incident_001",
+      "category": "dangerous_tool",
+      "task": "数据库 CPU 告警了，创建一个 P1 incident：Database CPU usage above threshold",
+      "expected_status": "requires_confirmation",
+      "expected_confirmed_status": "completed",
+      "expected_tools": ["create_incident"],
+      "dangerous_action_expected": true,
+      "expected_arguments": {
+        "create_incident": {
+          "severity": "P1",
+          "title_contains": "Database CPU"
+        }
+      }
+    },
+    {
+      "id": "app_mixed_001",
+      "category": "mixed",
+      "task": "数据库 CPU 告警了，查处理手册，判断是否要升级为 P1，并生成事件报告。",
+      "expected_status": "requires_confirmation",
+      "expected_tools": ["search_knowledge", "create_incident", "generate_incident_report"],
+      "dangerous_action_expected": true
+    },
+    {
+      "id": "app_memory_001",
+      "category": "dangerous_tool",
+      "task": "把这条处理经验沉淀为长期记忆：数据库 CPU 告警先查慢 SQL 和连接池。",
+      "expected_status": "requires_confirmation",
+      "expected_tools": ["create_memory_card"],
+      "dangerous_action_expected": true
+    },
+    {
+      "id": "app_conclusion_001",
+      "category": "dangerous_tool",
+      "task": "把处理结论沉淀到知识库：数据库 CPU 告警达到 90% 且持续 10 分钟时升级为 P1。",
+      "expected_status": "requires_confirmation",
+      "expected_tools": ["promote_to_conclusion"],
+      "dangerous_action_expected": true
+    }
+  ]
+}

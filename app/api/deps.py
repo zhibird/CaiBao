@@ -4,6 +4,8 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings, reload_settings
 from app.core.exceptions import DomainValidationError
 from app.db.session import get_db_session
+from app.services.agent_app_service import AgentAppService
+from app.services.agent_service import AgentService
 from app.services.action_chat_service import ActionChatService
 from app.services.admin_service import AdminService
 from app.services.auth_service import AuthService
@@ -179,6 +181,42 @@ def get_action_chat_service(
     return ActionChatService(
         user_service=user_service,
         tool_service=tool_service,
+    )
+
+
+def get_agent_service(
+    db: Session = Depends(get_db_session),
+    user_service: UserService = Depends(get_user_service),
+    document_service: DocumentService = Depends(get_document_service),
+    rag_chat_service: RagChatService = Depends(get_rag_chat_service),
+    tool_service: ToolService = Depends(get_tool_service),
+    chat_history_service: ChatHistoryService = Depends(get_chat_history_service),
+    llm_service: LLMService = Depends(get_llm_service),
+    llm_model_service: LLMModelService = Depends(get_llm_model_service),
+) -> AgentService:
+    return AgentService(
+        db=db,
+        user_service=user_service,
+        document_service=document_service,
+        rag_chat_service=rag_chat_service,
+        tool_service=tool_service,
+        chat_history_service=chat_history_service,
+        llm_service=llm_service,
+        llm_model_service=llm_model_service,
+    )
+
+
+def get_agent_app_service(
+    db: Session = Depends(get_db_session),
+    user_service: UserService = Depends(get_user_service),
+    document_service: DocumentService = Depends(get_document_service),
+    agent_service: AgentService = Depends(get_agent_service),
+) -> AgentAppService:
+    return AgentAppService(
+        db=db,
+        user_service=user_service,
+        document_service=document_service,
+        agent_service=agent_service,
     )
 
 
