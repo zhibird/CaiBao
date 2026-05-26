@@ -29,7 +29,7 @@ DEFAULT_UPLOAD_ROOT_DIR = str(DEFAULT_RUNTIME_ROOT / "uploads")
 
 class Settings(BaseSettings):
     app_name: str = "CaiBao"
-    app_version: str = "0.18.0"
+    app_version: str = "0.19.0"
     app_env: str = "dev"
     api_prefix: str = "/api/v1"
     database_url: str

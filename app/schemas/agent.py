@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.schemas.chat import ChatSource
 
@@ -32,6 +32,30 @@ class AgentRunRequest(BaseModel):
     embedding_model: str | None = Field(default=None, min_length=1, max_length=128)
     enabled_tools: list[str] | None = None
     workflow_config: dict[str, Any] = Field(default_factory=dict)
+    model_routes: dict[str, Any] | None = None
+
+    @field_validator("model_routes", mode="before")
+    @classmethod
+    def _sanitize_model_routes(cls, value: Any) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            return None
+        sanitized: dict[str, Any] = {}
+        for role in ("planner", "fast", "vision"):
+            entry = value.get(role)
+            if entry is None:
+                sanitized[role] = None
+            elif isinstance(entry, str):
+                sanitized[role] = entry.strip() if entry.strip() else None
+            elif isinstance(entry, dict):
+                # Normalize {"model_name": "foo"} to plain string "foo" so
+                # LLMRouter._parse_route_value resolves user-configured models.
+                model_ref = str(entry.get("model_name", "")).strip()
+                sanitized[role] = model_ref if model_ref else None
+            else:
+                sanitized[role] = None
+        return sanitized
 
 
 class AgentConfirmRequest(BaseModel):
@@ -115,10 +139,54 @@ class AgentRunResponse(BaseModel):
     latency_ms: int | None = None
     created_at: datetime
     completed_at: datetime | None = None
+    model_routes: dict[str, Any] | None = None
 
 
 class AgentRunListResponse(BaseModel):
     items: list[AgentRunResponse]
+
+
+class AgentRunStartResponse(BaseModel):
+    run_id: str
+    stream_url: str
+    status: str
+
+
+class AgentStreamEvent(BaseModel):
+    event: str
+    run_id: str
+    step_index: int | None = None
+    seq: int = 0
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class LLMCompletionResult(BaseModel):
+    assistant_text: str
+    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+    finish_reason: str | None = None
+    raw_message: dict[str, Any] | None = None
+    usage: dict[str, Any] | None = None
+    model: str | None = None
+
+
+class LLMStreamChunk(BaseModel):
+    delta_text: str | None = None
+    tool_call_deltas: list[dict[str, Any]] = Field(default_factory=list)
+    finish_reason: str | None = None
+
+
+class ModelRoute(BaseModel):
+    model_name: str
+    base_url: str
+    api_key: str | None = Field(default=None, exclude=True)
+    source: str = "default"
+    capabilities: dict[str, Any] = Field(default_factory=dict)
+
+
+class LLMRoutesConfig(BaseModel):
+    planner: ModelRoute
+    fast: ModelRoute | None = None
+    vision: ModelRoute | None = None
 
 
 def _safe_json_loads(raw: str) -> dict[str, Any]:

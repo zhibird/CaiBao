@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Any
+
+try:
+    import jsonschema as _jsonschema_lib
+except ImportError:
+    _jsonschema_lib = None
 
 
 @dataclass(frozen=True)
@@ -33,6 +39,47 @@ class ToolDefinition:
             "permission_scope": self.permission_scope,
             "parameters": self.input_schema,
         }
+
+    def to_openai_tool(self) -> dict[str, Any]:
+        """Map to OpenAI-compatible function calling tool definition."""
+        schema = copy.deepcopy(self.input_schema)
+        # OpenAI requires type: "object" at the top level
+        if not isinstance(schema, dict) or schema.get("type") != "object":
+            schema = {"type": "object", "properties": {}, **schema}
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": schema,
+            },
+        }
+
+    def validate_arguments(self, raw_args: dict[str, Any]) -> list[str]:
+        """Validate arguments against input_schema. Returns list of error strings."""
+        if _jsonschema_lib is None:
+            return []
+        errors: list[str] = []
+        try:
+            validator_cls = _jsonschema_lib.validators.validator_for(self.input_schema)
+            validator = validator_cls(self.input_schema)
+            for err in validator.iter_errors(raw_args):
+                path = ".".join(str(p) for p in err.absolute_path) if err.absolute_path else "<root>"
+                errors.append(f"{path}: {err.message}")
+        except Exception:
+            pass
+        return errors
+
+    def normalize_arguments(self, raw_args: dict[str, Any]) -> dict[str, Any]:
+        """Normalize and fill defaults according to the schema."""
+        args = dict(raw_args)
+        properties = self.input_schema.get("properties", {}) if isinstance(self.input_schema, dict) else {}
+        for prop_name, prop_schema in properties.items():
+            if not isinstance(prop_schema, dict):
+                continue
+            if "default" in prop_schema and prop_name not in args:
+                args[prop_name] = prop_schema["default"]
+        return args
 
 
 AGENT_TOOL_DEFINITIONS = {
@@ -156,3 +203,12 @@ def get_tool_definition(name: str) -> ToolDefinition | None:
 
 def list_tool_definitions() -> list[ToolDefinition]:
     return list(AGENT_TOOL_DEFINITIONS.values())
+
+
+def get_openai_tools(enabled_tools: list[str] | None = None) -> list[dict[str, Any]]:
+    """Return OpenAI-compatible tool definitions for enabled tools."""
+    definitions = list_tool_definitions()
+    if enabled_tools:
+        allowed = {t.strip().lower() for t in enabled_tools if t.strip()}
+        definitions = [d for d in definitions if d.name.lower() in allowed]
+    return [d.to_openai_tool() for d in definitions if d.enabled]

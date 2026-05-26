@@ -4,9 +4,30 @@ import json
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.schemas.agent import AgentRunResponse
+
+
+def _sanitize_llm_routing(value: Any) -> dict[str, Any] | None:
+    """Strip raw api_key/base_url from llm_routing; only model-name refs are accepted."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return None
+    sanitized: dict[str, Any] = {}
+    for role in ("planner", "fast", "vision"):
+        entry = value.get(role)
+        if entry is None:
+            sanitized[role] = None
+        elif isinstance(entry, str):
+            sanitized[role] = entry.strip() if entry.strip() else None
+        elif isinstance(entry, dict):
+            model_ref = str(entry.get("model_name", "")).strip()
+            sanitized[role] = model_ref if model_ref else None
+        else:
+            sanitized[role] = None
+    return sanitized
 
 
 class AgentAppCreate(BaseModel):
@@ -22,7 +43,13 @@ class AgentAppCreate(BaseModel):
     retrieval_config: dict[str, Any] = Field(default_factory=dict)
     tool_config: dict[str, Any] = Field(default_factory=dict)
     workflow_config: dict[str, Any] = Field(default_factory=dict)
+    llm_routing: dict[str, Any] = Field(default_factory=dict)
     status: str = Field(default="draft", min_length=1, max_length=32)
+
+    @field_validator("llm_routing", mode="before")
+    @classmethod
+    def _sanitize_llm_routing(cls, value: Any) -> dict[str, Any] | None:
+        return _sanitize_llm_routing(value)
 
 
 class AgentAppUpdate(BaseModel):
@@ -38,7 +65,13 @@ class AgentAppUpdate(BaseModel):
     retrieval_config: dict[str, Any] | None = None
     tool_config: dict[str, Any] | None = None
     workflow_config: dict[str, Any] | None = None
+    llm_routing: dict[str, Any] | None = None
     status: str | None = Field(default=None, min_length=1, max_length=32)
+
+    @field_validator("llm_routing", mode="before")
+    @classmethod
+    def _sanitize_llm_routing(cls, value: Any) -> dict[str, Any] | None:
+        return _sanitize_llm_routing(value)
 
 
 class AgentAppPublishRequest(BaseModel):
@@ -106,6 +139,7 @@ class AgentAppResponse(BaseModel):
     retrieval_config: dict[str, Any]
     tool_config: dict[str, Any]
     workflow_config: dict[str, Any]
+    llm_routing: dict[str, Any] = Field(default_factory=dict)
     status: str
     app_version: int
     created_at: datetime
@@ -129,6 +163,7 @@ class AgentAppResponse(BaseModel):
             retrieval_config=_safe_json_loads(record.retrieval_config_json),
             tool_config=_safe_json_loads(record.tool_config_json),
             workflow_config=_safe_json_loads(record.workflow_config_json),
+            llm_routing=_sanitize_llm_routing(_safe_json_loads(record.llm_routing_json)) or {},
             status=record.status,
             app_version=record.app_version,
             created_at=record.created_at,

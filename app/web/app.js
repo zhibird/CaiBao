@@ -1739,27 +1739,22 @@ async function invokeSelectedAgentApp() {
   appendMessage("user", task);
   appendPendingAssistantMessage("Agent 应用正在执行…");
   try {
-    const response = await apiRequest(`/apps/${encodeURIComponent(app.app_id)}/invoke`, {
+    const body = {
+      conversation_id: state.conversationId,
+      space_id: getActiveSpaceId(),
+      task,
+      dry_run: false,
+      confirm_dangerous_actions: false,
+      embedding_model: state.selectedEmbedding || DEFAULT_EMBEDDING_ID,
+    };
+    if (state.selectedModel !== DEFAULT_MODEL_ID) {
+      body.model = state.selectedModel;
+    }
+    const createResponse = await apiRequest(`/apps/${encodeURIComponent(app.app_id)}/runs`, {
       method: "POST",
-      body: {
-        conversation_id: state.conversationId,
-        space_id: getActiveSpaceId(),
-        task,
-        dry_run: false,
-        confirm_dangerous_actions: false,
-        embedding_model: state.selectedEmbedding || DEFAULT_EMBEDDING_ID,
-        model: state.selectedModel !== DEFAULT_MODEL_ID ? state.selectedModel : undefined,
-      },
+      body,
     });
-    removePendingAssistantMessage();
-    appendMessage("assistant", response.answer || "Agent 应用已完成。", {
-      createdAt: response.completed_at || response.created_at,
-      sources: normalizeResponseSources(response),
-      agentRunId: response.run_id || "",
-      agentStatus: response.status || "",
-      agentSteps: Array.isArray(response.steps) ? response.steps : [],
-      requiredConfirmations: Array.isArray(response.required_confirmations) ? response.required_confirmations : [],
-    });
+    await consumeAgentStream(createResponse.stream_url, task);
     await Promise.all([loadHistory(), loadConversations()]);
   } finally {
     removePendingAssistantMessage();
@@ -3753,20 +3748,32 @@ async function handleSend() {
       payload.selected_document_ids = selectedDocumentIds;
     }
 
-    const requestPath = usingAgentMode && selectedAgentApp
-      ? `/apps/${encodeURIComponent(selectedAgentApp.app_id)}/invoke`
-      : (usingAgentMode ? "/agent/run" : "/chat/ask");
+    if (usingAgentMode) {
+      // Streaming agent path
+      const runsPath = selectedAgentApp
+        ? `/apps/${encodeURIComponent(selectedAgentApp.app_id)}/runs`
+        : "/agent/runs";
+      const createResponse = await apiRequest(runsPath, { method: "POST", body: payload });
 
-    await apiRequest(requestPath, {
-      method: "POST",
-      body: payload,
-    });
-    removePendingAssistantMessage();
-    await Promise.all([
-      loadHistory(),
-      maybeAutoTitleConversation(question).catch(() => null),
-    ]);
-    await loadConversations();
+      await consumeAgentStream(createResponse.stream_url, question);
+      await Promise.all([
+        loadHistory(),
+        maybeAutoTitleConversation(question).catch(() => null),
+      ]);
+      await loadConversations();
+    } else {
+      const requestPath = "/chat/ask";
+      await apiRequest(requestPath, {
+        method: "POST",
+        body: payload,
+      });
+      removePendingAssistantMessage();
+      await Promise.all([
+        loadHistory(),
+        maybeAutoTitleConversation(question).catch(() => null),
+      ]);
+      await loadConversations();
+    }
   } catch (error) {
     removePendingAssistantMessage();
     const message = String(error.message || "发送失败");
@@ -3861,6 +3868,134 @@ async function tryEchoFallback(question, errorMessage) {
   } catch {
     return null;
   }
+}
+
+async function consumeAgentStream(streamUrl, question) {
+  return new Promise((resolve, reject) => {
+    const fullUrl = `${window.location.origin}${API_PREFIX}${streamUrl}`;
+    const source = new EventSource(fullUrl);
+
+    let accumulatedText = "";
+    let currentStatus = "";
+    let agentRunId = "";
+    let requiredConfirmations = [];
+
+    const updatePendingLabel = (text) => {
+      const pendingEl = document.querySelector(".message.assistant.pending .message-content .message-text");
+      if (pendingEl) {
+        pendingEl.textContent = text || "Agent is thinking...";
+      }
+    };
+
+    source.addEventListener("llm.delta", (e) => {
+      try {
+        const event = JSON.parse(e.data);
+        if (event.payload && event.payload.text) {
+          accumulatedText += event.payload.text;
+          updatePendingLabel(accumulatedText);
+        }
+      } catch {}
+    });
+
+    source.addEventListener("tool.proposed", (e) => {
+      try {
+        const event = JSON.parse(e.data);
+        if (event.payload && event.payload.tool_name) {
+          updatePendingLabel(`Agent is using tool: ${event.payload.tool_name}...`);
+        }
+      } catch {}
+    });
+
+    source.addEventListener("tool.started", (e) => {
+      try {
+        const event = JSON.parse(e.data);
+        if (event.payload && event.payload.tool_name) {
+          updatePendingLabel(`Executing: ${event.payload.tool_name}...`);
+        }
+      } catch {}
+    });
+
+    source.addEventListener("tool.result", (e) => {
+      try {
+        const event = JSON.parse(e.data);
+        updatePendingLabel("Agent is analyzing tool results...");
+      } catch {}
+    });
+
+    source.addEventListener("confirmation.required", (e) => {
+      try {
+        const event = JSON.parse(e.data);
+        requiredConfirmations = [event.payload || {}];
+        agentRunId = event.run_id || "";
+        updatePendingLabel("Confirmation required. Please approve the tool execution.");
+      } catch {}
+    });
+
+    source.addEventListener("run.completed", (e) => {
+      source.close();
+      try {
+        const event = JSON.parse(e.data);
+        const payload = event.payload || {};
+        const finalAnswer = payload.answer || accumulatedText || "Agent has completed.";
+        agentRunId = payload.run_id || agentRunId;
+        const status = payload.status || "completed";
+        const steps = Array.isArray(payload.steps) ? payload.steps : [];
+        const sources = Array.isArray(payload.sources) ? payload.sources : [];
+
+        removePendingAssistantMessage();
+        appendMessage("assistant", finalAnswer, {
+          createdAt: payload.completed_at || payload.created_at || new Date().toISOString(),
+          sources: normalizeResponseSources({ sources }),
+          agentRunId,
+          agentStatus: status,
+          agentSteps: steps,
+          requiredConfirmations: requiredConfirmations,
+        });
+        resolve(payload);
+      } catch {
+        removePendingAssistantMessage();
+        appendMessage("assistant", accumulatedText || "Agent has completed.");
+        resolve({});
+      }
+    });
+
+    source.addEventListener("run.failed", (e) => {
+      source.close();
+      try {
+        const event = JSON.parse(e.data);
+        const error = (event.payload && event.payload.error) || "Agent execution failed.";
+        removePendingAssistantMessage();
+        appendMessage("assistant", `Agent 执行失败：${error}`);
+        showToast(error, true);
+      } catch {
+        removePendingAssistantMessage();
+        appendMessage("assistant", "Agent 执行失败。");
+      }
+      reject(new Error((e.data && JSON.parse(e.data).payload && JSON.parse(e.data).payload.error) || "Agent execution failed"));
+    });
+
+    source.addEventListener("step.completed", (e) => {
+      // Trace step completion silently
+    });
+
+    source.addEventListener("run.started", (e) => {
+      try {
+        const event = JSON.parse(e.data);
+        agentRunId = event.run_id || "";
+      } catch {}
+    });
+
+    source.onerror = (e) => {
+      source.close();
+      removePendingAssistantMessage();
+      if (accumulatedText) {
+        appendMessage("assistant", accumulatedText);
+      } else {
+        appendMessage("assistant", "Stream 连接中断，请重试。");
+      }
+      reject(new Error("SSE connection error"));
+    };
+  });
 }
 
 async function handleImportFromComposer() {

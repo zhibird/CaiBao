@@ -13,6 +13,7 @@ from app.models.agent_app import AgentApp
 from app.models.agent_app_version import AgentAppVersion
 from app.schemas.agent import AgentRunRequest, AgentRunResponse
 from app.schemas.agent_app import AgentAppCreate, AgentAppInvokeRequest, AgentAppUpdate
+from app.schemas.agent_app import _sanitize_llm_routing as _sanitize_llm_routing_output
 from app.services.agent_service import AgentService
 from app.services.document_service import DocumentService
 from app.services.tool_registry import AGENT_TOOL_DEFINITIONS
@@ -56,6 +57,7 @@ class AgentAppService:
             retrieval_config_json=self._to_json(self._normalize_retrieval_config(payload.retrieval_config)),
             tool_config_json=self._to_json(self._normalize_tool_config(payload.tool_config)),
             workflow_config_json=self._to_json(self._normalize_workflow_config(payload.workflow_config)),
+            llm_routing_json=self._to_json(self._normalize_llm_routing(payload.llm_routing)),
             status=self._normalize_status(payload.status),
             app_version=0,
             created_at=now,
@@ -105,6 +107,8 @@ class AgentAppService:
             app.tool_config_json = self._to_json(self._normalize_tool_config(payload.tool_config))
         if payload.workflow_config is not None:
             app.workflow_config_json = self._to_json(self._normalize_workflow_config(payload.workflow_config))
+        if payload.llm_routing is not None:
+            app.llm_routing_json = self._to_json(self._normalize_llm_routing(payload.llm_routing))
         if payload.status is not None:
             app.status = self._normalize_status(payload.status)
 
@@ -183,8 +187,57 @@ class AgentAppService:
             embedding_model=payload.embedding_model or app.embedding_model,
             enabled_tools=self._enabled_tools(tool_config),
             workflow_config=workflow_config,
+            model_routes=self._safe_json_dict(app.llm_routing_json) or None,
         )
         return self.agent_service.run(agent_payload)
+
+    def invoke_queued(self, *, app_id: str, payload: AgentAppInvokeRequest) -> AgentRunStartResponse:
+        """Create a queued run for this app (for streaming consumption)."""
+        team_id, user_id = self._require_identity(payload.team_id, payload.user_id)
+        app = self.get(app_id=app_id, team_id=team_id, user_id=user_id)
+        if app.status == "archived":
+            raise DomainValidationError("Archived agent apps cannot be invoked.")
+
+        retrieval_config = self._safe_json_dict(app.retrieval_config_json)
+        tool_config = self._safe_json_dict(app.tool_config_json)
+        workflow_config = self._safe_json_dict(app.workflow_config_json)
+        space_id = payload.space_id or app.space_id
+        if space_id is not None:
+            space_id = self._resolve_space_id(team_id=team_id, user_id=user_id, space_id=space_id)
+
+        danger_requires_confirmation = bool(tool_config.get("dangerous_requires_confirmation", True))
+        effective_confirm = payload.confirm_dangerous_actions or not danger_requires_confirmation
+
+        agent_payload = AgentRunRequest(
+            team_id=team_id,
+            user_id=user_id,
+            conversation_id=payload.conversation_id,
+            space_id=space_id,
+            app_id=app.app_id,
+            app_version=app.app_version,
+            trigger_channel="app",
+            run_mode=app.mode,
+            system_prompt=app.system_prompt,
+            task=payload.task,
+            top_k=int(payload.top_k or retrieval_config.get("top_k") or 5),
+            selected_document_ids=payload.selected_document_ids,
+            include_memory=self._coalesce_bool(payload.include_memory, retrieval_config.get("include_memory"), True),
+            include_library=self._coalesce_bool(payload.include_library, retrieval_config.get("include_library"), True),
+            include_conclusions=self._coalesce_bool(
+                payload.include_conclusions,
+                retrieval_config.get("include_conclusions"),
+                False,
+            ),
+            dry_run=payload.dry_run,
+            confirm_dangerous_actions=effective_confirm,
+            max_steps=int(payload.max_steps or workflow_config.get("max_steps") or 5),
+            model=payload.model or app.model,
+            embedding_model=payload.embedding_model or app.embedding_model,
+            enabled_tools=self._enabled_tools(tool_config),
+            workflow_config=workflow_config,
+            model_routes=self._safe_json_dict(app.llm_routing_json) or None,
+        )
+        return self.agent_service.start(agent_payload)
 
     def _require_identity(self, team_id: str | None, user_id: str | None) -> tuple[str, str]:
         normalized_team_id = str(team_id or "").strip()
@@ -241,6 +294,22 @@ class AgentAppService:
             "dangerous_requires_confirmation": bool((raw or {}).get("dangerous_requires_confirmation", True)),
         }
 
+    def _normalize_llm_routing(self, raw: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            return {}
+        result: dict[str, Any] = {}
+        for role in ("planner", "fast", "vision"):
+            value = raw.get(role)
+            if value is None:
+                result[role] = None
+            elif isinstance(value, str) and value.strip():
+                result[role] = value.strip()
+            elif isinstance(value, dict):
+                result[role] = value
+            else:
+                result[role] = None
+        return result
+
     def _normalize_workflow_config(self, raw: dict[str, Any]) -> dict[str, Any]:
         nodes = raw.get("nodes") if isinstance(raw, dict) else None
         if nodes is None:
@@ -273,6 +342,7 @@ class AgentAppService:
             "retrieval_config": self._safe_json_dict(app.retrieval_config_json),
             "tool_config": self._safe_json_dict(app.tool_config_json),
             "workflow_config": self._safe_json_dict(app.workflow_config_json),
+            "llm_routing": _sanitize_llm_routing_output(self._safe_json_dict(app.llm_routing_json)),
         }
 
     def _clean_optional(self, raw: str | None) -> str | None:

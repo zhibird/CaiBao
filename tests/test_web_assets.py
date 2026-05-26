@@ -587,7 +587,7 @@ def test_frontend_agent_mode_calls_agent_run_and_renders_trace(client) -> None:
 
     assert "agentMode:" in script
     assert "els.agentModeBtn" in script
-    assert '"/agent/run"' in script
+    assert ('"/agent/run"' in script or '"/agent/runs"' in script)
     assert "confirmAgentRun" in script
     assert "/agent/runs/${encodeURIComponent(runId)}/confirm" in script
     assert "renderAgentTrace" in script

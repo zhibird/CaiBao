@@ -191,6 +191,8 @@ def get_agent_service(
     rag_chat_service: RagChatService = Depends(get_rag_chat_service),
     tool_service: ToolService = Depends(get_tool_service),
     chat_history_service: ChatHistoryService = Depends(get_chat_history_service),
+    llm_service: LLMService = Depends(get_llm_service),
+    llm_model_service: LLMModelService = Depends(get_llm_model_service),
 ) -> AgentService:
     return AgentService(
         db=db,
@@ -199,6 +201,8 @@ def get_agent_service(
         rag_chat_service=rag_chat_service,
         tool_service=tool_service,
         chat_history_service=chat_history_service,
+        llm_service=llm_service,
+        llm_model_service=llm_model_service,
     )
 
 
