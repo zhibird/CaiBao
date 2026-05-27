@@ -1237,6 +1237,90 @@ def test_chat_action_rejects_invalid_incident_payload(client) -> None:
     assert response.status_code == 400
 
 
+def test_chat_action_rejects_dangerous_generic_write_file(client) -> None:
+    """Dangerous generic tools must NOT execute via /chat/action."""
+    team_id, user_id = register_workspace_user(
+        client,
+        prefix="action_dgwf",
+        display_name="Runner",
+    )
+
+    response = client.post(
+        "/api/v1/chat/action",
+        json={
+            "user_id": user_id,
+            "team_id": team_id,
+            "action": "write_file",
+            "arguments": {"path": "evil.txt", "content": "pwned"},
+        },
+    )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"].lower()
+    assert "dangerous" in detail or "cannot be executed" in detail
+
+
+def test_chat_action_rejects_dangerous_generic_edit_file(client) -> None:
+    team_id, user_id = register_workspace_user(
+        client,
+        prefix="action_dgef",
+        display_name="Runner",
+    )
+
+    response = client.post(
+        "/api/v1/chat/action",
+        json={
+            "user_id": user_id,
+            "team_id": team_id,
+            "action": "edit_file",
+            "arguments": {"path": "cfg.txt", "old_text": "a", "new_text": "b"},
+        },
+    )
+
+    assert response.status_code == 400
+
+
+def test_chat_action_rejects_dangerous_generic_shell_exec(client) -> None:
+    team_id, user_id = register_workspace_user(
+        client,
+        prefix="action_dgse",
+        display_name="Runner",
+    )
+
+    response = client.post(
+        "/api/v1/chat/action",
+        json={
+            "user_id": user_id,
+            "team_id": team_id,
+            "action": "shell_exec",
+            "arguments": {"command": "echo hello"},
+        },
+    )
+
+    assert response.status_code == 400
+
+
+def test_chat_action_rejects_dangerous_mcp_tool(client) -> None:
+    """Dangerous MCP tools must NOT execute via /chat/action."""
+    team_id, user_id = register_workspace_user(
+        client,
+        prefix="action_dgmt",
+        display_name="Runner",
+    )
+
+    response = client.post(
+        "/api/v1/chat/action",
+        json={
+            "user_id": user_id,
+            "team_id": team_id,
+            "action": "mcp__demo__destroy",
+            "arguments": {},
+        },
+    )
+
+    assert response.status_code == 400
+
+
 def test_chat_ask_rejects_unconfigured_custom_model(client) -> None:
     team_id, user_id = register_workspace_user(
         client,

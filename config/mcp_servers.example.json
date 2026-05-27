@@ -1,0 +1,16 @@
+{
+  "servers": [
+    {
+      "name": "filesystem_demo",
+      "enabled": false,
+      "command": "node",
+      "args": ["./mcp-servers/filesystem/index.js"],
+      "cwd": ".",
+      "env": {
+        "SOME_KEY": "${SOME_KEY}"
+      },
+      "timeout_seconds": 20,
+      "allowed_tools": ["read_file", "list_dir"]
+    }
+  ]
+}

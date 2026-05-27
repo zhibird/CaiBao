@@ -23,6 +23,9 @@ from app.services.rag_chat_service import RagChatService
 from app.services.retrieval_service import RetrievalService
 from app.services.space_service import SpaceService
 from app.services.team_service import TeamService
+from app.services.mcp_manager import MCPManager
+from app.services.tool_catalog_service import ToolCatalogService
+from app.services.tool_safety import ToolSafetyService
 from app.services.tool_service import ToolService
 from app.services.user_service import UserService
 
@@ -146,8 +149,169 @@ def get_llm_model_service(
     return LLMModelService(db=db, user_service=user_service)
 
 
-def get_tool_service(db: Session = Depends(get_db_session)) -> ToolService:
-    return ToolService(db)
+_catalog_singleton: ToolCatalogService | None = None
+_safety_singleton: ToolSafetyService | None = None
+_mcp_manager_singleton: MCPManager | None = None
+
+
+def get_mcp_manager() -> MCPManager:
+    global _mcp_manager_singleton
+    if _mcp_manager_singleton is None:
+        _mcp_manager_singleton = MCPManager()
+    return _mcp_manager_singleton
+
+
+def get_tool_catalog_service() -> ToolCatalogService:
+    global _catalog_singleton
+    if _catalog_singleton is None:
+        _catalog_singleton = ToolCatalogService()
+        _register_generic_tools(_catalog_singleton)
+    return _catalog_singleton
+
+
+def _register_generic_tools(catalog: ToolCatalogService) -> None:
+    from app.services.tools.web_tools import create_web_tools
+    from app.services.tools.file_tools import create_file_tools
+    from app.services.tools.shell_tools import create_shell_tools
+
+    catalog.register_generic(create_web_tools())
+    catalog.register_generic(create_file_tools())
+    catalog.register_generic(create_shell_tools())
+
+
+def get_tool_safety_service() -> ToolSafetyService:
+    global _safety_singleton
+    if _safety_singleton is None:
+        _safety_singleton = ToolSafetyService()
+    return _safety_singleton
+
+
+def get_tool_service(
+    db: Session = Depends(get_db_session),
+    catalog: ToolCatalogService = Depends(get_tool_catalog_service),
+    safety: ToolSafetyService = Depends(get_tool_safety_service),
+    mcp_manager: MCPManager = Depends(get_mcp_manager),
+) -> ToolService:
+    svc = ToolService(db=db, catalog=catalog, safety=safety)
+    _register_generic_handlers(svc)
+    _register_mcp_handlers(svc, catalog, mcp_manager)
+    return svc
+
+
+def _register_generic_handlers(svc: ToolService) -> None:
+    from app.services.tools.web_tools import web_fetch_handler, web_search_handler
+    from app.services.tools.file_tools import (
+        edit_file_handler,
+        list_dir_handler,
+        read_file_handler,
+        write_file_handler,
+    )
+
+    svc.register_generic_handler("web_fetch", web_fetch_handler)
+    svc.register_generic_handler("web_search", web_search_handler)
+    svc.register_generic_handler("list_dir", list_dir_handler)
+    svc.register_generic_handler("read_file", read_file_handler)
+    svc.register_generic_handler("write_file", write_file_handler)
+    svc.register_generic_handler("edit_file", edit_file_handler)
+
+    from app.services.tools.shell_tools import (
+        shell_exec_handler,
+        shell_kill_handler,
+        shell_status_handler,
+    )
+
+    svc.register_generic_handler("shell_exec", shell_exec_handler)
+    svc.register_generic_handler("shell_status", shell_status_handler)
+    svc.register_generic_handler("shell_kill", shell_kill_handler)
+
+
+import threading as _threading
+
+_mcp_connect_lock = _threading.Lock()
+_mcp_connected = False
+_mcp_defs_cache: list | None = None
+
+
+def _reset_mcp_connection() -> None:
+    global _mcp_connected, _mcp_defs_cache
+    with _mcp_connect_lock:
+        _mcp_connected = False
+        _mcp_defs_cache = None
+
+
+def _finalize_mcp_reload(
+    mcp_manager: MCPManager,
+    catalog: ToolCatalogService,
+) -> None:
+    """Mark MCP as connected and populate the handler cache after an explicit reload.
+
+    Must be called *after* the caller has already connected to all servers
+    and refreshed the catalog.  This prevents the next per-request
+    ``_register_mcp_handlers`` from re-entering ``connect_all()`` (which
+    would ``shutdown_all()`` first).
+    """
+    global _mcp_connected, _mcp_defs_cache
+    mcp_defs = mcp_manager.discover_tools()
+    catalog.refresh_mcp(mcp_defs)
+
+    cached_pairs: list = []
+    for d in mcp_defs:
+        def _make_mcp_handler(namespaced_name=d.name):
+            def handler(*, team_id, user_id, arguments):
+                return mcp_manager.call_tool(namespaced_name, arguments)
+            return handler
+        handler = _make_mcp_handler()
+        cached_pairs.append((d, handler))
+
+    with _mcp_connect_lock:
+        _mcp_defs_cache = cached_pairs
+        _mcp_connected = True
+
+
+def _register_mcp_handlers(
+    svc: ToolService,
+    catalog: ToolCatalogService,
+    mcp_manager: MCPManager,
+) -> None:
+    """Load MCP config, connect servers once, discover tools, and register handlers.
+
+    Caches MCP tool definitions after first discovery so that subsequent
+    per-request dependency injections are cheap (no re-discover / re-register).
+    """
+    global _mcp_connected, _mcp_defs_cache
+    if not get_settings().mcp_enabled:
+        return
+
+    with _mcp_connect_lock:
+        if not _mcp_connected:
+            try:
+                configs = mcp_manager.load_config()
+            except DomainValidationError:
+                configs = []
+            if configs:
+                mcp_manager.connect_all(configs)
+            _mcp_connected = True
+
+    # Serve from cache after initial discovery
+    if _mcp_defs_cache is not None:
+        for d, handler in _mcp_defs_cache:
+            svc.register_generic_handler(d.name, handler)
+        return
+
+    mcp_defs = mcp_manager.discover_tools()
+    catalog.refresh_mcp(mcp_defs)
+
+    cached_pairs: list = []
+    for d in mcp_defs:
+        def _make_mcp_handler(namespaced_name=d.name):
+            def handler(*, team_id, user_id, arguments):
+                return mcp_manager.call_tool(namespaced_name, arguments)
+            return handler
+        handler = _make_mcp_handler()
+        svc.register_generic_handler(d.name, handler)
+        cached_pairs.append((d, handler))
+
+    _mcp_defs_cache = cached_pairs
 
 
 def get_chat_service(user_service: UserService = Depends(get_user_service)) -> ChatService:

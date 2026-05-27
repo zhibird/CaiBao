@@ -28,7 +28,7 @@ from app.services.llm_model_service import LLMModelService
 from app.services.llm_router import LLMRouter
 from app.services.llm_service import LLMCompletionResult, LLMService, LLMStreamChunk
 from app.services.rag_chat_service import RagChatService
-from app.services.tool_registry import get_openai_tools, get_tool_definition
+
 from app.services.tool_service import ToolService
 from app.services.user_service import UserService
 
@@ -195,10 +195,9 @@ class AgentService:
         call = pending_calls[0]
         try:
             result = self.tool_service.execute(
-                team_id=team_id,
-                user_id=user_id,
-                action=call.tool_name,
-                arguments=call.arguments,
+                team_id=team_id, user_id=user_id,
+                action=call.tool_name, arguments=call.arguments,
+                run_id=run.run_id, confirmed=True,
             )
             tool_result_entry = {"tool_name": call.tool_name, "arguments": call.arguments, "result": result}
             tool_status = "completed"
@@ -272,6 +271,7 @@ class AgentService:
                 result = self.tool_service.execute(
                     team_id=team_id, user_id=user_id,
                     action=call.tool_name, arguments=call.arguments,
+                    run_id=run.run_id, confirmed=True,
                 )
                 tool_results.append({"tool_name": call.tool_name, "arguments": call.arguments, "result": result})
             except Exception as exc:  # noqa: BLE001
@@ -571,7 +571,7 @@ class AgentService:
                     return final_text, "completed", False
 
                 # Validate tool exists
-                definition = get_tool_definition(tool_name)
+                definition = self.tool_service.get_tool_definition(tool_name)
                 if definition is None:
                     messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
                     messages.append({
@@ -593,8 +593,9 @@ class AgentService:
                     })
                     continue
 
-                # Filter by enabled_tools
-                if enabled_tools and tool_name not in enabled_tools:
+                # Filter by enabled_tools (case-insensitive, like streaming)
+                enabled_tool_names = {t.strip().lower() for t in (enabled_tools or []) if t.strip()} if enabled_tools else None
+                if enabled_tool_names and tool_name.lower() not in enabled_tool_names:
                     messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
                     messages.append({
                         "role": "tool",
@@ -628,6 +629,8 @@ class AgentService:
                         exec_result = self.tool_service.execute(
                             team_id=team_id, user_id=user_id,
                             action=tool_name, arguments=normalized_args,
+                            run_id=run.run_id, dry_run=dry_run,
+                            confirmed=confirm_dangerous_actions or not definition.dangerous,
                         )
                         tool_result = {"tool_name": tool_name, "arguments": normalized_args, "result": exec_result}
                         tool_status = "completed"
@@ -767,7 +770,7 @@ class AgentService:
                 if self._count_consecutive(tool_call_history, call_sig) >= _MAX_CONSECUTIVE_DUPLICATE_CALLS:
                     break
 
-                definition = get_tool_definition(tool_name)
+                definition = self.tool_service.get_tool_definition(tool_name)
                 if definition is None:
                     messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
                     messages.append({
@@ -835,6 +838,8 @@ class AgentService:
                         exec_result = self.tool_service.execute(
                             team_id=team_id, user_id=user_id,
                             action=tool_name, arguments=normalized_args,
+                            run_id=run.run_id, dry_run=dry_run,
+                            confirmed=confirm_dangerous_actions or not definition.dangerous,
                         )
                         tool_result = {"tool_name": tool_name, "arguments": normalized_args, "result": exec_result}
                         tool_status = "completed"
@@ -1153,7 +1158,7 @@ class AgentService:
         run: AgentRun,
     ) -> list[dict[str, object]]:
         enabled_tools = payload.enabled_tools if payload is not None else None
-        return get_openai_tools(enabled_tools=enabled_tools)
+        return self.tool_service.catalog.get_openai_tools(enabled_tools=enabled_tools)
 
     def _resolve_routes(
         self,
@@ -1340,6 +1345,7 @@ class AgentService:
                     team_id=team_id, user_id=user_id,
                     action=enriched_call.tool_name,
                     arguments=enriched_call.arguments,
+                    confirmed=True,
                 )
                 tool_results.append({
                     "tool_name": enriched_call.tool_name,

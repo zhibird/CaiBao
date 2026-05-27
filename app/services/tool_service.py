@@ -13,20 +13,52 @@ from app.models.document import Document
 from app.models.incident import Incident
 from app.models.memory_card import MemoryCard
 from app.models.project_space import ProjectSpace
+from app.schemas.tooling import ToolCallContext
+from app.services.tool_catalog_service import ToolCatalogService
 from app.services.tool_registry import ToolDefinition, get_tool_definition, list_tool_definitions
+from app.services.tool_safety import ToolSafetyService
 
 
 class ToolService:
-    """Built-in tool plugin executor for Agent and Agent App workflows."""
+    """Tool executor for builtin + generic + MCP tools. Dispatches via ToolCatalogService."""
 
-    def __init__(self, db: Session) -> None:
+    _BUILTIN_GENERIC_HANDLERS: dict[str, str] = {
+        "search_knowledge": "_search_knowledge",
+        "list_recent_documents": "_list_recent_documents",
+        "create_incident": "_create_incident",
+        "create_memory_card": "_create_memory_card",
+        "promote_to_conclusion": "_promote_to_conclusion",
+        "generate_incident_report": "_generate_incident_report",
+        "web_fetch": "_delegate_generic",
+        "web_search": "_delegate_generic",
+        "list_dir": "_delegate_generic",
+        "read_file": "_delegate_generic",
+        "write_file": "_delegate_generic",
+        "edit_file": "_delegate_generic",
+        "shell_exec": "_delegate_generic",
+        "shell_status": "_delegate_generic",
+        "shell_kill": "_delegate_generic",
+    }
+
+    def __init__(
+        self,
+        db: Session,
+        catalog: ToolCatalogService,
+        safety: ToolSafetyService,
+    ) -> None:
         self.db = db
+        self.catalog = catalog
+        self.safety = safety
+        self._generic_handlers: dict[str, object] = {}
+
+    def register_generic_handler(self, name: str, handler: object) -> None:
+        self._generic_handlers[name] = handler
 
     def list_tools(self) -> list[ToolDefinition]:
-        return list_tool_definitions()
+        return self.catalog.list_definitions()
 
     def get_tool_definition(self, action: str) -> ToolDefinition | None:
-        return get_tool_definition(action)
+        return self.catalog.get_definition(action)
 
     def execute(
         self,
@@ -35,24 +67,87 @@ class ToolService:
         user_id: str,
         action: str,
         arguments: dict[str, object],
+        run_id: str | None = None,
+        dry_run: bool = False,
+        confirmed: bool = False,
     ) -> dict[str, object]:
         action_name = action.strip().lower()
+        definition = self.catalog.get_definition(action_name)
+        if definition is None:
+            available = ", ".join(d.name for d in self.catalog.list_definitions())
+            raise DomainValidationError(f"Unsupported action '{action_name}'. Available: {available}.")
 
-        if action_name == "search_knowledge":
-            return self._search_knowledge(team_id=team_id, user_id=user_id, arguments=arguments)
-        if action_name == "list_recent_documents":
-            return self._list_recent_documents(team_id=team_id, user_id=user_id, arguments=arguments)
-        if action_name == "create_incident":
-            return self._create_incident(team_id=team_id, user_id=user_id, arguments=arguments)
-        if action_name == "create_memory_card":
-            return self._create_memory_card(team_id=team_id, user_id=user_id, arguments=arguments)
-        if action_name == "promote_to_conclusion":
-            return self._promote_to_conclusion(team_id=team_id, user_id=user_id, arguments=arguments)
-        if action_name == "generate_incident_report":
-            return self._generate_incident_report(arguments=arguments)
+        # Safety preflight
+        ctx = ToolCallContext(
+            run_id=run_id, team_id=team_id, user_id=user_id,
+            tool_name=action_name, arguments=arguments,
+            source=definition.source, dry_run=dry_run,
+        )
+        preflight = self.safety.preflight(ctx, definition)
+        if not preflight.allowed:
+            raise DomainValidationError(preflight.reason or "Tool call blocked by safety checks.")
 
-        available = ", ".join(item.name for item in self.list_tools())
-        raise DomainValidationError(f"Unsupported action. Available actions: {available}.")
+        # Dangerous tools require explicit confirmation (or dry_run)
+        if preflight.requires_confirmation and not confirmed and not dry_run:
+            raise DomainValidationError(
+                f"Tool '{action_name}' requires explicit confirmation. "
+                "Set confirmed=True or use the Agent confirm endpoint."
+            )
+
+        effective_args = preflight.normalized_arguments
+        ctx.arguments = effective_args  # align signature with normalized args for loop guard
+
+        # Dry-run: run all safety checks but DO NOT execute any handler
+        if dry_run:
+            self.safety.record_call(ctx)
+            return {
+                "tool_name": action_name,
+                "arguments": effective_args,
+                "dry_run": True,
+                "would_require_confirmation": preflight.requires_confirmation,
+                "would_be_dangerous": preflight.dangerous,
+            }
+
+        # Dispatch
+        if definition.source == "mcp":
+            return self._dispatch_mcp(
+                definition=definition, arguments=effective_args,
+                team_id=team_id, user_id=user_id,
+            )
+
+        handler_key = self._BUILTIN_GENERIC_HANDLERS.get(action_name)
+        if handler_key is None:
+            raise DomainValidationError(f"Unsupported action '{action_name}'.")
+
+        if handler_key == "_delegate_generic":
+            handler = self._generic_handlers.get(action_name)
+            if handler is None:
+                raise DomainValidationError(f"No handler registered for generic tool '{action_name}'.")
+            result = handler(team_id=team_id, user_id=user_id, arguments=effective_args)
+        else:
+            method = getattr(self, handler_key)
+            result = method(team_id=team_id, user_id=user_id, arguments=effective_args)
+
+        # Safety postflight
+        result = self.safety.postflight_output(result, source=definition.source)
+
+        # Record call for loop guard
+        self.safety.record_call(ctx)
+        return result
+
+    def _dispatch_mcp(
+        self,
+        *,
+        definition: ToolDefinition,
+        arguments: dict[str, object],
+        team_id: str,
+        user_id: str,
+    ) -> dict[str, object]:
+        """Dispatch to MCP tool handler. Registered by MCP manager."""
+        handler = self._generic_handlers.get(definition.name)
+        if handler is None:
+            raise DomainValidationError(f"MCP tool '{definition.name}' has no active handler.")
+        return handler(team_id=team_id, user_id=user_id, arguments=arguments)
 
     def _search_knowledge(
         self,
@@ -281,7 +376,13 @@ class ToolService:
             },
         }
 
-    def _generate_incident_report(self, *, arguments: dict[str, object]) -> dict[str, object]:
+    def _generate_incident_report(
+        self,
+        *,
+        team_id: str,
+        user_id: str,
+        arguments: dict[str, object],
+    ) -> dict[str, object]:
         title = str(arguments.get("title", "Incident Report")).strip() or "Incident Report"
         summary = str(arguments.get("incident_summary", "")).strip() or "No incident summary provided."
         findings = self._string_list(arguments.get("findings")) or ["Context reviewed by Agent."]

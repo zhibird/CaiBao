@@ -69,6 +69,32 @@ class Settings(BaseSettings):
     upload_max_file_size_mb: int = 20
     db_legacy_init_enabled: bool | None = None
 
+    # Web tools
+    web_tools_enabled: bool = True
+    web_search_provider: str = "disabled"
+    web_search_api_key: str | None = None
+    web_fetch_max_bytes: int = 1_000_000
+    web_fetch_block_private_ips: bool = True
+
+    # File tools
+    file_tools_enabled: bool = True
+    file_tools_root_dir: str = "data/agent_files"
+
+    # Shell tools
+    shell_tool_enabled: bool = False
+    shell_allowed_cwd: str = "data/agent_shell"
+    shell_default_timeout_seconds: int = 20
+    shell_max_timeout_seconds: int = 120
+    shell_max_output_bytes: int = 200_000
+    shell_allow_network: bool = False
+
+    # MCP
+    mcp_enabled: bool = False
+    mcp_config_path: str = "config/mcp_servers.json"
+    mcp_init_timeout_seconds: float = 10.0
+    mcp_call_timeout_seconds: float = 30.0
+    mcp_max_output_bytes: int = 200_000
+
     model_config = SettingsConfigDict(
         env_file=str(ROOT_ENV_FILE),
         env_file_encoding="utf-8",

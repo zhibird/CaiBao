@@ -21,6 +21,8 @@ class ToolDefinition:
     handler_key: str
     enabled: bool = True
     permission_scope: str = "team"
+    source: str = "builtin"  # "builtin" | "generic" | "mcp"
+    provider: str = ""       # "web_tools" | "file_tools" | "shell_tools" | mcp server name
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -37,6 +39,8 @@ class ToolDefinition:
             "handler_key": self.handler_key,
             "enabled": self.enabled,
             "permission_scope": self.permission_scope,
+            "source": self.source,
+            "provider": self.provider,
             "parameters": self.input_schema,
         }
 

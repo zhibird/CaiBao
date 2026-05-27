@@ -16,7 +16,7 @@ from app.schemas.agent_app import AgentAppCreate, AgentAppInvokeRequest, AgentAp
 from app.schemas.agent_app import _sanitize_llm_routing as _sanitize_llm_routing_output
 from app.services.agent_service import AgentService
 from app.services.document_service import DocumentService
-from app.services.tool_registry import AGENT_TOOL_DEFINITIONS
+
 from app.services.user_service import UserService
 
 
@@ -283,12 +283,12 @@ class AgentAppService:
         return config
 
     def _normalize_tool_config(self, raw: dict[str, Any]) -> dict[str, Any]:
-        available = set(AGENT_TOOL_DEFINITIONS)
+        # None means "all tools from catalog" — filtering happens at execution time.
         raw_enabled = raw.get("enabled_tools") if isinstance(raw, dict) else None
         if isinstance(raw_enabled, list):
-            enabled_tools = [str(item).strip() for item in raw_enabled if str(item).strip() in available]
+            enabled_tools = [str(item).strip() for item in raw_enabled if str(item).strip()] or None
         else:
-            enabled_tools = list(available)
+            enabled_tools = None
         return {
             "enabled_tools": enabled_tools,
             "dangerous_requires_confirmation": bool((raw or {}).get("dangerous_requires_confirmation", True)),
@@ -321,12 +321,12 @@ class AgentAppService:
             "max_steps": max(3, min(int((raw or {}).get("max_steps") or 5), 10)),
         }
 
-    def _enabled_tools(self, tool_config: dict[str, Any]) -> list[str]:
+    def _enabled_tools(self, tool_config: dict[str, Any]) -> list[str] | None:
         raw_items = tool_config.get("enabled_tools")
         if not isinstance(raw_items, list):
-            return list(AGENT_TOOL_DEFINITIONS)
-        available = set(AGENT_TOOL_DEFINITIONS)
-        return [str(item).strip() for item in raw_items if str(item).strip() in available]
+            return None
+        items = [str(item).strip() for item in raw_items if str(item).strip()]
+        return items if items else None
 
     def _app_snapshot(self, app: AgentApp, *, version_number: int) -> dict[str, Any]:
         return {

@@ -73,6 +73,9 @@ class AgentToolDefinition(BaseModel):
     handler_key: str | None = None
     enabled: bool = True
     permission_scope: str = "team"
+    source: str = "builtin"
+    provider: str = ""
+    requires_confirmation_by_default: bool = False
     parameters: dict[str, Any]
 
 
