@@ -16,10 +16,48 @@ class UTF8JSONResponse(JSONResponse):
     media_type = "application/json; charset=utf-8"
 
 
+_scheduler: object = None  # ProactiveScheduler | None
+
+
+def _make_proactive_tick():
+    """Create a tick function for the proactive scheduler."""
+    from app.db.session import SessionLocal
+    from app.services.mcp_manager import MCPManager
+    from app.services.proactive_gateway import ProactiveGateway
+    from app.services.proactive_service import ProactiveService
+
+    def _tick():
+        db = SessionLocal()
+        try:
+            mcp = MCPManager()
+            gateway = ProactiveGateway(mcp)
+            svc = ProactiveService(db, gateway)
+            svc.run_tick()
+        except Exception:
+            pass
+        finally:
+            db.close()
+    return _tick
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global _scheduler
     init_db()
+
+    settings = get_settings()
+    if settings.proactive_scheduler_enabled:
+        from app.services.proactive_scheduler import ProactiveScheduler
+        _scheduler = ProactiveScheduler(
+            _make_proactive_tick(),
+            interval_seconds=settings.proactive_tick_interval_seconds,
+        )
+        _scheduler.start()
+
     yield
+
+    if _scheduler is not None:
+        _scheduler.stop()
 
 
 def create_app() -> FastAPI:

@@ -14,6 +14,8 @@ from app.api.routes.health import router as health_router
 from app.api.routes.library import router as library_router
 from app.api.routes.llm_model import router as llm_model_router
 from app.api.routes.mcp import router as mcp_router
+from app.api.routes.proactive import router as proactive_router
+from app.api.routes.drift import router as drift_router
 from app.api.routes.memory import router as memory_router
 from app.api.routes.retrieval import router as retrieval_router
 from app.api.routes.space import router as space_router
@@ -39,4 +41,6 @@ api_router.include_router(agent_router, tags=["agent"])
 api_router.include_router(apps_router, tags=["apps"])
 api_router.include_router(favorite_router, tags=["favorites"])
 api_router.include_router(mcp_router, tags=["mcp"])
+api_router.include_router(proactive_router, tags=["proactive"])
+api_router.include_router(drift_router, tags=["drift"])
 api_router.include_router(conclusion_router, tags=["conclusions"])

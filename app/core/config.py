@@ -110,6 +110,33 @@ class Settings(BaseSettings):
     retrieval_sufficiency_enabled: bool = True
     retrieval_fast_timeout_ms: int = 5000
 
+    # Plugin system
+    plugin_enabled: bool = False
+    plugin_dirs: str = "data/plugins"
+    plugin_fail_fast: bool = False
+
+    # Proactive push
+    proactive_enabled: bool = False
+    proactive_scheduler_enabled: bool = False
+    proactive_tick_interval_seconds: int = 60
+    proactive_energy_urgency_weight: float = 0.4
+    proactive_energy_relevance_weight: float = 0.35
+    proactive_energy_fatigue_weight: float = 0.25
+    proactive_outbound_channels: str = "database"
+    proactive_webhook_url: str = ""
+    proactive_max_retries: int = 3
+
+    # Drift
+    drift_enabled: bool = False
+    drift_root_dir: str = "data/drift"
+
+    # SubAgent
+    subagent_enabled: bool = False
+    subagent_sync_max_steps: int = 10
+    subagent_async_max_steps: int = 15
+    peer_agent_enabled: bool = False
+    peer_agent_launch_enabled: bool = False
+
     model_config = SettingsConfigDict(
         env_file=str(ROOT_ENV_FILE),
         env_file_encoding="utf-8",

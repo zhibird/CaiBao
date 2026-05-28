@@ -49,6 +49,21 @@ def get_event_bus() -> EventBus:
     return _event_bus_singleton
 
 
+_plugin_mgr_singleton = None
+
+
+def get_plugin_manager() -> "PluginManager | None":
+    global _plugin_mgr_singleton
+    from app.core.config import get_settings
+    if not get_settings().plugin_enabled:
+        return None
+    if _plugin_mgr_singleton is None:
+        from app.plugins.manager import PluginManager
+        _plugin_mgr_singleton = PluginManager(event_bus=get_event_bus())
+        _plugin_mgr_singleton.load_all()
+    return _plugin_mgr_singleton
+
+
 def get_team_service(db: Session = Depends(get_db_session)) -> TeamService:
     return TeamService(db)
 
@@ -197,6 +212,33 @@ def _register_generic_tools(catalog: ToolCatalogService) -> None:
     catalog.register_generic(create_file_tools())
     catalog.register_generic(create_shell_tools())
 
+    from app.core.config import get_settings as _gs2
+    if _gs2().subagent_enabled:
+        catalog.register_generic(_create_subagent_tool())
+
+def _create_subagent_tool():
+    from app.services.tool_registry import ToolDefinition
+    return [ToolDefinition(
+        name="spawn_subagent",
+        display_name="生成子智能体",
+        description="Spawn a sub-agent with a restricted tool profile (research or ops) to handle a sub-task.",
+        dangerous=False,
+        handler_key="generic.spawn_subagent",
+        permission_scope="team",
+        source="generic",
+        provider="subagent",
+        input_schema={
+            "type": "object",
+            "required": ["profile", "task"],
+            "properties": {
+                "profile": {"type": "string", "enum": ["research", "ops"]},
+                "task": {"type": "string", "minLength": 1, "maxLength": 4000},
+                "async_mode": {"type": "boolean", "default": False},
+            },
+        },
+        output_schema={"type": "object"},
+    )]
+
 
 def get_tool_safety_service() -> ToolSafetyService:
     global _safety_singleton
@@ -211,7 +253,7 @@ def get_tool_service(
     safety: ToolSafetyService = Depends(get_tool_safety_service),
     mcp_manager: MCPManager = Depends(get_mcp_manager),
 ) -> ToolService:
-    svc = ToolService(db=db, catalog=catalog, safety=safety)
+    svc = ToolService(db=db, catalog=catalog, safety=safety, plugin_manager=get_plugin_manager())
     _register_generic_handlers(svc)
     _register_mcp_handlers(svc, catalog, mcp_manager)
     return svc
@@ -242,6 +284,33 @@ def _register_generic_handlers(svc: ToolService) -> None:
     svc.register_generic_handler("shell_exec", shell_exec_handler)
     svc.register_generic_handler("shell_status", shell_status_handler)
     svc.register_generic_handler("shell_kill", shell_kill_handler)
+
+    # Sub-agent spawn tool
+    from app.core.config import get_settings as _gs
+    if _gs().subagent_enabled:
+        def _spawn_subagent_handler(*, team_id, user_id, arguments):
+            from app.db.session import SessionLocal
+            from app.services.llm_service import LLMService
+            from app.services.subagent_service import SubAgentService
+            db2 = SessionLocal()
+            try:
+                profile = str(arguments.get("profile", "research"))
+                task = str(arguments.get("task", ""))
+                async_mode = bool(arguments.get("async_mode", False))
+                svc_sub = SubAgentService(
+                    db=db2,
+                    llm_service=LLMService(settings=_gs()),
+                    tool_service=svc,  # reuse the per-request ToolService
+                )
+                if async_mode:
+                    job_id = svc_sub.run_async(profile=profile, task=task, team_id=team_id, user_id=user_id)
+                    return {"job_id": job_id, "async": True}
+                else:
+                    result = svc_sub.run_sync(profile=profile, task=task, team_id=team_id, user_id=user_id)
+                    return result
+            finally:
+                db2.close()
+        svc.register_generic_handler("spawn_subagent", _spawn_subagent_handler)
 
 
 import threading as _threading
@@ -450,6 +519,7 @@ def get_agent_service(
         llm_model_service=llm_model_service,
         event_bus=get_event_bus(),
         memory_store=_get_memory_store(),
+        plugin_manager=get_plugin_manager(),
     )
 
 
