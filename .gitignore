@@ -9,5 +9,8 @@ __pycache__/
 !.env.example
 .pytest_cache/
 data/uploads/
+data/memory/
+data/agent_files/
+data/agent_shell/
 tmp/
 *.db.bak_*

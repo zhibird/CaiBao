@@ -22,11 +22,22 @@ from app.schemas.agent import (
     AgentToolCall,
 )
 from app.schemas.chat import ChatAskRequest, ChatSource
+from app.core.config import get_settings
+from app.events.event_bus import EventBus
+from app.events.lifecycle import (
+    RetrievalCompleted,
+    StepCompleted,
+    ToolCalled,
+    ToolResulted,
+    TurnCommitted,
+    TurnStarted,
+)
 from app.services.chat_history_service import ChatHistoryService
 from app.services.document_service import DocumentService
 from app.services.llm_model_service import LLMModelService
 from app.services.llm_router import LLMRouter
 from app.services.llm_service import LLMCompletionResult, LLMService, LLMStreamChunk
+from app.services.memory_markdown_store import MemoryMarkdownStore
 from app.services.rag_chat_service import RagChatService
 
 from app.services.tool_service import ToolService
@@ -52,6 +63,8 @@ class AgentService:
         chat_history_service: ChatHistoryService,
         llm_service: LLMService,
         llm_model_service: LLMModelService,
+        event_bus: EventBus | None = None,
+        memory_store: MemoryMarkdownStore | None = None,
     ) -> None:
         self.db = db
         self.user_service = user_service
@@ -61,6 +74,8 @@ class AgentService:
         self.chat_history_service = chat_history_service
         self.llm_service = llm_service
         self.llm_model_service = llm_model_service
+        self.event_bus = event_bus
+        self.memory_store = memory_store
 
     # ------------------------------------------------------------------
     # Public API
@@ -92,6 +107,13 @@ class AgentService:
         run = self._create_run(payload=payload, team_id=team_id, user_id=user_id, space_id=effective_space_id)
         routes = self._resolve_routes(team_id=team_id, user_id=user_id, payload=payload)
         self._persist_routes(run, routes)
+
+        if self.event_bus:
+            self.event_bus.emit(TurnStarted(
+                run_id=run.run_id, team_id=team_id, user_id=user_id,
+                conversation_id=payload.conversation_id, space_id=effective_space_id,
+                task=payload.task, channel=payload.trigger_channel,
+            ))
 
         if payload.run_mode.strip().lower() == "workflow" and self._workflow_nodes(payload.workflow_config):
             response = self._run_workflow(
@@ -133,6 +155,13 @@ class AgentService:
             event="run.started", run_id=run.run_id, seq=seq,
             payload={"status": "running"},
         )
+
+        if self.event_bus:
+            self.event_bus.emit(TurnStarted(
+                run_id=run.run_id, team_id=team_id, user_id=user_id,
+                conversation_id=run.conversation_id, space_id=effective_space_id,
+                task=payload.task, channel=run.trigger_channel,
+            ))
 
         started = time.perf_counter()
         try:
@@ -182,6 +211,13 @@ class AgentService:
             return self._confirm_fallback(run=run, pending_calls=pending_calls,
                                           team_id=team_id, user_id=user_id)
 
+        if self.event_bus:
+            self.event_bus.emit(TurnStarted(
+                run_id=run.run_id, team_id=team_id, user_id=user_id,
+                conversation_id=run.conversation_id, space_id=run.space_id,
+                task=run.task, channel=run.trigger_channel,
+            ))
+
         started = time.perf_counter()
 
         # Re-resolve real routes (DB persisted snapshot is masked; we need live keys).
@@ -191,8 +227,13 @@ class AgentService:
 
         # Execute the pending tool call
         next_index = self._next_step_index(run.run_id)
-        tool_started = time.perf_counter()
         call = pending_calls[0]
+        if self.event_bus:
+            self.event_bus.emit(ToolCalled(
+                run_id=run.run_id, step_index=next_index,
+                tool_name=call.tool_name, arguments=call.arguments,
+            ))
+        tool_started = time.perf_counter()
         try:
             result = self.tool_service.execute(
                 team_id=team_id, user_id=user_id,
@@ -204,6 +245,12 @@ class AgentService:
         except Exception as exc:  # noqa: BLE001
             tool_result_entry = {"tool_name": call.tool_name, "arguments": call.arguments, "error": str(exc)}
             tool_status = "failed"
+        if self.event_bus:
+            self.event_bus.emit(ToolResulted(
+                run_id=run.run_id, step_index=next_index,
+                tool_name=call.tool_name, status=tool_status,
+                error=str(tool_result_entry.get("error")) if "error" in tool_result_entry else None,
+            ))
 
         self._record_step(
             run=run, step_index=next_index, step_type="tool_call",
@@ -267,6 +314,11 @@ class AgentService:
         tool_results: list[dict[str, object]] = []
         tool_errors: list[str] = []
         for call in pending_calls:
+            if self.event_bus:
+                self.event_bus.emit(ToolCalled(
+                    run_id=run.run_id, step_index=next_index,
+                    tool_name=call.tool_name, arguments=call.arguments,
+                ))
             try:
                 result = self.tool_service.execute(
                     team_id=team_id, user_id=user_id,
@@ -274,8 +326,19 @@ class AgentService:
                     run_id=run.run_id, confirmed=True,
                 )
                 tool_results.append({"tool_name": call.tool_name, "arguments": call.arguments, "result": result})
+                if self.event_bus:
+                    self.event_bus.emit(ToolResulted(
+                        run_id=run.run_id, step_index=next_index,
+                        tool_name=call.tool_name, status="completed",
+                    ))
             except Exception as exc:  # noqa: BLE001
                 tool_errors.append(f"{call.tool_name}: {exc}")
+                if self.event_bus:
+                    self.event_bus.emit(ToolResulted(
+                        run_id=run.run_id, step_index=next_index,
+                        tool_name=call.tool_name, status="failed",
+                        error=str(exc),
+                    ))
 
         status = "failed" if tool_errors and not tool_results else ("partial_success" if tool_errors else "completed")
         self._record_step(
@@ -390,10 +453,19 @@ class AgentService:
                              required_confirmations=[], started=started)
             return self.get_run(run_id=run.run_id, team_id=team_id, user_id=user_id)
 
+        if self.event_bus:
+            self.event_bus.emit(RetrievalCompleted(
+                run_id=run.run_id, query=payload.task, hit_count=1 if rag_answer else 0,
+                injected_count=1 if rag_answer else 0,
+                error=retrieval_failed,
+            ))
+
         # Build messages
         messages = self._build_agent_messages(
             task=payload.task, system_prompt=payload.system_prompt,
             rag_answer=rag_answer,
+            team_id=team_id, user_id=user_id, space_id=space_id,
+            include_memory=payload.include_memory,
         )
         tools = self._build_tools(payload=payload, run=run)
 
@@ -467,6 +539,12 @@ class AgentService:
             run=run, payload=payload, team_id=team_id, user_id=user_id,
             space_id=space_id, step_index=2, title="Retrieve workspace context",
         )
+        if self.event_bus:
+            self.event_bus.emit(RetrievalCompleted(
+                run_id=run.run_id, query=payload.task, hit_count=1 if rag_answer else 0,
+                injected_count=1 if rag_answer else 0,
+                error=retrieval_failed,
+            ))
         if retrieval_failed is not None:
             self._finish_run(run=run, status="failed",
                              final_answer=f"Agent 检索阶段失败：{retrieval_failed}",
@@ -480,6 +558,8 @@ class AgentService:
         messages = self._build_agent_messages(
             task=payload.task, system_prompt=payload.system_prompt,
             rag_answer=rag_answer,
+            team_id=team_id, user_id=user_id, space_id=space_id,
+            include_memory=payload.include_memory,
         )
         tools = self._build_tools(payload=payload, run=run)
 
@@ -620,6 +700,11 @@ class AgentService:
 
                 # Record step
                 current_step += 1
+                if self.event_bus:
+                    self.event_bus.emit(ToolCalled(
+                        run_id=run.run_id, step_index=current_step,
+                        tool_name=tool_name, arguments=normalized_args,
+                    ))
                 tool_started = time.perf_counter()
                 if dry_run:
                     tool_result = {"tool_name": tool_name, "arguments": normalized_args, "result": {"dry_run": True}}
@@ -638,6 +723,12 @@ class AgentService:
                         tool_result = {"tool_name": tool_name, "arguments": normalized_args, "error": str(exc)}
                         tool_status = "failed"
 
+                if self.event_bus:
+                    self.event_bus.emit(ToolResulted(
+                        run_id=run.run_id, step_index=current_step,
+                        tool_name=tool_name, status=tool_status,
+                        error=str(tool_result.get("error")) if "error" in tool_result else None,
+                    ))
                 self._record_step(
                     run=run, step_index=current_step, step_type="tool_call",
                     title=f"Execute: {tool_name}", status=tool_status,
@@ -823,6 +914,11 @@ class AgentService:
                     return
 
                 current_step += 1
+                if self.event_bus:
+                    self.event_bus.emit(ToolCalled(
+                        run_id=run.run_id, step_index=current_step,
+                        tool_name=tool_name, arguments=normalized_args,
+                    ))
                 seq += 1
                 yield AgentStreamEvent(
                     event="tool.started", run_id=run.run_id, step_index=current_step, seq=seq,
@@ -847,6 +943,12 @@ class AgentService:
                         tool_result = {"tool_name": tool_name, "arguments": normalized_args, "error": str(exc)}
                         tool_status = "failed"
 
+                if self.event_bus:
+                    self.event_bus.emit(ToolResulted(
+                        run_id=run.run_id, step_index=current_step,
+                        tool_name=tool_name, status=tool_status,
+                        error=str(tool_result.get("error")) if "error" in tool_result else None,
+                    ))
                 self._record_step(
                     run=run, step_index=current_step, step_type="tool_call",
                     title=f"Execute: {tool_name}", status=tool_status,
@@ -875,9 +977,7 @@ class AgentService:
                     "content": json.dumps(tool_result, ensure_ascii=False, default=str),
                 })
 
-            if not current_tool_calls or tool_call_history and self._count_consecutive(
-                tool_call_history, call_sig
-            ) >= _MAX_CONSECUTIVE_DUPLICATE_CALLS:
+            if not current_tool_calls:
                 break
 
         final_text = "\n".join(accumulated_text).strip()
@@ -948,6 +1048,7 @@ class AgentService:
                 space_id=space_id, task=payload.task,
                 dry_run=payload.dry_run,
                 confirm_dangerous_actions=payload.confirm_dangerous_actions,
+                run_id=run.run_id, step_index=step_index,
             )
             self._record_step(
                 run=run, step_index=step_index, step_type="tool_call",
@@ -994,6 +1095,7 @@ class AgentService:
                 calls=planned_calls, team_id=team_id, user_id=user_id,
                 space_id=space_id, task=run.task,
                 dry_run=run.dry_run, confirm_dangerous_actions=False,
+                run_id=run.run_id, step_index=step_index,
             )
         status = self._resolve_run_status(
             dry_run=run.dry_run, skipped_calls=skipped_calls,
@@ -1074,6 +1176,7 @@ class AgentService:
                     calls=[call], team_id=team_id, user_id=user_id,
                     space_id=space_id, task=payload.task,
                     dry_run=payload.dry_run,
+                    run_id=run.run_id, step_index=step_index,
                     confirm_dangerous_actions=payload.confirm_dangerous_actions,
                 )
                 tool_results.extend(call_results)
@@ -1129,16 +1232,53 @@ class AgentService:
     # Helpers: retrieval, tool execution, build messages, routing
     # ------------------------------------------------------------------
 
+    def _build_memory_prompt_blocks(
+        self,
+        *,
+        team_id: str,
+        user_id: str,
+        space_id: str | None,
+        include_memory: bool = True,
+    ) -> str:
+        """Return MEMORY.md + RECENT_CONTEXT.md prompt injection block."""
+        settings = get_settings()
+        if not include_memory or not settings.memory_markdown_enabled or self.memory_store is None:
+            return ""
+        if not team_id or not user_id:
+            return ""
+
+        parts: list[str] = []
+        long_term = self.memory_store.read_long_term(team_id, user_id, space_id)
+        if long_term:
+            parts.append(f"## Long-term Memory\n\n{long_term[:6000]}")
+
+        recent = self.memory_store.read_recent_context(team_id, user_id, space_id, include_recent_turns=False)
+        if recent:
+            parts.append(f"## Recent Context\n\n{recent[:3000]}")
+
+        return "\n\n".join(parts)
+
     def _build_agent_messages(
         self,
         *,
         task: str,
         system_prompt: str | None,
         rag_answer: str,
+        team_id: str = "",
+        user_id: str = "",
+        space_id: str | None = None,
+        include_memory: bool = True,
     ) -> list[dict[str, object]]:
+        memory_blocks = self._build_memory_prompt_blocks(
+            team_id=team_id, user_id=user_id, space_id=space_id,
+            include_memory=include_memory,
+        )
+
         system = (system_prompt or "").strip()
         if not system:
             system = "You are CaiBao, an enterprise operations agent. Use tools when appropriate and answer based on available data."
+        if memory_blocks:
+            system = system + "\n\n" + memory_blocks
 
         messages: list[dict[str, object]] = [
             {"role": "system", "content": system},
@@ -1327,6 +1467,8 @@ class AgentService:
         task: str,
         dry_run: bool,
         confirm_dangerous_actions: bool,
+        run_id: str = "",
+        step_index: int = 0,
     ) -> tuple[list[dict[str, object]], list[AgentToolCall], list[str], str]:
         tool_results: list[dict[str, object]] = []
         skipped_calls: list[AgentToolCall] = []
@@ -1340,6 +1482,12 @@ class AgentService:
             if enriched_call.dangerous and not confirm_dangerous_actions:
                 skipped_calls.append(enriched_call.model_copy(update={"requires_confirmation": True}))
                 continue
+            if self.event_bus:
+                self.event_bus.emit(ToolCalled(
+                    run_id=run_id, step_index=step_index,
+                    tool_name=enriched_call.tool_name,
+                    arguments=enriched_call.arguments,
+                ))
             try:
                 result = self.tool_service.execute(
                     team_id=team_id, user_id=user_id,
@@ -1352,8 +1500,19 @@ class AgentService:
                     "arguments": enriched_call.arguments,
                     "result": result,
                 })
+                if self.event_bus:
+                    self.event_bus.emit(ToolResulted(
+                        run_id=run_id, step_index=step_index,
+                        tool_name=enriched_call.tool_name, status="completed",
+                    ))
             except Exception as exc:  # noqa: BLE001
                 tool_errors.append(f"{enriched_call.tool_name}: {exc}")
+                if self.event_bus:
+                    self.event_bus.emit(ToolResulted(
+                        run_id=run_id, step_index=step_index,
+                        tool_name=enriched_call.tool_name, status="failed",
+                        error=str(exc),
+                    ))
 
         if tool_errors:
             return tool_results, skipped_calls, tool_errors, "partial_success" if tool_results else "failed"
@@ -1484,6 +1643,13 @@ class AgentService:
         self.db.add(step)
         self.db.commit()
         self.db.refresh(step)
+
+        if self.event_bus:
+            self.event_bus.emit(StepCompleted(
+                run_id=run.run_id, step_index=step_index,
+                step_type=step_type, status=status,
+                latency_ms=latency_ms,
+            ))
         return step
 
     def _finish_run(
@@ -1500,12 +1666,35 @@ class AgentService:
         run.required_confirmations_json = self._to_json([item.model_dump() for item in required_confirmations])
         run.latency_ms = self._elapsed_ms(started)
         run.completed_at = datetime.now(timezone.utc)
-        # Keep loop_state_json for requires_confirmation status (needed by confirm_run)
         if status != "requires_confirmation":
             run.loop_state_json = None
         self.db.add(run)
         self.db.commit()
         self.db.refresh(run)
+
+        if self.event_bus and status in ("completed", "partial_success"):
+            self.event_bus.enqueue(TurnCommitted(
+                run_id=run.run_id,
+                team_id=run.team_id,
+                user_id=run.user_id,
+                conversation_id=run.conversation_id,
+                space_id=run.space_id,
+                input_message=run.task,
+                assistant_response=run.final_answer,
+                tools_used=self._extract_tool_names(run),
+            ))
+
+    def _extract_tool_names(self, run: AgentRun) -> list[str]:
+        stmt = select(AgentStep).where(
+            AgentStep.run_id == run.run_id,
+            AgentStep.step_type == "tool_call",
+        ).order_by(AgentStep.step_index)
+        steps = list(self.db.scalars(stmt).all())
+        tool_names: list[str] = []
+        for s in steps:
+            if s.tool_name and s.tool_name not in tool_names:
+                tool_names.append(s.tool_name)
+        return tool_names
 
     # ------------------------------------------------------------------
     # Keyword planning (fallback — kept intact from original)

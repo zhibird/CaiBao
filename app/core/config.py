@@ -95,6 +95,21 @@ class Settings(BaseSettings):
     mcp_call_timeout_seconds: float = 30.0
     mcp_max_output_bytes: int = 200_000
 
+    # Markdown memory
+    memory_markdown_enabled: bool = True
+    memory_root_dir: str = "data/memory"
+    memory_consolidation_min_turns: int = 4
+    memory_recent_turns: int = 6
+    memory_optimizer_enabled: bool = False
+    memory_optimizer_interval_seconds: int = 64800
+
+    # Retrieval enhancement
+    retrieval_enhancement_enabled: bool = True
+    retrieval_query_rewrite_enabled: bool = True
+    retrieval_hyde_enabled: bool = True
+    retrieval_sufficiency_enabled: bool = True
+    retrieval_fast_timeout_ms: int = 5000
+
     model_config = SettingsConfigDict(
         env_file=str(ROOT_ENV_FILE),
         env_file_encoding="utf-8",

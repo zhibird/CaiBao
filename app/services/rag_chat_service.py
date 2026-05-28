@@ -5,7 +5,9 @@ from app.services.chat_history_service import ChatHistoryService
 from app.services.document_service import DocumentService
 from app.services.llm_model_service import LLMModelService
 from app.services.llm_service import AssistantContentPart, LLMAnswer, LLMService, VisionAttachment
+from app.core.config import get_settings
 from app.services.memory_service import MemoryService
+from app.services.retrieval_enhancer import EnhancedRetrievalService
 from app.services.retrieval_service import RetrievalService
 from app.services.user_service import UserService
 
@@ -20,6 +22,7 @@ class RagChatService:
         memory_service: MemoryService,
         llm_service: LLMService,
         llm_model_service: LLMModelService,
+        enhanced_retrieval: EnhancedRetrievalService | None = None,
     ) -> None:
         self.user_service = user_service
         self.chat_history_service = chat_history_service
@@ -28,6 +31,7 @@ class RagChatService:
         self.memory_service = memory_service
         self.llm_service = llm_service
         self.llm_model_service = llm_model_service
+        self.enhanced_retrieval = enhanced_retrieval
 
     def ask(self, payload: ChatAskRequest, *, before_message_id: str | None = None) -> ChatAskResponse:
         self.user_service.ensure_user_in_team(
@@ -138,14 +142,37 @@ class RagChatService:
                 model=selected_model,
             )
 
-        raw_hits = self.retrieval_service.search_chunks(
-            team_id=payload.team_id,
-            query=payload.question,
-            top_k=payload.top_k,
-            document_ids=scope_document_ids or None,
-            user_id=payload.user_id,
-            embedding_model=payload.embedding_model,
-        )
+        if self.enhanced_retrieval:
+            # Use the global default model for retrieval enhancement (not the
+            # per-request user model). In future the LLMRouter fast route can
+            # be resolved here for a dedicated lightweight model.
+            settings = get_settings()
+            fast_model = settings.llm_model or runtime_selected_model or ""
+            fast_base = settings.llm_base_url or ""
+            fast_key = settings.llm_api_key or ""
+            if not fast_base or not fast_key:
+                fast_model = fast_base = fast_key = ""  # let LLMService use defaults
+            enhanced = self.enhanced_retrieval.search_chunks_enhanced(
+                query=payload.question,
+                team_id=payload.team_id,
+                user_id=payload.user_id,
+                fast_model_name=fast_model,
+                fast_base_url=fast_base,
+                fast_api_key=fast_key,
+                top_k=payload.top_k,
+                document_ids=scope_document_ids or None,
+                embedding_model=payload.embedding_model,
+            )
+            raw_hits = enhanced.hits
+        else:
+            raw_hits = self.retrieval_service.search_chunks(
+                team_id=payload.team_id,
+                query=payload.question,
+                top_k=payload.top_k,
+                document_ids=scope_document_ids or None,
+                user_id=payload.user_id,
+                embedding_model=payload.embedding_model,
+            )
 
         llm_answer = self.llm_service.answer_question(
             question=payload.question,

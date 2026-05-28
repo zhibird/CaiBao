@@ -317,5 +317,73 @@ class MemoryService:
             model_name=normalized,
         )
 
+    def create_from_consolidation(
+        self,
+        *,
+        team_id: str,
+        user_id: str,
+        space_id: str | None,
+        history_entries: list[dict],
+        source_ref: str,
+    ) -> list[str]:
+        """Idempotent upsert of consolidation history entries as vector cards.
+
+        Returns list of created/updated memory_id strings.
+        """
+        created_ids: list[str] = []
+        for i, entry in enumerate(history_entries):
+            summary = str(entry.get("summary", ""))[:2000]
+            if not summary.strip():
+                continue
+            title = summary[:80]
+            entry_ref = f"{source_ref}:{i}"
+
+            # Idempotency: skip if same per-entry source_ref already exists
+            existing = self.db.scalar(
+                select(MemoryCard).where(
+                    MemoryCard.team_id == team_id,
+                    MemoryCard.user_id == user_id,
+                    MemoryCard.space_id == space_id,
+                    MemoryCard.source_ref == entry_ref,
+                    MemoryCard.memory_type == "history",
+                )
+            )
+            if existing is not None:
+                created_ids.append(existing.memory_id)
+                continue
+
+            now = datetime.now(timezone.utc)
+            card = MemoryCard(
+                memory_id=str(uuid4()),
+                team_id=team_id,
+                space_id=space_id,
+                user_id=user_id,
+                scope_level="space" if space_id else "global",
+                category="history",
+                title=title,
+                content=summary,
+                summary=summary[:500],
+                weight=0.7,
+                confidence=0.8,
+                status="active",
+                source_ref=entry_ref,
+                memory_type="history",
+                created_at=now,
+                updated_at=now,
+            )
+            self.db.add(card)
+            self.db.commit()
+            self.db.refresh(card)
+
+            # Generate embedding
+            try:
+                self._upsert_embedding(memory=card, runtime=None)
+            except Exception:
+                pass  # embedding failure is non-fatal
+
+            created_ids.append(card.memory_id)
+
+        return created_ids
+
     def _memory_model(self):
         return MemoryCard

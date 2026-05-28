@@ -28,6 +28,25 @@ from app.services.tool_catalog_service import ToolCatalogService
 from app.services.tool_safety import ToolSafetyService
 from app.services.tool_service import ToolService
 from app.services.user_service import UserService
+from app.services.memory_markdown_store import MemoryMarkdownStore
+from app.events.event_bus import EventBus
+from app.db.session import SessionLocal  # used by consolidation factory
+
+_event_bus_singleton: EventBus | None = None
+_event_bus_lock = None  # lazy-init via existing _threading import
+
+
+def get_event_bus() -> EventBus:
+    global _event_bus_singleton, _event_bus_lock
+    if _event_bus_lock is None:
+        import threading as _t
+        _event_bus_lock = _t.Lock()
+    if _event_bus_singleton is None:
+        with _event_bus_lock:
+            if _event_bus_singleton is None:
+                _event_bus_singleton = EventBus()
+                _event_bus_singleton.start_worker()
+    return _event_bus_singleton
 
 
 def get_team_service(db: Session = Depends(get_db_session)) -> TeamService:
@@ -327,6 +346,8 @@ def get_rag_chat_service(
     llm_service: LLMService = Depends(get_llm_service),
     llm_model_service: LLMModelService = Depends(get_llm_model_service),
 ) -> RagChatService:
+    from app.services.retrieval_enhancer import EnhancedRetrievalService
+    enhanced = EnhancedRetrievalService(retrieval_service, llm_service)
     return RagChatService(
         user_service=user_service,
         chat_history_service=chat_history_service,
@@ -335,6 +356,7 @@ def get_rag_chat_service(
         memory_service=memory_service,
         llm_service=llm_service,
         llm_model_service=llm_model_service,
+        enhanced_retrieval=enhanced,
     )
 
 
@@ -348,6 +370,64 @@ def get_action_chat_service(
     )
 
 
+_memory_store_singleton: MemoryMarkdownStore | None = None
+_consolidation_svc_singleton = None  # MemoryConsolidationService | None
+
+
+def _get_memory_store() -> MemoryMarkdownStore:
+    global _memory_store_singleton
+    if _memory_store_singleton is None:
+        _memory_store_singleton = MemoryMarkdownStore()
+    return _memory_store_singleton
+
+
+def _get_consolidation_service(llm_service=None):
+    global _consolidation_svc_singleton
+    if _consolidation_svc_singleton is None or llm_service is not None:
+        from app.services.memory_consolidation_service import MemoryConsolidationService
+        from app.core.config import get_settings as _gs
+        model = _gs().llm_model or ""
+        base = _gs().llm_base_url or ""
+        key = _gs().llm_api_key or ""
+        if not base or not key:
+            model = base = key = ""  # let LLMService use provider defaults
+        if _consolidation_svc_singleton is None:
+            _consolidation_svc_singleton = MemoryConsolidationService(
+                event_bus=get_event_bus(),
+                store=_get_memory_store(),
+                llm_service=llm_service,
+                fast_model_name=model,
+                fast_base_url=base,
+                fast_api_key=key,
+                memory_service_factory=_create_memory_service_for_consolidation,
+            )
+        elif llm_service is not None:
+            _consolidation_svc_singleton._llm = llm_service
+    return _consolidation_svc_singleton
+
+
+def _create_memory_service_for_consolidation():
+    """Create a fresh MemoryService with its own DB session for background work."""
+    from app.db.session import SessionLocal
+    from app.services.embedding_model_service import EmbeddingModelService
+    from app.services.embedding_service import EmbeddingService
+    from app.services.space_service import SpaceService
+    from app.services.user_service import UserService
+
+    db = SessionLocal()
+    user_svc = UserService(db)
+    space_svc = SpaceService(db=db, user_service=user_svc)
+    embedding_svc = EmbeddingService(settings=reload_settings())
+    emb_model_svc = EmbeddingModelService(db=db, user_service=user_svc)
+    return MemoryService(
+        db=db,
+        user_service=user_svc,
+        space_service=space_svc,
+        embedding_service=embedding_svc,
+        embedding_model_service=emb_model_svc,
+    )
+
+
 def get_agent_service(
     db: Session = Depends(get_db_session),
     user_service: UserService = Depends(get_user_service),
@@ -358,6 +438,7 @@ def get_agent_service(
     llm_service: LLMService = Depends(get_llm_service),
     llm_model_service: LLMModelService = Depends(get_llm_model_service),
 ) -> AgentService:
+    _get_consolidation_service(llm_service=llm_service)
     return AgentService(
         db=db,
         user_service=user_service,
@@ -367,6 +448,8 @@ def get_agent_service(
         chat_history_service=chat_history_service,
         llm_service=llm_service,
         llm_model_service=llm_model_service,
+        event_bus=get_event_bus(),
+        memory_store=_get_memory_store(),
     )
 
 

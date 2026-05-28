@@ -65,6 +65,8 @@ class MemoryCard(Base):
         nullable=True,
         index=True,
     )
+    source_ref: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    memory_type: Mapped[str] = mapped_column(String(32), nullable=False, default="card", server_default="card")
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

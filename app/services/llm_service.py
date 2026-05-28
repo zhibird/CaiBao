@@ -144,6 +144,7 @@ class LLMService:
         tools: list[dict[str, object]] | None = None,
         tool_choice: str = "auto",
         force_mock: bool = False,
+        timeout_seconds: float | None = None,
     ) -> LLMCompletionResult:
         """Non-streaming chat completion with optional tool calling."""
         if force_mock:
@@ -160,13 +161,14 @@ class LLMService:
             tool_choice=tool_choice,
         )
         selected_model = str(model or self.settings.llm_model).strip()
+        effective_timeout = timeout_seconds if timeout_seconds is not None else self.settings.llm_timeout_seconds
 
         try:
             response = self._post_chat_completion(
                 payload=payload,
                 base_url=runtime[0],
                 api_key=runtime[1],
-                timeout_seconds=self.settings.llm_timeout_seconds,
+                timeout_seconds=effective_timeout,
             )
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:

@@ -475,6 +475,10 @@ def test_chat_ask_falls_back_when_provider_rejects_multimodal_array_content(clie
         )
 
     monkeypatch.setattr("app.services.llm_service.httpx.post", _fake_post)
+    monkeypatch.setattr(
+        "app.services.retrieval_enhancer.get_settings",
+        lambda: type("S", (), {"retrieval_enhancement_enabled": False})(),
+    )
 
     ask_response = client.post(
         "/api/v1/chat/ask",
