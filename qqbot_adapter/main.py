@@ -132,6 +132,7 @@ async def main(config_path: str) -> None:
             bot_user_id=caibao_cfg.get("bot_user_id", "qqbot"),
             bot_password=caibao_cfg.get("bot_password", ""),
             http_timeout=caibao_cfg.get("http_timeout", 120.0),
+            system_prompt=caibao_cfg.get("system_prompt") or None,
         )
 
         _logger.info(

@@ -103,3 +103,57 @@ def test_ensure_phase1_columns_adds_auth_columns_to_legacy_users_table(tmp_path,
         engine.dispose()
 
     assert {"password_hash", "is_active", "password_updated_at"} <= users_columns
+
+
+def test_ensure_phase1_columns_normalizes_legacy_agent_runs_table(tmp_path, monkeypatch):
+    db_file = tmp_path / "legacy-agent-runs.db"
+    database_url = f"sqlite:///{db_file.resolve().as_posix()}"
+    engine = create_engine(database_url, future=True)
+    try:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                """
+                CREATE TABLE agent_runs (
+                    run_id VARCHAR(36) NOT NULL PRIMARY KEY,
+                    team_id VARCHAR(64) NOT NULL,
+                    user_id VARCHAR(64) NOT NULL,
+                    conversation_id VARCHAR(36),
+                    space_id VARCHAR(36),
+                    task TEXT NOT NULL,
+                    status VARCHAR(24) NOT NULL,
+                    max_steps INTEGER NOT NULL,
+                    current_step INTEGER NOT NULL,
+                    result_summary TEXT,
+                    error_message TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL
+                )
+                """
+            )
+            connection.exec_driver_sql(
+                """
+                INSERT INTO agent_runs (
+                    run_id, team_id, user_id, task, status, max_steps, current_step
+                )
+                VALUES ('run-old', 'team-a', 'user-a', 'hello', 'queued', 5, 0)
+                """
+            )
+
+        monkeypatch.setattr(session_module, "engine", engine)
+        session_module._ensure_phase1_columns()
+
+        with engine.begin() as connection:
+            columns = {col["name"] for col in inspect(connection).get_columns("agent_runs")}
+            connection.exec_driver_sql(
+                """
+                INSERT INTO agent_runs (run_id, team_id, user_id, task)
+                VALUES ('run-new', 'team-a', 'user-a', 'new task')
+                """
+            )
+            row_count = connection.exec_driver_sql("SELECT COUNT(*) FROM agent_runs").scalar_one()
+    finally:
+        engine.dispose()
+
+    assert not {"current_step", "result_summary", "error_message", "updated_at"} & columns
+    assert {"final_answer", "dry_run", "request_payload_json", "completed_at"} <= columns
+    assert row_count == 2

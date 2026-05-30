@@ -33,6 +33,31 @@ settings = get_settings()
 is_sqlite = _is_sqlite_url(settings.database_url)
 connect_args = _build_connect_args(settings.database_url, settings.db_connect_timeout_seconds)
 
+_AGENT_RUN_CURRENT_COLUMNS = (
+    "run_id",
+    "team_id",
+    "user_id",
+    "conversation_id",
+    "space_id",
+    "app_id",
+    "app_version",
+    "trigger_channel",
+    "task",
+    "status",
+    "final_answer",
+    "model",
+    "dry_run",
+    "max_steps",
+    "required_confirmations_json",
+    "request_payload_json",
+    "loop_state_json",
+    "model_routes_json",
+    "latency_ms",
+    "created_at",
+    "completed_at",
+)
+_AGENT_RUN_LEGACY_COLUMNS = {"current_step", "result_summary", "error_message", "updated_at"}
+
 engine = create_engine(
     settings.database_url,
     connect_args=connect_args,
@@ -134,6 +159,140 @@ def _get_current_alembic_revision() -> str | None:
         return str(result).strip() or None
 
 
+def _ensure_agent_steps_columns(step_cols: set) -> None:
+    """Migrate agent_steps from old schema to current model."""
+    _add_col("agent_steps", "team_id", "VARCHAR(64) NOT NULL DEFAULT ''", step_cols)
+    _add_col("agent_steps", "user_id", "VARCHAR(64) NOT NULL DEFAULT ''", step_cols)
+    _add_col("agent_steps", "title", "VARCHAR(128) NOT NULL DEFAULT ''", step_cols)
+    _add_col("agent_steps", "input_json", "TEXT NOT NULL DEFAULT '{}'", step_cols)
+    _add_col("agent_steps", "output_json", "TEXT NOT NULL DEFAULT '{}'", step_cols)
+    _add_col("agent_steps", "error_message", "TEXT", step_cols)
+    _add_col("agent_steps", "latency_ms", "INTEGER", step_cols)
+
+
+def _add_col(table: str, col: str, typedef: str, existing: set) -> None:
+    if col not in existing:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {col} {typedef}")
+        existing.add(col)
+
+
+def _normalize_legacy_agent_runs_table() -> None:
+    """Rebuild old SQLite agent_runs tables that still require current_step."""
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        if "agent_runs" not in set(inspector.get_table_names()):
+            return
+        columns = {item["name"] for item in inspector.get_columns("agent_runs")}
+        if not (_AGENT_RUN_LEGACY_COLUMNS & columns):
+            return
+
+        select_list = ", ".join(
+            _agent_run_select_expression(column, columns)
+            for column in _AGENT_RUN_CURRENT_COLUMNS
+        )
+        insert_columns = ", ".join(f'"{column}"' for column in _AGENT_RUN_CURRENT_COLUMNS)
+
+        conn.exec_driver_sql("DROP TABLE IF EXISTS agent_runs__normalized")
+        conn.exec_driver_sql(
+            """
+            CREATE TABLE agent_runs__normalized (
+                run_id VARCHAR(36) NOT NULL,
+                team_id VARCHAR(64) NOT NULL,
+                user_id VARCHAR(64) NOT NULL,
+                conversation_id VARCHAR(36),
+                space_id VARCHAR(36),
+                app_id VARCHAR(36),
+                app_version INTEGER,
+                trigger_channel VARCHAR(32) NOT NULL DEFAULT 'agent',
+                task TEXT NOT NULL,
+                status VARCHAR(32) NOT NULL DEFAULT 'running',
+                final_answer TEXT NOT NULL DEFAULT '',
+                model VARCHAR(128),
+                dry_run BOOLEAN NOT NULL DEFAULT 0,
+                max_steps INTEGER NOT NULL DEFAULT 5,
+                required_confirmations_json TEXT NOT NULL DEFAULT '[]',
+                request_payload_json TEXT NOT NULL DEFAULT '{}',
+                loop_state_json TEXT,
+                model_routes_json TEXT,
+                latency_ms INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
+                completed_at DATETIME,
+                PRIMARY KEY (run_id),
+                FOREIGN KEY(conversation_id) REFERENCES conversations (conversation_id),
+                FOREIGN KEY(space_id) REFERENCES project_spaces (space_id),
+                FOREIGN KEY(team_id) REFERENCES teams (team_id),
+                FOREIGN KEY(user_id) REFERENCES users (user_id),
+                FOREIGN KEY(app_id) REFERENCES agent_apps (app_id)
+            )
+            """
+        )
+        conn.exec_driver_sql(
+            f"""
+            INSERT INTO agent_runs__normalized ({insert_columns})
+            SELECT {select_list}
+            FROM agent_runs
+            """
+        )
+        conn.exec_driver_sql("DROP TABLE agent_runs")
+        conn.exec_driver_sql("ALTER TABLE agent_runs__normalized RENAME TO agent_runs")
+        _create_agent_run_indexes(conn)
+
+
+def _agent_run_select_expression(column: str, columns: set[str]) -> str:
+    if column in columns:
+        source = f'"{column}"'
+    else:
+        source = _agent_run_missing_value(column)
+
+    default = _agent_run_coalesce_default(column)
+    if default is not None:
+        source = f"COALESCE({source}, {default})"
+    return f'{source} AS "{column}"'
+
+
+def _agent_run_missing_value(column: str) -> str:
+    return {
+        "trigger_channel": "'agent'",
+        "task": "''",
+        "status": "'running'",
+        "final_answer": "''",
+        "dry_run": "0",
+        "max_steps": "5",
+        "required_confirmations_json": "'[]'",
+        "request_payload_json": "'{}'",
+        "created_at": "CURRENT_TIMESTAMP",
+    }.get(column, "NULL")
+
+
+def _agent_run_coalesce_default(column: str) -> str | None:
+    return {
+        "trigger_channel": "'agent'",
+        "task": "''",
+        "status": "'running'",
+        "final_answer": "''",
+        "dry_run": "0",
+        "max_steps": "5",
+        "required_confirmations_json": "'[]'",
+        "request_payload_json": "'{}'",
+        "created_at": "CURRENT_TIMESTAMP",
+    }.get(column)
+
+
+def _create_agent_run_indexes(conn: Any) -> None:
+    conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_agent_runs_team_id ON agent_runs(team_id)")
+    conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_agent_runs_user_id ON agent_runs(user_id)")
+    conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_agent_runs_conversation_id ON agent_runs(conversation_id)")
+    conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_agent_runs_space_id ON agent_runs(space_id)")
+    conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_agent_runs_status ON agent_runs(status)")
+    conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_agent_runs_dry_run ON agent_runs(dry_run)")
+    conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_agent_runs_app_id ON agent_runs(app_id)")
+    conn.exec_driver_sql(
+        "CREATE INDEX IF NOT EXISTS ix_agent_runs_team_user_created_at "
+        "ON agent_runs(team_id, user_id, created_at)"
+    )
+
+
 def _get_head_alembic_revision() -> str:
     alembic_ini = Path(__file__).resolve().parents[2] / "alembic.ini"
     if not alembic_ini.exists():
@@ -192,6 +351,51 @@ def _ensure_phase1_columns() -> None:
         if "trigger_channel" not in agent_run_cols:
             with engine.begin() as conn:
                 conn.exec_driver_sql("ALTER TABLE agent_runs ADD COLUMN trigger_channel VARCHAR(32) DEFAULT 'agent'")
+        # v0.23.0+: 旧表 goal → task 重命名 + 缺失列补充
+        if "goal" in agent_run_cols and "task" not in agent_run_cols:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("ALTER TABLE agent_runs RENAME COLUMN goal TO task")
+            agent_run_cols.discard("goal")
+            agent_run_cols.add("task")
+        if "task" not in agent_run_cols:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("ALTER TABLE agent_runs ADD COLUMN task TEXT NOT NULL DEFAULT ''")
+        if "final_answer" not in agent_run_cols:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("ALTER TABLE agent_runs ADD COLUMN final_answer TEXT NOT NULL DEFAULT ''")
+        if "model" not in agent_run_cols:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("ALTER TABLE agent_runs ADD COLUMN model VARCHAR(128)")
+        if "dry_run" not in agent_run_cols:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("ALTER TABLE agent_runs ADD COLUMN dry_run BOOLEAN NOT NULL DEFAULT 0")
+        if "required_confirmations_json" not in agent_run_cols:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("ALTER TABLE agent_runs ADD COLUMN required_confirmations_json TEXT NOT NULL DEFAULT '[]'")
+        if "request_payload_json" not in agent_run_cols:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("ALTER TABLE agent_runs ADD COLUMN request_payload_json TEXT NOT NULL DEFAULT '{}'")
+        if "loop_state_json" not in agent_run_cols:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("ALTER TABLE agent_runs ADD COLUMN loop_state_json TEXT")
+        if "model_routes_json" not in agent_run_cols:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("ALTER TABLE agent_runs ADD COLUMN model_routes_json TEXT")
+        if "latency_ms" not in agent_run_cols:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("ALTER TABLE agent_runs ADD COLUMN latency_ms INTEGER")
+        if "completed_at" not in agent_run_cols:
+            with engine.begin() as conn:
+                conn.exec_driver_sql("ALTER TABLE agent_runs ADD COLUMN completed_at DATETIME")
+        _normalize_legacy_agent_runs_table()
+
+    # agent_steps 旧→新 schema 迁移
+    if "agent_steps" in table_names:
+        step_cols = {item["name"] for item in inspector.get_columns("agent_steps")}
+        _ensure_agent_steps_columns(step_cols)
+
+    if "documents" in table_names:
+        document_cols = {item["name"] for item in inspector.get_columns("documents")}
         if "mime_type" not in document_cols:
             with engine.begin() as conn:
                 conn.exec_driver_sql("ALTER TABLE documents ADD COLUMN mime_type VARCHAR(128)")

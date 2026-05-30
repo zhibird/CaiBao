@@ -16,7 +16,7 @@ from sqlalchemy.schema import CreateColumn
 from app.db.base import Base
 from app.models import *  # noqa: F401,F403
 
-HEAD_REVISION = "20260529_00"
+HEAD_REVISION = "20260530_00"
 EXPECTED_TABLES = {
     "teams",
     "users",
@@ -131,6 +131,72 @@ def test_migration_upgrade_from_half_upgraded_database(tmp_path) -> None:
 
     command.upgrade(config, "head")
     assert _current_revision(database_url) == HEAD_REVISION
+
+
+def test_migration_removes_legacy_agent_run_required_columns(tmp_path) -> None:
+    db_file = tmp_path / "legacy-agent-runs.db"
+    database_url = _sqlite_database_url(db_file)
+    config = _make_alembic_config(database_url)
+
+    command.upgrade(config, "20260412_00")
+    engine = _create_engine(database_url)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE agent_runs (
+                        run_id VARCHAR(36) NOT NULL PRIMARY KEY,
+                        team_id VARCHAR(64) NOT NULL,
+                        user_id VARCHAR(64) NOT NULL,
+                        conversation_id VARCHAR(36),
+                        space_id VARCHAR(36),
+                        task TEXT NOT NULL,
+                        max_steps INTEGER NOT NULL DEFAULT 5,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
+                        status VARCHAR(32) NOT NULL DEFAULT 'running',
+                        current_step INTEGER NOT NULL,
+                        result_summary TEXT,
+                        error_message TEXT,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL
+                    )
+                    """
+                )
+            )
+    finally:
+        engine.dispose()
+
+    command.upgrade(config, "head")
+
+    engine = _create_engine(database_url)
+    try:
+        with engine.begin() as connection:
+            columns = {col["name"] for col in inspect(connection).get_columns("agent_runs")}
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO agent_runs (run_id, team_id, user_id, task)
+                    VALUES ('run-new', 'team-a', 'user-a', 'new task')
+                    """
+                )
+            )
+    finally:
+        engine.dispose()
+
+    assert not {"current_step", "result_summary", "error_message", "updated_at"} & columns
+    assert {
+        "app_id",
+        "app_version",
+        "trigger_channel",
+        "final_answer",
+        "dry_run",
+        "required_confirmations_json",
+        "request_payload_json",
+        "loop_state_json",
+        "model_routes_json",
+        "latency_ms",
+        "completed_at",
+    } <= columns
 
 
 def test_auth_migration_adds_auth_tables_and_user_columns(tmp_path) -> None:

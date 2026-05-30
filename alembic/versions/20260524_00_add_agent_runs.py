@@ -46,6 +46,8 @@ def upgrade() -> None:
             sa.ForeignKeyConstraint(["user_id"], ["users.user_id"]),
             sa.PrimaryKeyConstraint("run_id"),
         )
+    else:
+        _ensure_agent_run_columns()
 
     _ensure_index("agent_runs", "ix_agent_runs_team_id", ["team_id"])
     _ensure_index("agent_runs", "ix_agent_runs_user_id", ["user_id"])
@@ -94,6 +96,33 @@ def _ensure_index(table_name: str, index_name: str, columns: list[str]) -> None:
     index_names = {item["name"] for item in inspector.get_indexes(table_name)}
     if index_name not in index_names:
         op.create_index(index_name, table_name, columns, unique=False)
+
+
+def _ensure_agent_run_columns() -> None:
+    inspector = sa.inspect(op.get_bind())
+    columns = {item["name"] for item in inspector.get_columns("agent_runs")}
+
+    if "goal" in columns and "task" not in columns:
+        with op.batch_alter_table("agent_runs") as batch_op:
+            batch_op.alter_column("goal", new_column_name="task", existing_type=sa.Text())
+        columns.discard("goal")
+        columns.add("task")
+
+    for column in (
+        sa.Column("task", sa.Text(), nullable=False, server_default=""),
+        sa.Column("status", sa.String(length=32), nullable=False, server_default="running"),
+        sa.Column("final_answer", sa.Text(), nullable=False, server_default=""),
+        sa.Column("model", sa.String(length=128), nullable=True),
+        sa.Column("dry_run", sa.Boolean(), nullable=False, server_default=sa.false()),
+        sa.Column("max_steps", sa.Integer(), nullable=False, server_default="5"),
+        sa.Column("required_confirmations_json", sa.Text(), nullable=False, server_default="[]"),
+        sa.Column("latency_ms", sa.Integer(), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
+    ):
+        if column.name not in columns:
+            op.add_column("agent_runs", column)
+            columns.add(column.name)
 
 
 def downgrade() -> None:

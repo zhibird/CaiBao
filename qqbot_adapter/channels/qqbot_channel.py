@@ -34,7 +34,7 @@ from qqbot_adapter.utils.image_utils import (
 
 _logger = logging.getLogger(__name__)
 
-# QQ 官方 Bot API 基础 URL
+# QQ 官方 Bot API 基础 URL（群机器人，非频道/Guild）
 _QQ_API_BASE = "https://api.sgroup.qq.com"
 _QQ_AUTH_URL = "https://bots.qq.com/app/getAppAccessToken"
 
@@ -87,6 +87,7 @@ class QQBotChannel(BaseChannel):
         self._session_id: str = ""
         self._last_seq: int = 0
         self._ws_url: str = ""
+        self._reply_seq_by_msg_id: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -210,6 +211,8 @@ class QQBotChannel(BaseChannel):
                 interval = payload.get("heartbeat_interval", 41250)
                 self._start_heartbeat(interval)
                 _logger.info("QQBot Hello received, heartbeat=%sms", interval)
+                # 发送 Identify 帧（必须！否则不会收到 dispatch 事件）
+                await self._send_identify()
 
             elif op == 0:  # Dispatch
                 self._last_seq = data.get("s", self._last_seq)
@@ -218,6 +221,31 @@ class QQBotChannel(BaseChannel):
 
             elif op == 11:  # Heartbeat ACK
                 _logger.debug("Heartbeat ACK")
+
+    async def _send_identify(self) -> None:
+        """发送 Identify 帧，订阅 C2C 消息事件。
+
+        QQ Bot WebSocket 必须在 Hello 后发送 Identify 才会推送 dispatch 事件。
+        """
+        assert self._ws is not None
+        identify = {
+            "op": 2,  # Identify
+            "d": {
+                "token": f"QQBot {self._access_token}",
+                "intents": self._intents,
+                "shard": [0, 1],
+                "properties": {},
+            },
+        }
+        await self._ws.send(json.dumps(identify, ensure_ascii=False))
+        _logger.info("QQBot Identify sent, intents=%s", self._intents)
+
+    @property
+    def _intents(self) -> int:
+        """事件订阅位掩码。1<<25 = C2C_MESSAGE_CREATE。"""
+        # 1 << 25: C2C_MESSAGE_CREATE (私聊消息)
+        # 1 << 0:  GUILDS (频道，不需要)
+        return 1 << 25
 
     def _start_heartbeat(self, interval_ms: int) -> None:
         """启动心跳任务。"""
@@ -255,6 +283,8 @@ class QQBotChannel(BaseChannel):
             await self._on_group_message(payload)
         elif event_type == "READY":
             _logger.info("QQBot Ready: session=%s", payload.get("session_id", ""))
+        else:
+            _logger.debug("QQBot unhandled event type: %s", event_type)
 
     async def _on_private_message(self, payload: dict[str, Any]) -> None:
         """处理官方 Bot 私聊消息。"""
@@ -296,13 +326,15 @@ class QQBotChannel(BaseChannel):
         """处理官方 Bot 群聊消息（@ 触发）。"""
         group_openid = str(payload.get("group_openid", ""))
         group_config = self.groups.get(group_openid)
-        if group_config is None:
+        if group_config is None and not self.allow_all:
+            _logger.debug("QQBot group %s blocked (not configured)", group_openid)
             return
 
         author = payload.get("author", {})
         user_id = str(author.get("member_openid", ""))
-        allow_from = group_config.get("allow_from", [])
+        allow_from = [] if self.allow_all or group_config is None else group_config.get("allow_from", [])
         if allow_from and user_id not in allow_from:
+            _logger.debug("QQBot group user %s blocked (not in allow_from)", user_id)
             return
 
         content = str(payload.get("content", ""))
@@ -341,6 +373,7 @@ class QQBotChannel(BaseChannel):
         chat_id: str,
         content: str,
         chat_type: str | None = None,
+        reply_to: str | None = None,
     ) -> dict[str, Any]:
         """发送文本消息（HTTP POST）。"""
         await self._ensure_token()
@@ -350,16 +383,12 @@ class QQBotChannel(BaseChannel):
             "Authorization": f"QQBot {self._access_token}",
             "Content-Type": "application/json",
         }
-        msg_id = self._generate_msg_id()
-
         if chat_id.startswith("g"):
             # 群聊
             group_openid = chat_id[1:]
             body = {
                 "content": content,
                 "msg_type": 0,
-                "msg_id": msg_id,
-                "msg_seq": 1,
             }
             url = f"{_QQ_API_BASE}/v2/groups/{group_openid}/messages"
         else:
@@ -367,9 +396,12 @@ class QQBotChannel(BaseChannel):
             body = {
                 "content": content,
                 "msg_type": 0,
-                "msg_id": msg_id,
             }
             url = f"{_QQ_API_BASE}/v2/users/{chat_id}/messages"
+
+        if reply_to:
+            body["msg_id"] = reply_to
+            body["msg_seq"] = self._next_reply_msg_seq(reply_to)
 
         resp = await self._http.post(url, json=body, headers=headers)
         try:
@@ -424,9 +456,21 @@ class QQBotChannel(BaseChannel):
 
     @staticmethod
     def _generate_msg_id() -> str:
-        """生成唯一消息 ID。"""
-        import uuid
-        return uuid.uuid4().hex[:32]
+        """生成消息 ID（QQ Bot 要求纯数字字符串）。"""
+        return str(int(time.time() * 1000))
+
+    def _next_reply_msg_seq(self, msg_id: str) -> int:
+        """Return a stable increasing sequence for replies to one inbound message."""
+        seq = self._reply_seq_by_msg_id.get(msg_id, 0) + 1
+        self._reply_seq_by_msg_id[msg_id] = seq
+        if len(self._reply_seq_by_msg_id) > 4096:
+            self._reply_seq_by_msg_id.pop(next(iter(self._reply_seq_by_msg_id)), None)
+        return seq
+
+    @staticmethod
+    def _next_msg_seq() -> int:
+        """生成消息序号。"""
+        return int(time.time() * 1000) % 65536
 
     # ------------------------------------------------------------------
     # 出站回调
@@ -434,4 +478,4 @@ class QQBotChannel(BaseChannel):
 
     async def _outbound_callback(self, msg: OutboundMessage) -> None:
         """MessageBus 出站回调 → send_message。"""
-        await self.send_message(chat_id=msg.chat_id, content=msg.content)
+        await self.send_message(chat_id=msg.chat_id, content=msg.content, reply_to=msg.reply_to)

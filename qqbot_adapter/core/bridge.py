@@ -33,6 +33,8 @@ _logger = logging.getLogger(__name__)
 _MAX_MESSAGE_CHARS = 3500
 # 同 chat_id 最小发送间隔（秒），防止 QQ 频控
 _MIN_SEND_INTERVAL = 0.3
+_QQBOT_PASSIVE_REPLY_LIMIT = 5
+_QQBOT_REPLY_COUNT_CACHE_LIMIT = 2048
 
 # SSE 流式失败时触发同步降级的异常类型
 _STREAMING_FALLBACK_ERRORS = (
@@ -91,12 +93,14 @@ class AgentBridge:
         bot_user_id: str,
         bot_password: str,
         http_timeout: float = 120.0,
+        system_prompt: str | None = None,
     ) -> None:
         self.bus = bus
         self.caibao_url = caibao_base_url.rstrip("/")
         self.bot_user_id = bot_user_id
         self.bot_password = bot_password
         self.http_timeout = http_timeout
+        self.system_prompt = system_prompt
 
         # httpx 客户端（带 cookie 持久化，用于 CaiBao JWT 认证）
         self._client: httpx.AsyncClient | None = None
@@ -105,6 +109,7 @@ class AgentBridge:
         self._last_send_time: dict[str, float] = {}
         # 待确认的危险操作：chat_id → PendingConfirmation
         self._pending_confirmations: dict[str, PendingConfirmation] = {}
+        self._reply_counts: dict[tuple[str, str, str], int] = {}
         # QQ 标识 → CaiBao 真实 conversation UUID
         # TODO(P2): Persist conversation mapping.
         #   Suggest implementing via CaiBao backend resolve API at POST /api/v1/conversations/resolve.
@@ -139,6 +144,9 @@ class AgentBridge:
             return
 
         try:
+            if inbound.channel_type == "qqbot":
+                await self._handle_message_sync(inbound)
+                return
             await self._handle_message_streaming(inbound)
         except _STREAMING_FALLBACK_ERRORS as exc:
             _logger.warning(
@@ -152,31 +160,22 @@ class AgentBridge:
                     "Sync fallback also failed for user %s: %.100s",
                     inbound.user_id, inbound.content,
                 )
-                await self.bus.publish_outbound(OutboundMessage(
-                    channel_type=inbound.channel_type,
-                    chat_id=inbound.chat_id,
-                    content="⚠️ Agent 处理请求时出错，请稍后重试。",
-                ))
+                await self._publish_reply(inbound, "⚠️ Agent 处理请求时出错，请稍后重试。")
         except httpx.HTTPStatusError as exc:
             _logger.error(
                 "CaiBao API error for user %s: %s %s",
                 inbound.user_id, exc.response.status_code, exc.response.text[:200],
             )
-            await self.bus.publish_outbound(OutboundMessage(
-                channel_type=inbound.channel_type,
-                chat_id=inbound.chat_id,
-                content=f"⚠️ CaiBao 服务返回错误 ({exc.response.status_code})，请检查 Bot 账号配置。",
-            ))
+            await self._publish_reply(
+                inbound,
+                f"⚠️ CaiBao 服务返回错误 ({exc.response.status_code})，请检查 Bot 账号配置。",
+            )
         except Exception:
             _logger.exception(
                 "Failed to handle message from %s: %.100s",
                 inbound.user_id, inbound.content,
             )
-            await self.bus.publish_outbound(OutboundMessage(
-                channel_type=inbound.channel_type,
-                chat_id=inbound.chat_id,
-                content="⚠️ Agent 处理请求时出错，请稍后重试。",
-            ))
+            await self._publish_reply(inbound, "⚠️ Agent 处理请求时出错，请稍后重试。")
 
     async def _handle_message_streaming(self, inbound: InboundMessage) -> None:
         """SSE 流式路径：创建 queued run → 流式消费 → 智能分段推送。
@@ -371,22 +370,52 @@ class AgentBridge:
         if wait > 0:
             await asyncio.sleep(wait)
 
-        await self.bus.publish_outbound(OutboundMessage(
-            channel_type=inbound.channel_type,
-            chat_id=chat_id,
-            content=content,
-            tool_status=tool_status,
-        ))
+        await self._publish_reply(inbound, content, tool_status=tool_status)
         self._last_send_time[chat_id] = time.monotonic()
 
-    async def _handle_message_sync(self, inbound: InboundMessage) -> None:
-        """同步降级路径：POST /api/v1/agent/run → 一次性返回完整答案。"""
+    async def _publish_reply(
+        self,
+        inbound: InboundMessage,
+        content: str,
+        *,
+        tool_status: str | None = None,
+    ) -> None:
+        if not self._consume_reply_budget(inbound):
+            return
         await self.bus.publish_outbound(OutboundMessage(
             channel_type=inbound.channel_type,
             chat_id=inbound.chat_id,
-            content="⏳ 正在处理（同步模式，请稍候）...",
-            tool_status="thinking",
+            content=content,
+            reply_to=inbound.message_id or None,
+            tool_status=tool_status,
         ))
+
+    def _consume_reply_budget(self, inbound: InboundMessage) -> bool:
+        if inbound.channel_type != "qqbot" or not inbound.message_id:
+            return True
+
+        key = (inbound.channel_type, inbound.chat_id, inbound.message_id)
+        count = self._reply_counts.get(key, 0)
+        if count >= _QQBOT_PASSIVE_REPLY_LIMIT:
+            _logger.warning(
+                "QQBot passive reply limit reached: chat=%s msg_id=%s",
+                inbound.chat_id,
+                inbound.message_id,
+            )
+            return False
+
+        if key not in self._reply_counts and len(self._reply_counts) >= _QQBOT_REPLY_COUNT_CACHE_LIMIT:
+            self._reply_counts.pop(next(iter(self._reply_counts)), None)
+        self._reply_counts[key] = count + 1
+        return True
+
+    async def _handle_message_sync(self, inbound: InboundMessage) -> None:
+        """同步降级路径：POST /api/v1/agent/run → 一次性返回完整答案。"""
+        await self._publish_reply(
+            inbound,
+            "⏳ 正在处理（同步模式，请稍候）...",
+            tool_status="thinking",
+        )
 
         result = await self._run_sync(inbound)
 
@@ -401,12 +430,11 @@ class AgentBridge:
                 name = tc.get("tool_name", "unknown")
                 dangerous = "⚠️" if tc.get("dangerous") else ""
                 lines.append(f"  - {dangerous}{name}")
-            await self.bus.publish_outbound(OutboundMessage(
-                channel_type=inbound.channel_type,
-                chat_id=inbound.chat_id,
-                content="\n".join(lines),
+            await self._publish_reply(
+                inbound,
+                "\n".join(lines),
                 tool_status="done",
-            ))
+            )
 
         # 推送确认提示 + 保存待确认状态（支持交互式回复）
         confirmations = result.get("required_confirmations") or []
@@ -417,10 +445,9 @@ class AgentBridge:
             args = first.get("arguments", {})
             args_text = json.dumps(args, ensure_ascii=False)[:200]
 
-            await self.bus.publish_outbound(OutboundMessage(
-                channel_type=inbound.channel_type,
-                chat_id=inbound.chat_id,
-                content=(
+            await self._publish_reply(
+                inbound,
+                (
                     f"⚠️ 需要确认危险操作\n"
                     f"━━━━━━━━━━━━━━\n"
                     f"工具: {tool_name}\n"
@@ -428,7 +455,7 @@ class AgentBridge:
                     f"━━━━━━━━━━━━━━\n"
                     f"回复「确认」执行，回复「取消」跳过"
                 ),
-            ))
+            )
             # 保存待确认状态，支持用户交互式回复
             run_id = str(result.get("run_id", ""))
             if run_id:
@@ -443,11 +470,7 @@ class AgentBridge:
         if answer:
             await self._send_long_message(inbound, answer, is_final=True)
         elif status == "failed":
-            await self.bus.publish_outbound(OutboundMessage(
-                channel_type=inbound.channel_type,
-                chat_id=inbound.chat_id,
-                content="❌ Agent 执行失败，请检查任务内容或稍后重试。",
-            ))
+            await self._publish_reply(inbound, "❌ Agent 执行失败，请检查任务内容或稍后重试。")
 
     # ------------------------------------------------------------------
     # CaiBao API 调用
@@ -512,7 +535,7 @@ class AgentBridge:
 
         注意：conversation_id 在调用前由 _ensure_conversation 填入真实 UUID。
         """
-        return {
+        payload: dict[str, Any] = {
             "task": msg.content,
             "trigger_channel": "qqbot",
             "include_memory": True,
@@ -520,6 +543,9 @@ class AgentBridge:
             "dry_run": False,
             "confirm_dangerous_actions": False,  # QQ 侧走确认流程
         }
+        if self.system_prompt:
+            payload["system_prompt"] = self.system_prompt
+        return payload
 
     async def _create_run(self, msg: InboundMessage) -> str:
         """POST /api/v1/agent/runs 创建队列运行，返回 run_id。"""
@@ -698,23 +724,18 @@ class AgentBridge:
 
         # 如果文本不太长，一次发送
         if len(text) <= _MAX_MESSAGE_CHARS:
-            await self.bus.publish_outbound(OutboundMessage(
-                channel_type=inbound.channel_type,
-                chat_id=inbound.chat_id,
-                content=text,
+            await self._publish_reply(
+                inbound,
+                text,
                 tool_status="done" if is_final else None,
-            ))
+            )
             return
 
         # 分段发送
         parts = self._split_text(text, _MAX_MESSAGE_CHARS)
         for i, part in enumerate(parts):
             suffix = f"  ({i + 1}/{len(parts)})" if len(parts) > 1 else ""
-            await self.bus.publish_outbound(OutboundMessage(
-                channel_type=inbound.channel_type,
-                chat_id=inbound.chat_id,
-                content=part + suffix,
-            ))
+            await self._publish_reply(inbound, part + suffix)
 
     @staticmethod
     def _split_text(text: str, max_chars: int) -> list[str]:
