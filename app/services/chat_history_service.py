@@ -30,8 +30,8 @@ class ChatHistoryService:
         response_payload: dict[str, object],
     ) -> ChatHistory:
         normalized_channel = channel.strip().lower()
-        if normalized_channel not in {"echo", "ask", "action", "agent"}:
-            raise DomainValidationError("channel must be one of: echo, ask, action, agent.")
+        if normalized_channel not in {"echo", "ask", "action", "agent", "qqbot"}:
+            raise DomainValidationError("channel must be one of: echo, ask, action, agent, qqbot.")
 
         space_id: str | None = None
         if conversation_id is not None:

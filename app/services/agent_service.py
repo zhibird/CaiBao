@@ -65,6 +65,7 @@ class AgentService:
         llm_model_service: LLMModelService,
         event_bus: EventBus | None = None,
         memory_store: MemoryMarkdownStore | None = None,
+        plugin_manager=None,  # optional PluginManager
     ) -> None:
         self.db = db
         self.user_service = user_service
@@ -76,6 +77,7 @@ class AgentService:
         self.llm_model_service = llm_model_service
         self.event_bus = event_bus
         self.memory_store = memory_store
+        self.plugin_manager = plugin_manager
 
     # ------------------------------------------------------------------
     # Public API
@@ -114,6 +116,9 @@ class AgentService:
                 conversation_id=payload.conversation_id, space_id=effective_space_id,
                 task=payload.task, channel=payload.trigger_channel,
             ))
+
+        self._run_plugin_phase("BeforeTurn", run.run_id, team_id, user_id, effective_space_id,
+                               run=run, payload=payload, routes=routes)
 
         if payload.run_mode.strip().lower() == "workflow" and self._workflow_nodes(payload.workflow_config):
             response = self._run_workflow(
@@ -162,6 +167,9 @@ class AgentService:
                 conversation_id=run.conversation_id, space_id=effective_space_id,
                 task=payload.task, channel=run.trigger_channel,
             ))
+
+        self._run_plugin_phase("BeforeTurn", run.run_id, team_id, user_id, effective_space_id,
+                               run=run, payload=payload, routes=routes)
 
         started = time.perf_counter()
         try:
@@ -469,6 +477,11 @@ class AgentService:
         )
         tools = self._build_tools(payload=payload, run=run)
 
+        self._run_plugin_phase("PromptRender", run.run_id, team_id, user_id, space_id,
+                               run=run, messages=messages)
+        self._run_plugin_phase("BeforeReasoning", run.run_id, team_id, user_id, space_id,
+                               run=run, messages=messages, tools=tools)
+
         step_index += 1
         final_answer, final_status, requires_confirmation = self._tool_loop(
             run=run, messages=messages, tools=tools,
@@ -499,8 +512,11 @@ class AgentService:
             input_payload={"task": payload.task},
             output_payload={"answer": final_answer, "status": final_status},
         )
+        self._run_plugin_phase("AfterReasoning", run.run_id, team_id, user_id, space_id,
+                               run=run, final_answer=final_answer)
         self._finish_run(run=run, status=final_status, final_answer=final_answer,
                          required_confirmations=[], started=started)
+        self._run_plugin_phase("AfterTurn", run.run_id, team_id, user_id, space_id, run=run)
         return self.get_run(run_id=run.run_id, team_id=team_id, user_id=user_id)
 
     def _run_agent_auto_tool_loop_stream(
@@ -562,6 +578,11 @@ class AgentService:
             include_memory=payload.include_memory,
         )
         tools = self._build_tools(payload=payload, run=run)
+
+        self._run_plugin_phase("PromptRender", run.run_id, team_id, user_id, space_id,
+                               run=run, messages=messages)
+        self._run_plugin_phase("BeforeReasoning", run.run_id, team_id, user_id, space_id,
+                               run=run, messages=messages, tools=tools)
 
         seq += 1
         yield from self._tool_loop_stream(
@@ -989,8 +1010,11 @@ class AgentService:
             input_payload={"run_id": run.run_id},
             output_payload={"answer": final_text, "status": "completed"},
         )
+        self._run_plugin_phase("AfterReasoning", run.run_id, run.team_id, run.user_id, run.space_id,
+                               run=run, final_answer=final_text)
         self._finish_run(run=run, status="completed", final_answer=final_text,
                          required_confirmations=[], started=started)
+        self._run_plugin_phase("AfterTurn", run.run_id, run.team_id, run.user_id, run.space_id, run=run)
         seq += 1
         yield AgentStreamEvent(
             event="step.completed", run_id=run.run_id, step_index=50, seq=seq,
@@ -1231,6 +1255,14 @@ class AgentService:
     # ------------------------------------------------------------------
     # Helpers: retrieval, tool execution, build messages, routing
     # ------------------------------------------------------------------
+
+    def _run_plugin_phase(self, phase: str, run_id: str, team_id: str, user_id: str, space_id: str | None, **slots):
+        """Run plugin phase hooks if plugin_manager is available."""
+        if self.plugin_manager is None:
+            return None
+        from app.plugins.base import PhaseFrame
+        frame = PhaseFrame(run_id=run_id, team_id=team_id, user_id=user_id, space_id=space_id, slots=dict(slots))
+        return self.plugin_manager.run_phase(phase, frame)
 
     def _build_memory_prompt_blocks(
         self,
@@ -1938,9 +1970,10 @@ class AgentService:
         return [dict(node) for node in nodes if isinstance(node, dict)]
 
     def _record_agent_history(self, *, payload: AgentRunRequest, response: AgentRunResponse) -> None:
+        effective_channel = (payload.trigger_channel or "agent").strip().lower() or "agent"
         self.chat_history_service.record_message(
             team_id=response.team_id, user_id=response.user_id,
-            conversation_id=response.conversation_id, channel="agent",
+            conversation_id=response.conversation_id, channel=effective_channel,
             request_text=payload.task, response_text=response.answer,
             request_payload=payload.model_dump(),
             response_payload=response.model_dump(mode="json"),
