@@ -1,10 +1,24 @@
 """测试 AgentBridge 核心逻辑（不依赖外部 API）。"""
 
+import asyncio
+import time
+
 import pytest
 
-from qqbot_adapter.core.bridge import AgentBridge
+from qqbot_adapter.core.bridge import AgentBridge, _MIN_SEND_INTERVAL
 from qqbot_adapter.core.bus import MessageBus
-from qqbot_adapter.core.events import InboundMessage, SSEEvent
+from qqbot_adapter.core.events import InboundMessage, OutboundMessage, SSEEvent
+
+
+def _make_inbound(user_id: str = "123", content: str = "test") -> InboundMessage:
+    return InboundMessage(
+        channel_type="napcat",
+        chat_type="private",
+        chat_id=user_id,
+        user_id=user_id,
+        user_name="tester",
+        content=content,
+    )
 
 
 class TestSplitText:
@@ -102,3 +116,263 @@ class TestSSEEventFromSseLine:
         assert event is not None
         assert event.event == "run.failed"
         assert "timeout" in event.payload.get("error", "").lower()
+
+
+class TestSendThrottled:
+    """频控发送测试。"""
+
+    @pytest.mark.asyncio
+    async def test_first_send_no_delay(self) -> None:
+        """首次发送不等待。"""
+        bus = MessageBus()
+        await bus.start()
+        bridge = AgentBridge(
+            bus=bus, caibao_base_url="http://test",
+            bot_user_id="bot", bot_password="pw",
+        )
+        inbound = _make_inbound("user_a", "hello")
+        start = time.monotonic()
+        await bridge._send_throttled(inbound, "消息1")
+        elapsed = time.monotonic() - start
+        assert elapsed < 0.1  # 首次发送几乎不等待
+        await bus.stop()
+
+    @pytest.mark.asyncio
+    async def test_consecutive_sends_throttled(self) -> None:
+        """连续发送同一 chat_id 应受频控（至少 _MIN_SEND_INTERVAL 间隔）。"""
+        bus = MessageBus()
+        await bus.start()
+        received: list[OutboundMessage] = []
+
+        async def capture(msg: OutboundMessage) -> None:
+            received.append(msg)
+
+        bus.subscribe_outbound("napcat", capture)
+
+        bridge = AgentBridge(
+            bus=bus, caibao_base_url="http://test",
+            bot_user_id="bot", bot_password="pw",
+        )
+        inbound = _make_inbound("user_a", "hello")
+
+        start = time.monotonic()
+        await bridge._send_throttled(inbound, "消息1")
+        t1 = time.monotonic()
+        await bridge._send_throttled(inbound, "消息2")
+        t2 = time.monotonic()
+        await bridge._send_throttled(inbound, "消息3")
+        t3 = time.monotonic()
+
+        # 第 2、3 条应分别等待至少 _MIN_SEND_INTERVAL 秒
+        assert t1 - start < 0.1  # 首次不等待
+        assert t2 - t1 >= _MIN_SEND_INTERVAL * 0.7  # 允许 30% 浮动
+        assert t3 - t2 >= _MIN_SEND_INTERVAL * 0.7
+
+        # 等待 Bus 分发完成
+        await asyncio.sleep(0.2)
+        assert len(received) == 3
+        await bus.stop()
+
+    @pytest.mark.asyncio
+    async def test_different_chat_ids_not_throttled(self) -> None:
+        """不同 chat_id 之间不互相频控。"""
+        bus = MessageBus()
+        await bus.start()
+        received: list[OutboundMessage] = []
+
+        async def capture(msg: OutboundMessage) -> None:
+            received.append(msg)
+
+        bus.subscribe_outbound("napcat", capture)
+
+        bridge = AgentBridge(
+            bus=bus, caibao_base_url="http://test",
+            bot_user_id="bot", bot_password="pw",
+        )
+
+        start = time.monotonic()
+        await bridge._send_throttled(_make_inbound("user_a"), "msg_a")
+        await bridge._send_throttled(_make_inbound("user_b"), "msg_b")
+        await bridge._send_throttled(_make_inbound("user_c"), "msg_c")
+        elapsed = time.monotonic() - start
+
+        # 不同 chat_id 之间不应等待
+        assert elapsed < 0.3
+        # 等待 Bus 后台分发完成
+        await asyncio.sleep(0.2)
+        assert len(received) == 3
+        await bus.stop()
+
+
+class TestDedupLogic:
+    """去重逻辑测试（纯静态分析，不依赖 API）。"""
+
+    def test_identical_content_not_resent(self) -> None:
+        """已流式推送的文本不应作为最终答案重复发送。"""
+        streamed = ["这是第一段", "这是第二段。"]
+        final_answer = "这是第一段这是第二段。"
+
+        already_sent = "".join(streamed)
+        should_send = final_answer.strip() not in already_sent
+        assert should_send is False
+
+    def test_different_content_is_sent(self) -> None:
+        """新内容（非流式已推送）应该发送。"""
+        streamed = ["第一部分..."]
+        final_answer = "第一部分内容，以及第二部分新增内容。"
+
+        already_sent = "".join(streamed)
+        should_send = final_answer.strip() not in already_sent
+        assert should_send is True
+
+    def test_last_chunk_duplicate_skipped(self) -> None:
+        """如果剩余文本和最后一条推送相同，跳过。"""
+        streamed = ["这是已经发送过的内容。"]
+        remaining = "这是已经发送过的内容。"
+
+        # 模拟判断：remaining 和 streamed[-1] 相同 → 不发送
+        is_duplicate = remaining == streamed[-1]
+        assert is_duplicate is True
+
+    def test_empty_final_answer_not_sent(self) -> None:
+        """空最终答案不发送。"""
+        final_answer = ""
+        streamed = ["已有内容"]
+        already_sent = "".join(streamed)
+        should_send = bool(final_answer.strip() and final_answer.strip() not in already_sent)
+        assert should_send is False
+
+
+class TestDispatchEventNoDoubleSend:
+    """验证 _dispatch_sse_event 不会对 step.completed/run.completed 重复发送。"""
+
+    @pytest.mark.asyncio
+    async def test_step_completed_not_dispatched_to_bus(self) -> None:
+        """step.completed 事件不应通过 _dispatch_sse_event 发到 Bus。"""
+        bus = MessageBus()
+        await bus.start()
+        sent_messages: list[OutboundMessage] = []
+
+        async def capture(msg: OutboundMessage) -> None:
+            sent_messages.append(msg)
+
+        bus.subscribe_outbound("napcat", capture)
+
+        bridge = AgentBridge(
+            bus=bus, caibao_base_url="http://test",
+            bot_user_id="bot", bot_password="pw",
+        )
+        inbound = _make_inbound("user_a")
+
+        event = SSEEvent(
+            event="step.completed",
+            run_id="r1", seq=50,
+            payload={"answer": "最终答案"},
+        )
+        await bridge._dispatch_sse_event(inbound, event)
+
+        await asyncio.sleep(0.1)
+        await bus.stop()
+
+        assert len(sent_messages) == 0, (
+            f"step.completed 不应触发 Bus 发送，但实际发送了 {len(sent_messages)} 条"
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_completed_not_dispatched_to_bus(self) -> None:
+        """run.completed 事件不应通过 _dispatch_sse_event 发到 Bus。"""
+        bus = MessageBus()
+        await bus.start()
+        sent_messages: list[OutboundMessage] = []
+
+        async def capture(msg: OutboundMessage) -> None:
+            sent_messages.append(msg)
+
+        bus.subscribe_outbound("napcat", capture)
+
+        bridge = AgentBridge(
+            bus=bus, caibao_base_url="http://test",
+            bot_user_id="bot", bot_password="pw",
+        )
+        inbound = _make_inbound("user_a")
+
+        event = SSEEvent(
+            event="run.completed",
+            run_id="r1", seq=100,
+            payload={"answer": "运行完成"},
+        )
+        await bridge._dispatch_sse_event(inbound, event)
+
+        await asyncio.sleep(0.1)
+        await bus.stop()
+
+        assert len(sent_messages) == 0, (
+            f"run.completed 不应触发 Bus 发送，但实际发送了 {len(sent_messages)} 条"
+        )
+
+    @pytest.mark.asyncio
+    async def test_tool_events_still_dispatched(self) -> None:
+        """tool.proposed 等事件仍应正常通过 _dispatch_sse_event 发送。"""
+        bus = MessageBus()
+        await bus.start()
+        sent_messages: list[OutboundMessage] = []
+
+        async def capture(msg: OutboundMessage) -> None:
+            sent_messages.append(msg)
+
+        bus.subscribe_outbound("napcat", capture)
+
+        bridge = AgentBridge(
+            bus=bus, caibao_base_url="http://test",
+            bot_user_id="bot", bot_password="pw",
+        )
+        inbound = _make_inbound("user_a")
+
+        for evt_type, payload in [
+            ("tool.proposed", {"tool_name": "search"}),
+            ("tool.started", {"tool_name": "search"}),
+            ("tool.result", {"tool_name": "search", "result": {"message": "ok"}}),
+            ("confirmation.required", {"tool_name": "create_incident", "arguments": {"title": "test"}}),
+            ("run.failed", {"error": "something wrong"}),
+        ]:
+            event = SSEEvent(event=evt_type, run_id="r1", seq=1, payload=payload)
+            await bridge._dispatch_sse_event(inbound, event)
+
+        await asyncio.sleep(0.2)
+        await bus.stop()
+
+        # 5 个事件类型都应触发发送
+        assert len(sent_messages) == 5, (
+            f"期望 5 条工具事件消息，实际 {len(sent_messages)} 条"
+        )
+
+    @pytest.mark.asyncio
+    async def test_llm_delta_not_dispatched(self) -> None:
+        """llm.delta 事件不应通过 _dispatch_sse_event 发到 Bus。"""
+        bus = MessageBus()
+        await bus.start()
+        sent_messages: list[OutboundMessage] = []
+
+        async def capture(msg: OutboundMessage) -> None:
+            sent_messages.append(msg)
+
+        bus.subscribe_outbound("napcat", capture)
+
+        bridge = AgentBridge(
+            bus=bus, caibao_base_url="http://test",
+            bot_user_id="bot", bot_password="pw",
+        )
+        inbound = _make_inbound("user_a")
+
+        event = SSEEvent(
+            event="llm.delta", run_id="r1", seq=3,
+            payload={"text": "流式增量文本"},
+        )
+        await bridge._dispatch_sse_event(inbound, event)
+
+        await asyncio.sleep(0.1)
+        await bus.stop()
+
+        assert len(sent_messages) == 0, (
+            f"llm.delta 不应触发 Bus 发送，但实际发送了 {len(sent_messages)} 条"
+        )

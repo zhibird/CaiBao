@@ -17,19 +17,21 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any, AsyncIterator
 
 import httpx
 
 from .bus import MessageBus
 from .events import InboundMessage, OutboundMessage, SSEEvent
+from ..utils.formatter import find_flush_point, markdown_to_qq
 
 _logger = logging.getLogger(__name__)
 
-# 流式推送阈值：每累积这么多字符发一条 QQ 消息
-_STREAMING_FLUSH_CHARS = 300
 # 单条 QQ 消息最大长度（留余量给前缀）
 _MAX_MESSAGE_CHARS = 3500
+# 同 chat_id 最小发送间隔（秒），防止 QQ 频控
+_MIN_SEND_INTERVAL = 0.3
 
 # SSE 流式失败时触发同步降级的异常类型
 _STREAMING_FALLBACK_ERRORS = (
@@ -63,6 +65,8 @@ class AgentBridge:
         # httpx 客户端（带 cookie 持久化，用于 CaiBao JWT 认证）
         self._client: httpx.AsyncClient | None = None
         self._authenticated = False
+        # 频控：chat_id → 上次发送时间戳
+        self._last_send_time: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # 主循环
@@ -126,13 +130,23 @@ class AgentBridge:
             ))
 
     async def _handle_message_streaming(self, inbound: InboundMessage) -> None:
-        """SSE 流式路径：创建 queued run → 流式消费 → 分段推送。"""
+        """SSE 流式路径：创建 queued run → 流式消费 → 智能分段推送。
+
+        改进点 (Phase 3)：
+        - 句子边界分段（非固定字符数切割）
+        - 流式开始即发送「正在思考」提示
+        - 已流式推送过的文本不重复发送（去重）
+        - 同 chat_id 频控（最小 0.3s 间隔）
+        """
+        # 0. 发送「正在思考」提示
+        await self._send_throttled(inbound, "⏳ 正在思考...", tool_status="thinking")
+
         # 1. 创建 CaiBao Agent Run
         run_id = await self._create_run(inbound)
 
         # 2. SSE 流式消费，边收边发
         acc_text: list[str] = []
-        char_count = 0
+        streamed_text: list[str] = []  # 记录已推送的文本（用于最终去重）
         final_answer = ""
 
         async for event in self._stream_run(run_id):
@@ -140,37 +154,72 @@ class AgentBridge:
                 delta = str(event.payload.get("text", ""))
                 if delta:
                     acc_text.append(delta)
-                    char_count += len(delta)
-                    if char_count >= _STREAMING_FLUSH_CHARS:
-                        chunk = "".join(acc_text)
-                        await self.bus.publish_outbound(OutboundMessage(
-                            channel_type=inbound.channel_type,
-                            chat_id=inbound.chat_id,
-                            content=chunk,
-                            tool_status="thinking",
-                        ))
-                        acc_text.clear()
-                        char_count = 0
+                    # 检查是否到了 flush 时机
+                    flush_point = find_flush_point("".join(acc_text))
+                    if flush_point is not None:
+                        full = "".join(acc_text)
+                        chunk = full[:flush_point].strip()
+                        rest = full[flush_point:].lstrip()
+                        if chunk:
+                            formatted = markdown_to_qq(chunk)
+                            await self._send_throttled(inbound, formatted, tool_status="thinking")
+                            streamed_text.append(formatted)
+                        # 保留剩余部分继续累积
+                        acc_text = [rest] if rest else []
             else:
                 await self._dispatch_sse_event(inbound, event)
-                if event.event == "step.completed":
-                    final_answer = str(event.payload.get("answer", ""))
+                # 捕获最终答案（step.completed / run.completed 含 answer）
+                if event.event in ("step.completed", "run.completed"):
+                    answer = str(event.payload.get("answer", ""))
+                    if answer:
+                        final_answer = answer
 
         # 3. 推送剩余文本
         if acc_text:
-            remaining = "".join(acc_text)
+            remaining = "".join(acc_text).strip()
+            if remaining:
+                formatted = markdown_to_qq(remaining)
+                # 去重：如果和已推送的最后一条相同则跳过
+                if not streamed_text or formatted != streamed_text[-1]:
+                    await self._send_throttled(inbound, formatted, tool_status="done")
+                    streamed_text.append(formatted)
             if not final_answer:
                 final_answer = remaining
-            await self.bus.publish_outbound(OutboundMessage(
-                channel_type=inbound.channel_type,
-                chat_id=inbound.chat_id,
-                content=remaining,
-                tool_status="done",
-            ))
 
-        # 4. 最终答案
-        if final_answer and final_answer != "".join(acc_text):
-            await self._send_long_message(inbound, final_answer, is_final=True)
+        # 4. 最终答案去重推送
+        if final_answer:
+            formatted_final = markdown_to_qq(final_answer)
+            # 只有和已流式推送的内容不同时才发送
+            already_sent = "".join(streamed_text)
+            if formatted_final.strip() and formatted_final.strip() not in already_sent:
+                await self._send_long_message(inbound, formatted_final, is_final=True)
+
+    # ------------------------------------------------------------------
+    # 频控发送
+    # ------------------------------------------------------------------
+
+    async def _send_throttled(
+        self,
+        inbound: InboundMessage,
+        content: str,
+        *,
+        tool_status: str | None = None,
+    ) -> None:
+        """带频控的发消息：同 chat_id 至少间隔 _MIN_SEND_INTERVAL 秒。"""
+        chat_id = inbound.chat_id
+        now = time.monotonic()
+        last = self._last_send_time.get(chat_id, 0)
+        wait = _MIN_SEND_INTERVAL - (now - last)
+        if wait > 0:
+            await asyncio.sleep(wait)
+
+        await self.bus.publish_outbound(OutboundMessage(
+            channel_type=inbound.channel_type,
+            chat_id=chat_id,
+            content=content,
+            tool_status=tool_status,
+        ))
+        self._last_send_time[chat_id] = time.monotonic()
 
     async def _handle_message_sync(self, inbound: InboundMessage) -> None:
         """同步降级路径：POST /api/v1/agent/run → 一次性返回完整答案。"""
@@ -331,31 +380,29 @@ class AgentBridge:
     async def _dispatch_sse_event(self, inbound: InboundMessage, event: SSEEvent) -> None:
         """根据 SSE 事件类型生成对应的 QQ 出站消息。
 
-        注意：llm.delta 事件由 _handle_message 统一累积推送，此处不处理。
+        注意：
+        - llm.delta 事件由 _handle_message_streaming 累积推送
+        - step.completed / run.completed 的最终答案也由 _handle_message_streaming
+          统一发送（去重），此处仅记录不发送
+        - 所有消息通过 _send_throttled 走频控
         """
         event_type = event.event
 
-        if event_type == "llm.delta":
-            # 已由 _handle_message 累积推送
+        if event_type in ("llm.delta", "step.completed", "run.completed"):
+            # 由 _handle_message_streaming 统一处理
             return
 
         if event_type == "tool.proposed":
             tool_name = event.payload.get("tool_name", "unknown")
-            await self.bus.publish_outbound(OutboundMessage(
-                channel_type=inbound.channel_type,
-                chat_id=inbound.chat_id,
-                content=f"🤔 LLM 提议调用工具: `{tool_name}`",
-                tool_status="thinking",
-            ))
+            await self._send_throttled(
+                inbound, f"🤔 LLM 提议调用工具: `{tool_name}`", tool_status="thinking",
+            )
 
         elif event_type == "tool.started":
             tool_name = event.payload.get("tool_name", "unknown")
-            await self.bus.publish_outbound(OutboundMessage(
-                channel_type=inbound.channel_type,
-                chat_id=inbound.chat_id,
-                content=f"🔧 正在执行: `{tool_name}` ...",
-                tool_status="tool_call",
-            ))
+            await self._send_throttled(
+                inbound, f"🔧 正在执行: `{tool_name}` ...", tool_status="tool_call",
+            )
 
         elif event_type == "tool.result":
             tool_name = event.payload.get("tool_name", "unknown")
@@ -367,48 +414,34 @@ class AgentBridge:
             else:
                 msg_text = str(result)[:200]
 
-            await self.bus.publish_outbound(OutboundMessage(
-                channel_type=inbound.channel_type,
-                chat_id=inbound.chat_id,
-                content=f"✅ `{tool_name}` 完成: {msg_text}" if msg_text else f"✅ `{tool_name}` 完成",
+            await self._send_throttled(
+                inbound,
+                f"✅ `{tool_name}` 完成: {msg_text}" if msg_text else f"✅ `{tool_name}` 完成",
                 tool_status="done",
-            ))
+            )
 
         elif event_type == "confirmation.required":
             tool_name = event.payload.get("tool_name", "unknown")
             args = event.payload.get("arguments", {})
             args_text = json.dumps(args, ensure_ascii=False)[:200]
 
-            await self.bus.publish_outbound(OutboundMessage(
-                channel_type=inbound.channel_type,
-                chat_id=inbound.chat_id,
-                content=(
-                    f"⚠️ **需要确认危险操作**\n"
-                    f"工具: `{tool_name}`\n"
-                    f"参数: {args_text}\n\n"
-                    f"回复「确认」执行，回复「取消」跳过。"
+            await self._send_throttled(
+                inbound,
+                (
+                    f"⚠️ 危险操作需要确认\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"工具: {tool_name}\n"
+                    f"参数: {args_text}\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"回复「确认」执行，回复「取消」跳过"
                 ),
-            ))
+            )
 
         elif event_type == "run.failed":
             error = event.payload.get("error", "未知错误")
-            await self.bus.publish_outbound(OutboundMessage(
-                channel_type=inbound.channel_type,
-                chat_id=inbound.chat_id,
-                content=f"❌ Agent 执行失败: {error}",
-            ))
-
-        elif event_type == "run.completed":
-            # 如果 step.completed 没有提供答案，从 run.completed 中提取
-            answer = event.payload.get("answer", "")
-            if answer:
-                await self._send_long_message(inbound, answer, is_final=True)
-
-        elif event_type == "step.completed":
-            # 步骤完成，可能包含最终答案
-            answer = event.payload.get("answer", "")
-            if answer:
-                await self._send_long_message(inbound, answer, is_final=True)
+            await self._send_throttled(
+                inbound, f"❌ Agent 执行失败: {error}",
+            )
 
     # ------------------------------------------------------------------
     # 消息发送辅助

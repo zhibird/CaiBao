@@ -29,6 +29,59 @@ _MD_RULES: list[tuple[str, str]] = [
     (r"^---+$", r"────────────"),
 ]
 
+# 句子结束符（用于智能分段）
+_SENTENCE_END_PATTERN = re.compile(r"[。！？!?\n](?=\s*)")
+# 段落结束（双换行，优先级最高）
+_PARAGRAPH_END_PATTERN = re.compile(r"\n\s*\n")
+
+# 智能分段参数
+_MIN_FLUSH_CHARS = 120   # 低于此字符数不急于 flush
+_SOFT_FLUSH_CHARS = 400  # 超过此字符数在句子边界 flush
+_HARD_FLUSH_CHARS = 700  # 超过此字符数强制 flush（在最后空格处）
+
+
+def find_flush_point(text: str, *, hard_max: int = _HARD_FLUSH_CHARS) -> int | None:
+    """在文本中找到最佳 flush 断点。
+
+    优先级（从高到低）：
+    1. 段落结束（\\n\\n）且超过 _MIN_FLUSH_CHARS
+    2. 句子结束（。！？!?\\n）且超过 _SOFT_FLUSH_CHARS
+    3. 超过 _HARD_FLUSH_CHARS 时在最后一个空格处强制截断
+    4. 不超过 _HARD_FLUSH_CHARS 时返回 None（暂不 flush）
+
+    返回 None 表示当前不应 flush，应继续累积。
+    """
+    if len(text) < _MIN_FLUSH_CHARS:
+        return None
+
+    # 1. 优先在段落结束处分段
+    para_matches = list(_PARAGRAPH_END_PATTERN.finditer(text))
+    if para_matches:
+        for m in reversed(para_matches):
+            end = m.end()
+            if _MIN_FLUSH_CHARS <= end <= hard_max:
+                return end
+
+    # 2. 在句子结束处分段（超过软阈值时）
+    if len(text) >= _SOFT_FLUSH_CHARS:
+        sent_matches = list(_SENTENCE_END_PATTERN.finditer(text))
+        if sent_matches:
+            for m in reversed(sent_matches):
+                end = m.end()
+                if end <= hard_max:
+                    return end
+
+    # 3. 超过硬阈值，强制在空格处截断
+    if len(text) >= hard_max:
+        space_at = text.rfind(" ", 0, hard_max)
+        if space_at > _MIN_FLUSH_CHARS:
+            return space_at
+        # 找不到空格，在硬阈值处直接截断
+        return hard_max
+
+    # 4. 还不够长，继续累积
+    return None
+
 
 def markdown_to_qq(text: str) -> str:
     """将 Agent 输出的 Markdown 文本转为 QQ 可读格式。
