@@ -31,6 +31,11 @@ import sys
 import tomllib
 from pathlib import Path
 
+# 确保 qqbot_adapter 作为包可被导入（python main.py 直接运行时需要）
+_sys_path_root = Path(__file__).resolve().parents[1]
+if str(_sys_path_root) not in sys.path:
+    sys.path.insert(0, str(_sys_path_root))
+
 from core.bus import MessageBus
 from core.bridge import AgentBridge
 from channels.napcat_channel import NapCatChannel

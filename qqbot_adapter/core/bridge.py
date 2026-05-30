@@ -25,7 +25,7 @@ import httpx
 
 from .bus import MessageBus
 from .events import InboundMessage, OutboundMessage, SSEEvent
-from ..utils.formatter import find_flush_point, markdown_to_qq
+from utils.formatter import find_flush_point, markdown_to_qq
 
 _logger = logging.getLogger(__name__)
 
