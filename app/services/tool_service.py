@@ -45,10 +45,12 @@ class ToolService:
         db: Session,
         catalog: ToolCatalogService,
         safety: ToolSafetyService,
+        plugin_manager=None,
     ) -> None:
         self.db = db
         self.catalog = catalog
         self.safety = safety
+        self.plugin_manager = plugin_manager
         self._generic_handlers: dict[str, object] = {}
 
     def register_generic_handler(self, name: str, handler: object) -> None:
@@ -107,6 +109,12 @@ class ToolService:
                 "would_require_confirmation": preflight.requires_confirmation,
                 "would_be_dangerous": preflight.dangerous,
             }
+
+        # Plugin tool pre-hooks: allow plugins to modify/deny arguments
+        if self.plugin_manager is not None:
+            effective_args = self.plugin_manager.check_tool_pre(
+                action_name, effective_args, definition,
+            )
 
         # Dispatch
         if definition.source == "mcp":
