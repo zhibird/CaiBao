@@ -1,0 +1,56 @@
+# CaiBao QQ Bot 适配器配置
+# ============================
+# 复制此文件为 config.toml 并填入实际值
+
+# ------------------------------------------------------------------
+# CaiBao 后端连接
+# ------------------------------------------------------------------
+[caibao]
+base_url = "http://127.0.0.1:8000"
+bot_user_id = "qqbot"
+bot_password = "change-me-before-use"
+http_timeout = 120.0
+
+
+# ------------------------------------------------------------------
+# NapCat / OneBot v11 WebSocket 通道
+# ------------------------------------------------------------------
+[channels.napcat]
+enabled = false
+ws_url = "ws://127.0.0.1:3001"
+access_token = ""
+allow_from = []
+allow_all = false
+reconnect = true
+
+# 群聊（可选）
+# [[channels.napcat.groups]]
+# group_id = "123456789"
+# allow_from = ["10001"]
+# require_at = true
+
+
+# ------------------------------------------------------------------
+# QQ 官方 Bot 通道
+# ------------------------------------------------------------------
+[channels.qqbot]
+enabled = false
+app_id = ""
+client_secret = ""
+allow_from = []
+allow_all = false
+reconnect = true
+
+# 群聊（可选）
+# [[channels.qqbot.groups]]
+# group_openid = "GROUP_OPENID"
+# allow_from = ["MEMBER_OPENID"]
+
+
+# ------------------------------------------------------------------
+# 消息行为
+# ------------------------------------------------------------------
+[message]
+streaming_flush_chars = 300
+max_message_chars = 3500
+show_sources = true

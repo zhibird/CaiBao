@@ -14,3 +14,4 @@ data/agent_files/
 data/agent_shell/
 tmp/
 *.db.bak_*
+qqbot_adapter/config.toml
