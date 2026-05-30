@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import time
+from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
 import httpx
@@ -43,6 +44,40 @@ _STREAMING_FALLBACK_ERRORS = (
     OSError,
 )
 
+# 确认关键词（用户回复这些词触发确认）
+_CONFIRM_KEYWORDS = ("确认", "是", "yes", "ok", "执行")
+_CANCEL_KEYWORDS = ("取消", "否", "no", "跳过", "不执行")
+
+# 需精确匹配的关键词（短英文词容易误匹配，如 "ok" in "smoke"）
+_EXACT_MATCH_KEYWORDS = frozenset({"ok", "no", "yes"})
+
+
+def _match_keyword(content: str, keywords: tuple[str, ...]) -> bool:
+    """检查 content 是否匹配任一关键词。
+
+    英文短词（ok/no/yes）需精确匹配防止误触发；
+    中文词（确认/取消等）支持子串匹配（如「好的，确认」）。
+    """
+    stripped = content.strip().lower()
+    for kw in keywords:
+        if kw in _EXACT_MATCH_KEYWORDS:
+            if stripped == kw:
+                return True
+        else:
+            if kw in stripped:
+                return True
+    return False
+
+
+@dataclass
+class PendingConfirmation:
+    """等待用户确认的危险操作。"""
+
+    run_id: str
+    tool_name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+    created_at: float = field(default_factory=time.monotonic)
+
 
 class AgentBridge:
     """QQ → CaiBao 桥接器。"""
@@ -67,6 +102,8 @@ class AgentBridge:
         self._authenticated = False
         # 频控：chat_id → 上次发送时间戳
         self._last_send_time: dict[str, float] = {}
+        # 待确认的危险操作：chat_id → PendingConfirmation
+        self._pending_confirmations: dict[str, PendingConfirmation] = {}
 
     # ------------------------------------------------------------------
     # 主循环
@@ -82,13 +119,17 @@ class AgentBridge:
             asyncio.create_task(self._handle_message(inbound))
 
     async def _handle_message(self, inbound: InboundMessage) -> None:
-        """处理一条入站消息：优先 SSE 流式 → 失败则同步 fallback。
+        """处理一条入站消息：确认拦截 → SSE 流式 → 同步 fallback。
 
         策略：
+        0. 如果用户有待确认操作，先检查消息是否为「确认」/「取消」
         1. 创建 queued run → SSE 流式消费（实时推送）
         2. 若 SSE 连接失败 / 超时 / 协议不兼容 → 降级为同步调用
-        3. 同步调用一次性返回完整答案
         """
+        # 0. 检查是否是对待确认操作的回复
+        if await self._try_handle_confirmation(inbound):
+            return
+
         try:
             await self._handle_message_streaming(inbound)
         except _STREAMING_FALLBACK_ERRORS as exc:
@@ -168,11 +209,19 @@ class AgentBridge:
                         acc_text = [rest] if rest else []
             else:
                 await self._dispatch_sse_event(inbound, event)
-                # 捕获最终答案（step.completed / run.completed 含 answer）
+                # 捕获最终答案
                 if event.event in ("step.completed", "run.completed"):
                     answer = str(event.payload.get("answer", ""))
                     if answer:
                         final_answer = answer
+                # 保存待确认状态
+                if event.event == "confirmation.required":
+                    self._save_pending_confirmation(
+                        inbound=inbound,
+                        run_id=run_id,
+                        tool_name=str(event.payload.get("tool_name", "unknown")),
+                        arguments=event.payload.get("arguments", {}),
+                    )
 
         # 3. 推送剩余文本
         if acc_text:
@@ -193,6 +242,94 @@ class AgentBridge:
             already_sent = "".join(streamed_text)
             if formatted_final.strip() and formatted_final.strip() not in already_sent:
                 await self._send_long_message(inbound, formatted_final, is_final=True)
+
+    # ------------------------------------------------------------------
+    # 危险操作确认交互
+    # ------------------------------------------------------------------
+
+    async def _try_handle_confirmation(self, inbound: InboundMessage) -> bool:
+        """检查入站消息是否为确认/取消回复。是则处理并返回 True。"""
+        pending = self._pending_confirmations.get(inbound.chat_id)
+        if pending is None:
+            return False
+
+        if _match_keyword(inbound.content, _CONFIRM_KEYWORDS):
+            await self._handle_confirm(inbound, pending)
+            return True
+        if _match_keyword(inbound.content, _CANCEL_KEYWORDS):
+            await self._handle_cancel(inbound, pending)
+            return True
+
+        # 用户发了其他消息，视为取消等待
+        self._pending_confirmations.pop(inbound.chat_id, None)
+        _logger.info(
+            "Confirmation dismissed for chat=%s (new message received)",
+            inbound.chat_id,
+        )
+        return False
+
+    async def _handle_confirm(
+        self, inbound: InboundMessage, pending: PendingConfirmation,
+    ) -> None:
+        """用户确认：调用 CaiBao confirm API 执行危险操作。"""
+        await self._send_throttled(inbound, "⏳ 正在执行确认的操作...", tool_status="tool_call")
+
+        try:
+            result = await self.confirm_run(pending.run_id)
+            answer = str(result.get("answer", "") or "")
+            status = str(result.get("status", ""))
+
+            if answer:
+                formatted = markdown_to_qq(answer)
+                await self._send_long_message(inbound, formatted, is_final=True)
+            elif status == "failed":
+                await self._send_throttled(
+                    inbound, "❌ 确认执行失败，请检查任务内容。",
+                )
+            else:
+                await self._send_throttled(
+                    inbound, "✅ 已确认执行。",
+                )
+        except Exception:
+            _logger.exception("Confirm API failed for run=%s", pending.run_id)
+            await self._send_throttled(
+                inbound, "⚠️ 确认请求失败，请稍后重试。",
+            )
+        finally:
+            self._pending_confirmations.pop(inbound.chat_id, None)
+
+    async def _handle_cancel(
+        self, inbound: InboundMessage, pending: PendingConfirmation,
+    ) -> None:
+        """用户取消：清除待确认状态。"""
+        await self._send_throttled(
+            inbound,
+            f"✅ 已取消操作「{pending.tool_name}」，Agent 不会执行此步骤。",
+        )
+        self._pending_confirmations.pop(inbound.chat_id, None)
+        _logger.info(
+            "Confirmation cancelled: run=%s tool=%s chat=%s",
+            pending.run_id, pending.tool_name, inbound.chat_id,
+        )
+
+    def _save_pending_confirmation(
+        self,
+        *,
+        inbound: InboundMessage,
+        run_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> None:
+        """保存待确认状态，等待用户回复。"""
+        self._pending_confirmations[inbound.chat_id] = PendingConfirmation(
+            run_id=run_id,
+            tool_name=tool_name,
+            arguments=dict(arguments),
+        )
+        _logger.info(
+            "Pending confirmation saved: chat=%s run=%s tool=%s",
+            inbound.chat_id, run_id, tool_name,
+        )
 
     # ------------------------------------------------------------------
     # 频控发送
@@ -250,23 +387,36 @@ class AgentBridge:
                 tool_status="done",
             ))
 
-        # 推送确认提示
+        # 推送确认提示 + 保存待确认状态（支持交互式回复）
         confirmations = result.get("required_confirmations") or []
         if confirmations:
-            for conf in confirmations:
-                tool_name = conf.get("tool_name", "unknown")
-                args = conf.get("arguments", {})
-                args_text = json.dumps(args, ensure_ascii=False)[:200]
-                await self.bus.publish_outbound(OutboundMessage(
-                    channel_type=inbound.channel_type,
-                    chat_id=inbound.chat_id,
-                    content=(
-                        f"⚠️ 需要确认危险操作\n"
-                        f"工具: {tool_name}\n"
-                        f"参数: {args_text}\n\n"
-                        f"回复「确认」执行，回复「取消」跳过。"
-                    ),
-                ))
+            # 取第一个待确认操作
+            first = confirmations[0] if isinstance(confirmations[0], dict) else {}
+            tool_name = first.get("tool_name", "unknown")
+            args = first.get("arguments", {})
+            args_text = json.dumps(args, ensure_ascii=False)[:200]
+
+            await self.bus.publish_outbound(OutboundMessage(
+                channel_type=inbound.channel_type,
+                chat_id=inbound.chat_id,
+                content=(
+                    f"⚠️ 需要确认危险操作\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"工具: {tool_name}\n"
+                    f"参数: {args_text}\n"
+                    f"━━━━━━━━━━━━━━\n"
+                    f"回复「确认」执行，回复「取消」跳过"
+                ),
+            ))
+            # 保存待确认状态，支持用户交互式回复
+            run_id = str(result.get("run_id", ""))
+            if run_id:
+                self._save_pending_confirmation(
+                    inbound=inbound,
+                    run_id=run_id,
+                    tool_name=tool_name,
+                    arguments=dict(args),
+                )
 
         # 推送最终答案
         if answer:
