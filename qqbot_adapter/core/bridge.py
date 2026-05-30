@@ -757,7 +757,7 @@ class AgentBridge:
             resp = await self._client.post(
                 login_url,
                 json={
-                    "account_id": self.bot_user_id,
+                    "user_id": self.bot_user_id,
                     "password": self.bot_password,
                 },
             )
