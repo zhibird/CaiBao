@@ -45,14 +45,21 @@ reconnect = true
 
 # ------------------------------------------------------------------
 # QQ 官方 Bot 通道（可选，与 NapCat 并存）
+# 通过 WebSocket 接收消息 + HTTP API 发送
 # 填 app_id 启用，留空跳过
 # ------------------------------------------------------------------
 [channels.qqbot]
 enabled = false
 app_id = ""
 client_secret = ""
-# 允许的用户 OpenID 列表
+# 允许的用户 OpenID 列表（私聊）
 allow_from = []
+# WebSocket 自动重连
+reconnect = true
+# 群聊配置（可选，每个群一条）
+# [[channels.qqbot.groups]]
+# group_openid = "GROUP_OPENID"
+# allow_from = ["MEMBER_OPENID"]
 
 
 # ------------------------------------------------------------------

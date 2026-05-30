@@ -34,6 +34,7 @@ from pathlib import Path
 from core.bus import MessageBus
 from core.bridge import AgentBridge
 from channels.napcat_channel import NapCatChannel
+from channels.qqbot_channel import QQBotChannel
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -94,13 +95,20 @@ async def main(config_path: str) -> None:
             channels.append(napcat)
             _logger.info("NapCat channel started")
 
-        # 3. QQBot 官方通道（Phase 1 仅占位）
+        # 3. QQBot 官方通道
         qqbot_cfg = config.get("channels", {}).get("qqbot", {})
         if qqbot_cfg.get("enabled", False):
-            _logger.warning(
-                "QQBot official channel not yet implemented in Phase 1. "
-                "Use NapCat channel instead."
+            qqbot = QQBotChannel(
+                bus=bus,
+                app_id=qqbot_cfg.get("app_id", ""),
+                client_secret=qqbot_cfg.get("client_secret", ""),
+                allow_from=qqbot_cfg.get("allow_from", []),
+                groups=qqbot_cfg.get("groups", []),
+                reconnect=qqbot_cfg.get("reconnect", True),
             )
+            await qqbot.start()
+            channels.append(qqbot)
+            _logger.info("QQBot channel started")
 
         if not channels:
             _logger.error(
