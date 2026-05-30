@@ -88,6 +88,7 @@ async def main(config_path: str) -> None:
                 ws_url=napcat_cfg.get("ws_url", "ws://127.0.0.1:3001"),
                 access_token=napcat_cfg.get("access_token") or None,
                 allow_from=napcat_cfg.get("allow_from", []),
+                allow_all=napcat_cfg.get("allow_all", False),
                 groups=napcat_cfg.get("groups", []),
                 reconnect=napcat_cfg.get("reconnect", True),
             )
@@ -103,6 +104,7 @@ async def main(config_path: str) -> None:
                 app_id=qqbot_cfg.get("app_id", ""),
                 client_secret=qqbot_cfg.get("client_secret", ""),
                 allow_from=qqbot_cfg.get("allow_from", []),
+                allow_all=qqbot_cfg.get("allow_all", False),
                 groups=qqbot_cfg.get("groups", []),
                 reconnect=qqbot_cfg.get("reconnect", True),
             )

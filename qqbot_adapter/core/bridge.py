@@ -76,6 +76,7 @@ class PendingConfirmation:
     run_id: str
     tool_name: str
     arguments: dict[str, Any] = field(default_factory=dict)
+    requester_user_id: str = ""  # 发起人，确认/取消必须同一用户或群管理员
     created_at: float = field(default_factory=time.monotonic)
 
 
@@ -104,6 +105,13 @@ class AgentBridge:
         self._last_send_time: dict[str, float] = {}
         # 待确认的危险操作：chat_id → PendingConfirmation
         self._pending_confirmations: dict[str, PendingConfirmation] = {}
+        # QQ 标识 → CaiBao 真实 conversation UUID
+        # TODO(P2): Persist conversation mapping.
+        #   Suggest implementing via CaiBao backend resolve API at POST /api/v1/conversations/resolve.
+        #   Currently in-memory only; restart loses mapping and creates new conversations.
+        self._conversation_cache: dict[str, str] = {}
+        # 会话创建锁（防止并发创建重复会话）
+        self._conversation_locks: dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------
     # 主循环
@@ -248,10 +256,22 @@ class AgentBridge:
     # ------------------------------------------------------------------
 
     async def _try_handle_confirmation(self, inbound: InboundMessage) -> bool:
-        """检查入站消息是否为确认/取消回复。是则处理并返回 True。"""
+        """检查入站消息是否为确认/取消回复。是则处理并返回 True。
+
+        安全约束：群聊中只有发起人（或私聊中本人）可以确认/取消。
+        其他成员发消息不接管待确认状态。
+        """
         pending = self._pending_confirmations.get(inbound.chat_id)
         if pending is None:
             return False
+
+        # 安全：群聊中只有发起人可以确认/取消
+        if pending.requester_user_id and inbound.user_id != pending.requester_user_id:
+            _logger.info(
+                "Confirmation ignored: chat=%s requester=%s sender=%s",
+                inbound.chat_id, pending.requester_user_id, inbound.user_id,
+            )
+            return False  # 其他用户的消息走正常流程
 
         if _match_keyword(inbound.content, _CONFIRM_KEYWORDS):
             await self._handle_confirm(inbound, pending)
@@ -260,7 +280,7 @@ class AgentBridge:
             await self._handle_cancel(inbound, pending)
             return True
 
-        # 用户发了其他消息，视为取消等待
+        # 发起人发了其他消息，视为取消等待
         self._pending_confirmations.pop(inbound.chat_id, None)
         _logger.info(
             "Confirmation dismissed for chat=%s (new message received)",
@@ -320,15 +340,16 @@ class AgentBridge:
         tool_name: str,
         arguments: dict[str, Any],
     ) -> None:
-        """保存待确认状态，等待用户回复。"""
+        """保存待确认状态，记录发起人防止其他用户接管。"""
         self._pending_confirmations[inbound.chat_id] = PendingConfirmation(
             run_id=run_id,
             tool_name=tool_name,
             arguments=dict(arguments),
+            requester_user_id=inbound.user_id,
         )
         _logger.info(
-            "Pending confirmation saved: chat=%s run=%s tool=%s",
-            inbound.chat_id, run_id, tool_name,
+            "Pending confirmation saved: chat=%s run=%s tool=%s requester=%s",
+            inbound.chat_id, run_id, tool_name, inbound.user_id,
         )
 
     # ------------------------------------------------------------------
@@ -432,10 +453,66 @@ class AgentBridge:
     # CaiBao API 调用
     # ------------------------------------------------------------------
 
+    async def _ensure_conversation(self, msg: InboundMessage) -> str:
+        """获取或创建 CaiBao conversation 的真实 UUID。
+
+        首次发消息时 POST /api/v1/conversations，后续复用缓存。
+        使用 per-key 锁防止并发消息创建重复会话。
+        """
+        cache_key = self._make_conversation_id(msg)
+        cached = self._conversation_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        # 获取或创建锁，防止并发创建同一会话
+        lock = self._conversation_locks.setdefault(cache_key, asyncio.Lock())
+        async with lock:
+            # 双重检查：锁内可能有其他协程已经创建了
+            cached = self._conversation_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+            assert self._client is not None
+            try:
+                resp = await self._api_post_with_retry(
+                    f"{self.caibao_url}/api/v1/conversations",
+                    {"title": f"QQ {msg.chat_type} {msg.user_name or msg.user_id}"},
+                )
+                resp.raise_for_status()
+                real_id = resp.json()["conversation_id"]
+            except Exception:
+                _logger.warning(
+                    "Failed to create conversation for %s, running without context",
+                    cache_key,
+                )
+                return ""
+
+            self._conversation_cache[cache_key] = real_id
+            _logger.info("Conversation created: %s → %s", cache_key, real_id)
+            return real_id
+
+    async def _auth_refresh(self) -> None:
+        """401 时尝试刷新 JWT token。"""
+        assert self._client is not None
+        try:
+            resp = await self._client.post(
+                f"{self.caibao_url}/api/v1/auth/refresh",
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            self._authenticated = True
+            _logger.info("JWT token refreshed")
+        except Exception:
+            _logger.warning("Token refresh failed, re-logging in")
+            self._authenticated = False
+            await self._ensure_authenticated()
+
     def _build_run_payload(self, msg: InboundMessage) -> dict[str, Any]:
-        """构建 CaiBao AgentRunRequest payload（流式和同步共用）。"""
+        """构建 CaiBao AgentRunRequest payload（流式和同步共用）。
+
+        注意：conversation_id 在调用前由 _ensure_conversation 填入真实 UUID。
+        """
         return {
-            "conversation_id": self._make_conversation_id(msg),
             "task": msg.content,
             "trigger_channel": "qqbot",
             "include_memory": True,
@@ -448,11 +525,14 @@ class AgentBridge:
         """POST /api/v1/agent/runs 创建队列运行，返回 run_id。"""
         assert self._client is not None
 
+        conv_id = await self._ensure_conversation(msg)
         payload = self._build_run_payload(msg)
-        resp = await self._client.post(
+        if conv_id:
+            payload["conversation_id"] = conv_id
+
+        resp = await self._api_post_with_retry(
             f"{self.caibao_url}/api/v1/agent/runs",
-            json=payload,
-            timeout=self.http_timeout,
+            payload,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -461,18 +541,17 @@ class AgentBridge:
         return run_id
 
     async def _run_sync(self, msg: InboundMessage) -> dict[str, Any]:
-        """POST /api/v1/agent/run 同步调用，阻塞等待完整结果。
-
-        当 SSE 流式路径不可用时（网络异常、CaiBao 不兼容等）作为降级方案。
-        返回 AgentRunResponse dict，含 answer / status / tool_calls 等字段。
-        """
+        """POST /api/v1/agent/run 同步调用，阻塞等待完整结果。"""
         assert self._client is not None
 
+        conv_id = await self._ensure_conversation(msg)
         payload = self._build_run_payload(msg)
-        resp = await self._client.post(
+        if conv_id:
+            payload["conversation_id"] = conv_id
+
+        resp = await self._api_post_with_retry(
             f"{self.caibao_url}/api/v1/agent/run",
-            json=payload,
-            timeout=self.http_timeout,
+            payload,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -481,6 +560,17 @@ class AgentBridge:
             msg.user_id, data.get("status"), len(data.get("answer", "") or ""),
         )
         return data
+
+    async def _api_post_with_retry(
+        self, url: str, payload: dict[str, Any],
+    ) -> httpx.Response:
+        """POST 请求，401 时自动刷新 token 重试一次。"""
+        assert self._client is not None
+        resp = await self._client.post(url, json=payload, timeout=self.http_timeout)
+        if resp.status_code == 401:
+            await self._auth_refresh()
+            resp = await self._client.post(url, json=payload, timeout=self.http_timeout)
+        return resp
 
     async def _stream_run(self, run_id: str) -> AsyncIterator[SSEEvent]:
         """GET /api/v1/agent/runs/{run_id}/stream 返回 SSE 事件迭代器。"""
@@ -515,10 +605,9 @@ class AgentBridge:
         """POST /api/v1/agent/runs/{run_id}/confirm 确认危险操作。"""
         assert self._client is not None
 
-        resp = await self._client.post(
+        resp = await self._api_post_with_retry(
             f"{self.caibao_url}/api/v1/agent/runs/{run_id}/confirm",
-            json={},
-            timeout=self.http_timeout,
+            {},
         )
         resp.raise_for_status()
         return resp.json()

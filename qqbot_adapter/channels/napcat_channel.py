@@ -61,6 +61,7 @@ class NapCatChannel(BaseChannel):
         ws_url: str = "ws://127.0.0.1:3001",
         access_token: str | None = None,
         allow_from: list[str] | None = None,
+        allow_all: bool = False,
         groups: list[dict[str, Any]] | None = None,
         reconnect: bool = True,
     ) -> None:
@@ -68,6 +69,7 @@ class NapCatChannel(BaseChannel):
         self.ws_url = ws_url
         self.access_token = access_token
         self.allow_from: set[str] = set(allow_from or [])
+        self.allow_all = allow_all
         self.groups: dict[str, dict[str, Any]] = {}
         if groups:
             for g in groups:
@@ -207,10 +209,11 @@ class NapCatChannel(BaseChannel):
         user_id = str(data.get("user_id", ""))
         user_name = sender.get("nickname", "") or user_id
 
-        # 白名单检查
-        if self.allow_from and user_id not in self.allow_from:
-            _logger.debug("Private message from %s blocked (not in allow_from)", user_id)
-            return
+        # 白名单检查：allow_all=true 时放行，否则必须有白名单
+        if not self.allow_all:
+            if not self.allow_from or user_id not in self.allow_from:
+                _logger.debug("Private message from %s blocked (not in allow_from)", user_id)
+                return
 
         raw_message = str(data.get("message", ""))
         content = self._extract_text(raw_message)

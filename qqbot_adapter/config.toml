@@ -19,16 +19,19 @@ http_timeout = 120.0
 
 # ------------------------------------------------------------------
 # NapCat / OneBot v11 WebSocket 通道
-# 填 bot_uin 启用，留空跳过
+# 填 enable=true 启用，留空跳过
+# 安全：必须显式设置 allow_all=true 或填写 allow_from 白名单
 # ------------------------------------------------------------------
 [channels.napcat]
-enabled = true
+enabled = false
 # WebSocket 地址（NapCat 默认 ws://127.0.0.1:3001）
 ws_url = "ws://127.0.0.1:3001"
 # NapCat access_token（如果配置了的话）
 access_token = ""
-# 私聊白名单（QQ 号列表）
+# 私聊白名单（QQ 号列表），allow_all=true 时忽略
 allow_from = []
+# 显式允许所有私聊（安全风险！仅开发环境使用）
+allow_all = false
 # WebSocket 自动重连
 reconnect = true
 
@@ -52,8 +55,10 @@ reconnect = true
 enabled = false
 app_id = ""
 client_secret = ""
-# 允许的用户 OpenID 列表（私聊）
+# 允许的用户 OpenID 列表（私聊），allow_all=true 时忽略
 allow_from = []
+# 显式允许所有私聊（安全风险！仅开发环境使用）
+allow_all = false
 # WebSocket 自动重连
 reconnect = true
 # 群聊配置（可选，每个群一条）

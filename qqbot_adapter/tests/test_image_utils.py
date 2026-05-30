@@ -116,3 +116,92 @@ class TestStripAtMention:
         from qqbot_adapter.channels.qqbot_channel import QQBotChannel
         result = QQBotChannel._strip_at_mention("普通消息")
         assert result == "普通消息"
+
+
+class TestQQBotAllowAll:
+    """QQBot 官方通道 allow_all 安全开关测试。"""
+
+    def test_allow_all_false_empty_list_blocks(self) -> None:
+        """allow_all=false 且白名单为空 → 拒绝所有人。"""
+        from qqbot_adapter.channels.qqbot_channel import QQBotChannel
+        from qqbot_adapter.core.bus import MessageBus
+        bus = MessageBus()
+        ch = QQBotChannel(
+            bus=bus, app_id="test", client_secret="test",
+            allow_from=[], allow_all=False,
+        )
+        assert ch.allow_all is False
+        assert len(ch.allow_from) == 0
+        # allow_all=False + 空白名单 → 任何人都不在白名单 → 拦截
+        assert "any_user" not in ch.allow_from
+
+    def test_allow_all_true_bypasses_filter(self) -> None:
+        """allow_all=true 时忽略白名单。"""
+        from qqbot_adapter.channels.qqbot_channel import QQBotChannel
+        from qqbot_adapter.core.bus import MessageBus
+        bus = MessageBus()
+        ch = QQBotChannel(
+            bus=bus, app_id="test", client_secret="test",
+            allow_from=["only_this_user"], allow_all=True,
+        )
+        assert ch.allow_all is True
+        # allow_all=true → 不会检查白名单，任何用户都放行
+
+    def test_allow_all_false_with_list_checks(self) -> None:
+        """allow_all=false 且有白名单时只允许白名单用户。"""
+        from qqbot_adapter.channels.qqbot_channel import QQBotChannel
+        from qqbot_adapter.core.bus import MessageBus
+        bus = MessageBus()
+        ch = QQBotChannel(
+            bus=bus, app_id="test", client_secret="test",
+            allow_from=["allowed_user"], allow_all=False,
+        )
+        assert "allowed_user" in ch.allow_from
+        assert "blocked_user" not in ch.allow_from
+
+    def test_default_allow_all_is_false(self) -> None:
+        """不传 allow_all 时默认 false。"""
+        from qqbot_adapter.channels.qqbot_channel import QQBotChannel
+        from qqbot_adapter.core.bus import MessageBus
+        bus = MessageBus()
+        ch = QQBotChannel(bus=bus, app_id="test", client_secret="test")
+        assert ch.allow_all is False
+
+
+class TestConversationCacheLock:
+    """会话创建锁和缓存测试。"""
+
+    def test_cache_key_for_private_chat(self) -> None:
+        from qqbot_adapter.core.bridge import AgentBridge
+        from qqbot_adapter.core.bus import MessageBus
+        from qqbot_adapter.core.events import InboundMessage
+        bus = MessageBus()
+        bridge = AgentBridge(
+            bus=bus, caibao_base_url="http://test",
+            bot_user_id="bot", bot_password="pw",
+        )
+        msg = InboundMessage(
+            channel_type="napcat", chat_type="private",
+            chat_id="123456", user_id="123456",
+            user_name="test", content="hi",
+        )
+        key = AgentBridge._make_conversation_id(msg)
+        assert key == "qq_123456"
+
+    def test_lock_created_per_key(self) -> None:
+        """每个 cache_key 应有独立的锁。"""
+        from qqbot_adapter.core.bridge import AgentBridge
+        from qqbot_adapter.core.bus import MessageBus
+        bus = MessageBus()
+        bridge = AgentBridge(
+            bus=bus, caibao_base_url="http://test",
+            bot_user_id="bot", bot_password="pw",
+        )
+        # 初始化时锁字典为空
+        assert len(bridge._conversation_locks) == 0
+        # setdefault 只在 key 不存在时创建新锁
+        lock1 = bridge._conversation_locks.setdefault("user_a", __import__("asyncio").Lock())
+        lock2 = bridge._conversation_locks.setdefault("user_a", __import__("asyncio").Lock())
+        assert lock1 is lock2  # 同一个 key 返回同一个锁
+        lock3 = bridge._conversation_locks.setdefault("user_b", __import__("asyncio").Lock())
+        assert lock1 is not lock3  # 不同 key 不同锁

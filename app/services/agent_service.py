@@ -188,6 +188,7 @@ class AgentService:
                     seq = event.seq
                     yield event
                 response = self.get_run(run_id=run.run_id, team_id=team_id, user_id=user_id)
+                self._record_agent_history(payload=payload, response=response)
         except Exception as exc:
             self._finish_run(run=run, status="failed", final_answer=f"Agent execution failed: {exc}",
                              required_confirmations=[], started=started)

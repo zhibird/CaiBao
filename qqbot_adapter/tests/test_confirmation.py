@@ -263,6 +263,61 @@ class TestConfirmationFlow:
         assert bridge._pending_confirmations["user_b"].tool_name == "tb"
 
 
+class TestRequesterUserId:
+    """群聊确认发起人身份校验测试。"""
+
+    @pytest.mark.asyncio
+    async def test_same_user_can_confirm(self) -> None:
+        """发起人本人可以确认。"""
+        bus = MessageBus()
+        bridge = AgentBridge(
+            bus=bus, caibao_base_url="http://test",
+            bot_user_id="bot", bot_password="pw",
+        )
+        inbound = _make_inbound("user_a", "创建 incident")
+        bridge._save_pending_confirmation(
+            inbound=inbound, run_id="r1", tool_name="t", arguments={},
+        )
+        # user_a 本人发确认
+        confirm_msg = _make_inbound("user_a", "确认")
+        result = await bridge._try_handle_confirmation(confirm_msg)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_other_user_cannot_confirm(self) -> None:
+        """其他用户不能确认（群聊安全）。"""
+        bus = MessageBus()
+        bridge = AgentBridge(
+            bus=bus, caibao_base_url="http://test",
+            bot_user_id="bot", bot_password="pw",
+        )
+        inbound = _make_inbound("user_a", "创建 incident")
+        bridge._save_pending_confirmation(
+            inbound=inbound, run_id="r1", tool_name="t", arguments={},
+        )
+        # user_b 试图确认
+        confirm_msg = _make_inbound("user_b", "确认")
+        result = await bridge._try_handle_confirmation(confirm_msg)
+        assert result is False  # 拦截，不是发起人
+        # 待确认状态保持不变
+        assert "user_a" in bridge._pending_confirmations
+
+    @pytest.mark.asyncio
+    async def test_requester_user_id_stored(self) -> None:
+        """PendingConfirmation 保存发起人 user_id。"""
+        bus = MessageBus()
+        bridge = AgentBridge(
+            bus=bus, caibao_base_url="http://test",
+            bot_user_id="bot", bot_password="pw",
+        )
+        inbound = _make_inbound("creator_123", "任务")
+        bridge._save_pending_confirmation(
+            inbound=inbound, run_id="r1", tool_name="t", arguments={},
+        )
+        pending = bridge._pending_confirmations["creator_123"]
+        assert pending.requester_user_id == "creator_123"
+
+
 class TestGroupChatConversationId:
     """群聊会话 ID 测试。"""
 

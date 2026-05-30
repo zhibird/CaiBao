@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -26,8 +27,8 @@ from qqbot_adapter.channels.base import BaseChannel
 from qqbot_adapter.core.bus import MessageBus
 from qqbot_adapter.core.events import InboundMessage, OutboundMessage
 from qqbot_adapter.utils.image_utils import (
-    download_images_from_message,
     bytes_to_base64,
+    download_images_from_urls,
     guess_mime_type,
 )
 
@@ -58,6 +59,7 @@ class QQBotChannel(BaseChannel):
         app_id: str,
         client_secret: str,
         allow_from: list[str] | None = None,
+        allow_all: bool = False,
         groups: list[dict[str, Any]] | None = None,
         reconnect: bool = True,
     ) -> None:
@@ -65,6 +67,7 @@ class QQBotChannel(BaseChannel):
         self.app_id = app_id
         self.client_secret = client_secret
         self.allow_from: set[str] = set(allow_from or [])
+        self.allow_all = allow_all
         self.groups: dict[str, dict[str, Any]] = {}
         if groups:
             for g in groups:
@@ -210,7 +213,8 @@ class QQBotChannel(BaseChannel):
 
             elif op == 0:  # Dispatch
                 self._last_seq = data.get("s", self._last_seq)
-                await self._dispatch_event(payload)
+                event_type = data.get("t", "")
+                await self._dispatch_event(event_type, payload)
 
             elif op == 11:  # Heartbeat ACK
                 _logger.debug("Heartbeat ACK")
@@ -240,10 +244,11 @@ class QQBotChannel(BaseChannel):
     # 事件分发
     # ------------------------------------------------------------------
 
-    async def _dispatch_event(self, payload: dict[str, Any]) -> None:
-        """根据事件类型分发到对应 handler。"""
-        event_type = payload.get("t", "")
+    async def _dispatch_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        """根据事件类型分发到对应 handler。
 
+        QQ Bot WebSocket 协议中 t（事件类型）在顶层，d 内是事件数据。
+        """
         if event_type == "C2C_MESSAGE_CREATE":
             await self._on_private_message(payload)
         elif event_type == "GROUP_AT_MESSAGE_CREATE":
@@ -257,8 +262,10 @@ class QQBotChannel(BaseChannel):
         user_id = str(author.get("id", ""))
         content = str(payload.get("content", ""))
 
-        if self.allow_from and user_id not in self.allow_from:
-            return
+        if not self.allow_all:
+            if not self.allow_from or user_id not in self.allow_from:
+                _logger.debug("QQBot private from %s blocked (not in allow_from)", user_id)
+                return
         if not content.strip():
             return
 
@@ -269,9 +276,7 @@ class QQBotChannel(BaseChannel):
             for a in attachments
             if a.get("content_type", "").startswith("image/")
         ]
-        images = await download_images_from_message(
-            "\n".join(image_urls), http_client=self._http,
-        )
+        images = await download_images_from_urls(image_urls, http_client=self._http)
 
         inbound = InboundMessage(
             channel_type=self.channel_type,
@@ -324,7 +329,6 @@ class QQBotChannel(BaseChannel):
     @staticmethod
     def _strip_at_mention(content: str) -> str:
         """去掉官方 Bot 消息中的 <@!xxx> @提及。"""
-        import re
         return re.sub(r"<@!\d+>", "", content).strip()
 
     # ------------------------------------------------------------------

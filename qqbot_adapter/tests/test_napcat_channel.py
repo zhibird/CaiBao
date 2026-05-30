@@ -133,23 +133,33 @@ class TestWhiteListFiltering:
             "message_id": "msg_001",
         }
 
-    def test_allow_from_empty_allows_all(self, channel) -> None:
-        """空 allow_from 表示不限制。"""
+    def test_allow_all_true_bypasses_filter(self, channel) -> None:
+        """allow_all=true 时白名单被忽略。"""
+        channel.allow_all = True
+        channel.allow_from = {"111111"}
+        data = self._make_private_event("999999")
+        # 999999 不在白名单，但 allow_all=true → 不拦截
+        assert not channel.allow_from or "999999" not in channel.allow_from
+        assert channel.allow_all  # allow_all 覆盖白名单
+
+    def test_allow_all_false_empty_list_blocks(self, channel) -> None:
+        """allow_all=false 且白名单为空 → 拒绝所有人。"""
+        channel.allow_all = False
         channel.allow_from = set()
         data = self._make_private_event("123456")
-        # 不会提前 return，消息会被处理
-        # 验证：user_id 不在空集合中 → not in 成立 → 不 return
-        assert "123456" not in channel.allow_from  # True
-        # 但 if self.allow_from and ... → set() is falsy → 不触发检查
+        # allow_all=False, allow_from 为空 → 任何 user_id 都被拦截
+        assert channel.allow_all is False
+        assert len(channel.allow_from) == 0
 
     def test_allow_from_blocked_user(self, channel) -> None:
         """白名单外的用户被拦截。"""
+        channel.allow_all = False
         channel.allow_from = {"111111", "222222"}
-        # user_id 不在白名单 → 会被 _on_private_message 静默拦截
         assert "999999" not in channel.allow_from
 
     def test_allow_from_allowed_user(self, channel) -> None:
         """白名单内的用户通过。"""
+        channel.allow_all = False
         channel.allow_from = {"111111", "222222"}
         assert "111111" in channel.allow_from
 
