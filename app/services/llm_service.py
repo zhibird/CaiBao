@@ -673,6 +673,22 @@ class LLMService:
     def _resolve_system_prompt(self, override: str | None = None) -> str:
         return (override or "").strip() or self.settings.agent_system_prompt.strip() or DEFAULT_AGENT_SYSTEM_PROMPT
 
+    @staticmethod
+    def _normalize_messages(messages: list[dict[str, object]]) -> list[dict[str, object]]:
+        """Ensure all message content values are JSON-serializable strings."""
+        import json as _json
+
+        cleaned: list[dict[str, object]] = []
+        for msg in messages:
+            m = dict(msg)
+            content = m.get("content")
+            if isinstance(content, dict):
+                m["content"] = _json.dumps(content, ensure_ascii=False, default=str)
+            if "tool_calls" in m and m["tool_calls"] is not None and not isinstance(m["tool_calls"], str):
+                m["tool_calls"] = _json.loads(_json.dumps(m["tool_calls"], ensure_ascii=False, default=str))
+            cleaned.append(m)
+        return cleaned
+
     def _build_payload(
         self,
         model: str | None,
@@ -685,7 +701,7 @@ class LLMService:
         selected_model = model.strip() if model else self.settings.llm_model
         payload: dict[str, object] = {
             "model": selected_model,
-            "messages": messages,
+            "messages": self._normalize_messages(messages),
             "temperature": self.settings.llm_temperature,
             "max_tokens": self.settings.llm_max_tokens,
         }
