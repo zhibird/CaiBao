@@ -1428,7 +1428,7 @@ class AgentService:
         for msg in messages:
             c = dict(msg)
             content = c.get("content")
-            if isinstance(content, list):
+            if not isinstance(content, str) and content is not None:
                 c["content"] = json.dumps(content, ensure_ascii=False, default=str)
             if "tool_calls" in c and c["tool_calls"] is not None:
                 c["tool_calls"] = json.loads(json.dumps(c["tool_calls"], ensure_ascii=False, default=str))
