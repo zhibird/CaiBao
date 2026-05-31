@@ -98,6 +98,7 @@ async def upload_document(
 @router.get("", response_model=list[DocumentResponse])
 def list_documents(
     conversation_id: str | None = Query(default=None, min_length=1, max_length=36),
+    space_id: str | None = Query(default=None, min_length=1, max_length=36),
     status_filter: str | None = Query(default=None, alias="status"),
     limit: int = Query(default=50, ge=1, le=200),
     current_user: User = Depends(require_current_active_user),
@@ -107,6 +108,7 @@ def list_documents(
         documents = document_service.list_documents(
             team_id=current_user.team_id,
             conversation_id=conversation_id,
+            space_id=space_id,
             user_id=current_user.user_id,
             status=status_filter,
             limit=limit,

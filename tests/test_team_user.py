@@ -3,6 +3,15 @@ from uuid import uuid4
 from tests.auth_helpers import login_existing_user
 
 
+def _admin_headers() -> dict[str, str]:
+    return {"X-Dev-Admin-Token": "test-admin-token"}
+
+
+def test_bootstrap_routes_require_admin_token(client) -> None:
+    assert client.get("/api/v1/teams").status_code == 403
+    assert client.get("/api/v1/users").status_code == 403
+
+
 def test_create_team_and_user(client) -> None:
     suffix = uuid4().hex[:8]
     team_id = f"team_{suffix}"
@@ -10,6 +19,7 @@ def test_create_team_and_user(client) -> None:
 
     team_response = client.post(
         "/api/v1/teams",
+        headers=_admin_headers(),
         json={
             "team_id": team_id,
             "name": "Operations",
@@ -21,6 +31,7 @@ def test_create_team_and_user(client) -> None:
 
     user_response = client.post(
         "/api/v1/users",
+        headers=_admin_headers(),
         json={
             "user_id": user_id,
             "team_id": team_id,
@@ -31,7 +42,7 @@ def test_create_team_and_user(client) -> None:
     assert user_response.status_code == 201
     assert user_response.json()["team_id"] == team_id
 
-    get_user_response = client.get(f"/api/v1/users/{user_id}")
+    get_user_response = client.get(f"/api/v1/users/{user_id}", headers=_admin_headers())
     assert get_user_response.status_code == 200
     assert get_user_response.json()["display_name"] == "Bob"
 
@@ -43,6 +54,7 @@ def test_ensure_team_and_user_are_idempotent(client) -> None:
 
     create_team_response = client.put(
         f"/api/v1/teams/{team_id}",
+        headers=_admin_headers(),
         json={
             "name": "Workspace Alpha",
             "description": None,
@@ -54,6 +66,7 @@ def test_ensure_team_and_user_are_idempotent(client) -> None:
 
     reuse_team_response = client.put(
         f"/api/v1/teams/{team_id}",
+        headers=_admin_headers(),
         json={
             "name": "Workspace Beta",
             "description": None,
@@ -65,6 +78,7 @@ def test_ensure_team_and_user_are_idempotent(client) -> None:
 
     create_user_response = client.put(
         f"/api/v1/users/{user_id}",
+        headers=_admin_headers(),
         json={
             "team_id": team_id,
             "display_name": "Workspace Beta",
@@ -77,6 +91,7 @@ def test_ensure_team_and_user_are_idempotent(client) -> None:
 
     reuse_user_response = client.put(
         f"/api/v1/users/{user_id}",
+        headers=_admin_headers(),
         json={
             "team_id": team_id,
             "display_name": "Workspace Gamma",
@@ -96,6 +111,7 @@ def test_ensure_user_rejects_cross_team_reuse(client) -> None:
 
     first_team_response = client.put(
         f"/api/v1/teams/{first_team_id}",
+        headers=_admin_headers(),
         json={
             "name": "Team A",
             "description": None,
@@ -105,6 +121,7 @@ def test_ensure_user_rejects_cross_team_reuse(client) -> None:
 
     second_team_response = client.put(
         f"/api/v1/teams/{second_team_id}",
+        headers=_admin_headers(),
         json={
             "name": "Team B",
             "description": None,
@@ -114,6 +131,7 @@ def test_ensure_user_rejects_cross_team_reuse(client) -> None:
 
     create_user_response = client.put(
         f"/api/v1/users/{user_id}",
+        headers=_admin_headers(),
         json={
             "team_id": first_team_id,
             "display_name": "Owner",
@@ -123,6 +141,7 @@ def test_ensure_user_rejects_cross_team_reuse(client) -> None:
 
     conflict_response = client.put(
         f"/api/v1/users/{user_id}",
+        headers=_admin_headers(),
         json={
             "team_id": second_team_id,
             "display_name": "Owner",
@@ -140,6 +159,7 @@ def test_ensure_routes_preserve_id_length_validation(client) -> None:
 
     team_response = client.put(
         f"/api/v1/teams/{too_long_team_id}",
+        headers=_admin_headers(),
         json={
             "name": "Too Long",
             "description": None,
@@ -149,6 +169,7 @@ def test_ensure_routes_preserve_id_length_validation(client) -> None:
 
     user_response = client.put(
         f"/api/v1/users/{too_long_user_id}",
+        headers=_admin_headers(),
         json={
             "team_id": "team_short",
             "display_name": "Too Long",
@@ -164,6 +185,7 @@ def test_workspace_bootstrap_sequence_is_repeatable_without_conflicts(client) ->
 
     first_team_response = client.put(
         f"/api/v1/teams/{workspace_id}",
+        headers=_admin_headers(),
         json={
             "name": workspace_name,
             "description": None,
@@ -173,6 +195,7 @@ def test_workspace_bootstrap_sequence_is_repeatable_without_conflicts(client) ->
 
     first_user_response = client.put(
         f"/api/v1/users/{workspace_id}",
+        headers=_admin_headers(),
         json={
             "team_id": workspace_id,
             "display_name": workspace_name,
@@ -182,6 +205,7 @@ def test_workspace_bootstrap_sequence_is_repeatable_without_conflicts(client) ->
 
     second_team_response = client.put(
         f"/api/v1/teams/{workspace_id}",
+        headers=_admin_headers(),
         json={
             "name": workspace_name,
             "description": None,
@@ -191,6 +215,7 @@ def test_workspace_bootstrap_sequence_is_repeatable_without_conflicts(client) ->
 
     second_user_response = client.put(
         f"/api/v1/users/{workspace_id}",
+        headers=_admin_headers(),
         json={
             "team_id": workspace_id,
             "display_name": workspace_name,

@@ -45,3 +45,37 @@ def test_blank_auth_cookie_domain_normalizes_to_none(monkeypatch):
     settings = Settings(_env_file=None)
 
     assert settings.auth_cookie_domain is None
+
+
+def test_prod_rejects_default_jwt_secret(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "prod")
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///prod-config.db")
+    monkeypatch.delenv("AUTH_JWT_SECRET", raising=False)
+    monkeypatch.setenv("AUTH_COOKIE_SECURE", "true")
+    monkeypatch.setenv("DEV_ADMIN_ENABLED", "false")
+
+    with pytest.raises(ValidationError, match="AUTH_JWT_SECRET"):
+        Settings(_env_file=None)
+
+
+def test_prod_requires_secure_cookies(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "prod")
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///prod-config.db")
+    monkeypatch.setenv("AUTH_JWT_SECRET", "prod-secret-value-with-at-least-32-chars")
+    monkeypatch.setenv("AUTH_COOKIE_SECURE", "false")
+    monkeypatch.setenv("DEV_ADMIN_ENABLED", "false")
+
+    with pytest.raises(ValidationError, match="AUTH_COOKIE_SECURE"):
+        Settings(_env_file=None)
+
+
+def test_prod_rejects_default_dev_admin_token_when_enabled(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "prod")
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///prod-config.db")
+    monkeypatch.setenv("AUTH_JWT_SECRET", "prod-secret-value-with-at-least-32-chars")
+    monkeypatch.setenv("AUTH_COOKIE_SECURE", "true")
+    monkeypatch.setenv("DEV_ADMIN_ENABLED", "true")
+    monkeypatch.setenv("DEV_ADMIN_TOKEN", "dev-admin-token")
+
+    with pytest.raises(ValidationError, match="DEV_ADMIN_TOKEN"):
+        Settings(_env_file=None)

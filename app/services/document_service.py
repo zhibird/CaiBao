@@ -14,7 +14,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from pypdf import PdfReader
-from sqlalchemy import delete, or_, select
+from sqlalchemy import and_, delete, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.config import PROJECT_ROOT, get_settings
@@ -286,13 +286,47 @@ class DocumentService:
         stmt = select(Document).where(Document.team_id == team_id)
         if conversation_id is not None and user_id is not None:
             self._ensure_conversation_access(team_id=team_id, conversation_id=conversation_id, user_id=user_id)
+        if space_id is not None and user_id is not None:
+            self.resolve_space_id(
+                team_id=team_id,
+                conversation_id=conversation_id,
+                space_id=space_id,
+                user_id=user_id,
+            )
         if conversation_id is not None:
             stmt = stmt.where(Document.conversation_id == conversation_id)
         if space_id is not None:
             stmt = stmt.where(Document.space_id == space_id)
         if user_id is not None:
-            stmt = stmt.outerjoin(Conversation, Conversation.conversation_id == Document.conversation_id).where(
-                or_(Document.conversation_id.is_(None), Conversation.user_id == user_id)
+            stmt = (
+                stmt.outerjoin(
+                    Conversation,
+                    and_(
+                        Conversation.conversation_id == Document.conversation_id,
+                        Conversation.team_id == Document.team_id,
+                    ),
+                )
+                .outerjoin(
+                    ProjectSpace,
+                    and_(
+                        ProjectSpace.space_id == Document.space_id,
+                        ProjectSpace.team_id == Document.team_id,
+                    ),
+                )
+                .where(
+                    or_(
+                        Conversation.user_id == user_id,
+                        and_(
+                            Document.conversation_id.is_(None),
+                            Document.space_id.isnot(None),
+                            ProjectSpace.owner_user_id == user_id,
+                        ),
+                        and_(
+                            Document.conversation_id.is_(None),
+                            Document.space_id.is_(None),
+                        ),
+                    )
+                )
             )
         if visibility is not None:
             stmt = stmt.where(Document.visibility == visibility.strip().lower())
@@ -474,12 +508,20 @@ class DocumentService:
         document = self.db.scalar(stmt)
         if document is None:
             raise EntityNotFoundError(f"Document '{document_id}' not found in team '{team_id}'.")
-        if user_id is not None and document.conversation_id is not None:
-            self._ensure_conversation_access(
-                team_id=team_id,
-                conversation_id=document.conversation_id,
-                user_id=user_id,
-            )
+        if user_id is not None:
+            if document.conversation_id is not None:
+                self._ensure_conversation_access(
+                    team_id=team_id,
+                    conversation_id=document.conversation_id,
+                    user_id=user_id,
+                )
+            elif document.space_id is not None:
+                self.resolve_space_id(
+                    team_id=team_id,
+                    conversation_id=None,
+                    space_id=document.space_id,
+                    user_id=user_id,
+                )
         return document
 
     def update_document_status(

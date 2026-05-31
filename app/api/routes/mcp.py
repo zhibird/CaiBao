@@ -8,6 +8,7 @@ from app.api.deps import (
     get_tool_catalog_service,
     get_tool_service,
     require_current_active_user,
+    require_dev_admin,
 )
 from app.api.deps import (
     _finalize_mcp_reload,
@@ -39,6 +40,7 @@ def reload_mcp_servers(
     mcp_manager: MCPManager = Depends(get_mcp_manager),
     catalog: ToolCatalogService = Depends(get_tool_catalog_service),
     current_user: User = Depends(require_current_active_user),
+    admin_user: User = Depends(require_dev_admin),
 ):
     try:
         _reset_mcp()

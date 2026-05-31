@@ -25,7 +25,10 @@ import httpx
 
 from .bus import MessageBus
 from .events import InboundMessage, OutboundMessage, SSEEvent
-from utils.formatter import find_flush_point, markdown_to_qq
+try:
+    from ..utils.formatter import find_flush_point, markdown_to_qq
+except ImportError:  # pragma: no cover - script-mode fallback
+    from utils.formatter import find_flush_point, markdown_to_qq
 
 _logger = logging.getLogger(__name__)
 
@@ -35,6 +38,7 @@ _MAX_MESSAGE_CHARS = 3500
 _MIN_SEND_INTERVAL = 0.3
 _QQBOT_PASSIVE_REPLY_LIMIT = 5
 _QQBOT_REPLY_COUNT_CACHE_LIMIT = 2048
+_QQBOT_TRUNCATION_NOTICE = "\n\n[Answer truncated: QQBot passive reply limit reached.]"
 
 # SSE 流式失败时触发同步降级的异常类型
 _STREAMING_FALLBACK_ERRORS = (
@@ -361,7 +365,7 @@ class AgentBridge:
         content: str,
         *,
         tool_status: str | None = None,
-    ) -> None:
+    ) -> bool:
         """带频控的发消息：同 chat_id 至少间隔 _MIN_SEND_INTERVAL 秒。"""
         chat_id = inbound.chat_id
         now = time.monotonic()
@@ -370,8 +374,10 @@ class AgentBridge:
         if wait > 0:
             await asyncio.sleep(wait)
 
-        await self._publish_reply(inbound, content, tool_status=tool_status)
-        self._last_send_time[chat_id] = time.monotonic()
+        sent = await self._publish_reply(inbound, content, tool_status=tool_status)
+        if sent:
+            self._last_send_time[chat_id] = time.monotonic()
+        return sent
 
     async def _publish_reply(
         self,
@@ -379,9 +385,9 @@ class AgentBridge:
         content: str,
         *,
         tool_status: str | None = None,
-    ) -> None:
+    ) -> bool:
         if not self._consume_reply_budget(inbound):
-            return
+            return False
         await self.bus.publish_outbound(OutboundMessage(
             channel_type=inbound.channel_type,
             chat_id=inbound.chat_id,
@@ -389,6 +395,15 @@ class AgentBridge:
             reply_to=inbound.message_id or None,
             tool_status=tool_status,
         ))
+        return True
+
+    def _remaining_reply_budget(self, inbound: InboundMessage) -> int | None:
+        if inbound.channel_type != "qqbot" or not inbound.message_id:
+            return None
+
+        key = (inbound.channel_type, inbound.chat_id, inbound.message_id)
+        count = self._reply_counts.get(key, 0)
+        return max(_QQBOT_PASSIVE_REPLY_LIMIT - count, 0)
 
     def _consume_reply_budget(self, inbound: InboundMessage) -> bool:
         if inbound.channel_type != "qqbot" or not inbound.message_id:
@@ -712,31 +727,6 @@ class AgentBridge:
     # 消息发送辅助
     # ------------------------------------------------------------------
 
-    async def _send_long_message(
-        self,
-        inbound: InboundMessage,
-        text: str,
-        is_final: bool = False,
-    ) -> None:
-        """将长文本分段发送到 QQ（QQ 有单条消息长度限制）。"""
-        if not text.strip():
-            return
-
-        # 如果文本不太长，一次发送
-        if len(text) <= _MAX_MESSAGE_CHARS:
-            await self._publish_reply(
-                inbound,
-                text,
-                tool_status="done" if is_final else None,
-            )
-            return
-
-        # 分段发送
-        parts = self._split_text(text, _MAX_MESSAGE_CHARS)
-        for i, part in enumerate(parts):
-            suffix = f"  ({i + 1}/{len(parts)})" if len(parts) > 1 else ""
-            await self._publish_reply(inbound, part + suffix)
-
     @staticmethod
     def _split_text(text: str, max_chars: int) -> list[str]:
         """按换行边界分段，尽量保持语义完整。"""
@@ -755,6 +745,56 @@ class AgentBridge:
         if remaining.strip():
             parts.append(remaining.strip())
         return parts
+
+    @staticmethod
+    def _fit_message(text: str, max_chars: int, suffix: str = "") -> str:
+        if len(text) + len(suffix) <= max_chars:
+            return text + suffix
+        room = max_chars - len(suffix)
+        if room <= 0:
+            return suffix[-max_chars:]
+        return text[:room].rstrip() + suffix
+
+    async def _send_long_message(
+        self,
+        inbound: InboundMessage,
+        text: str,
+        is_final: bool = False,
+    ) -> None:
+        if not text.strip():
+            return
+
+        if len(text) <= _MAX_MESSAGE_CHARS:
+            await self._publish_reply(
+                inbound,
+                text,
+                tool_status="done" if is_final else None,
+            )
+            return
+
+        parts = self._split_text(text, _MAX_MESSAGE_CHARS)
+        original_count = len(parts)
+        remaining_budget = self._remaining_reply_budget(inbound)
+        truncated = False
+        if remaining_budget is not None:
+            if remaining_budget <= 0:
+                return
+            if len(parts) > remaining_budget:
+                parts = parts[:remaining_budget]
+                truncated = True
+
+        for index, part in enumerate(parts):
+            suffix = f"  ({index + 1}/{original_count})" if original_count > 1 else ""
+            if truncated and index == len(parts) - 1:
+                suffix = f"{_QQBOT_TRUNCATION_NOTICE}{suffix}"
+            message = self._fit_message(part, _MAX_MESSAGE_CHARS, suffix)
+            sent = await self._publish_reply(
+                inbound,
+                message,
+                tool_status="done" if is_final and index == len(parts) - 1 else None,
+            )
+            if not sent:
+                break
 
     # ------------------------------------------------------------------
     # 认证

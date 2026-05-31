@@ -110,7 +110,7 @@ def test_admin_update_role_and_delete_user(client) -> None:
     )
     assert delete_user.status_code == 204
 
-    get_user = client.get(f"/api/v1/users/{user_id}")
+    get_user = client.get(f"/api/v1/users/{user_id}", headers=_admin_headers())
     assert get_user.status_code == 404
 
     users_in_team = client.get(

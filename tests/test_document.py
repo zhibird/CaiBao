@@ -150,6 +150,18 @@ def _create_conversation(client, *, title: str, team_id: str | None = None, user
     return response.json()
 
 
+def _create_space(client, *, name: str) -> dict[str, object]:
+    response = client.post(
+        "/api/v1/spaces",
+        json={
+            "name": name,
+            "description": None,
+        },
+    )
+    assert response.status_code == 201
+    return response.json()
+
+
 def test_document_routes_require_authenticated_user(client) -> None:
     client.cookies.clear()
 
@@ -414,6 +426,58 @@ def test_same_team_user_cannot_access_foreign_conversation_documents(client) -> 
         params={"conversation_id": conversation["conversation_id"]},
     )
     assert foreign_list_response.status_code == 404
+
+    get_response = client.get(f"/api/v1/documents/{document_id}")
+    assert get_response.status_code == 404
+
+    file_response = client.get(f"/api/v1/documents/{document_id}/file")
+    assert file_response.status_code == 404
+
+    delete_response = client.delete(f"/api/v1/documents/{document_id}")
+    assert delete_response.status_code == 404
+
+
+def test_same_team_user_cannot_access_foreign_space_documents(client) -> None:
+    owner_team_id, owner_user_id = register_workspace_user(
+        client,
+        prefix="doc_space_owner",
+        display_name="Doc Space Owner",
+    )
+    space = _create_space(client, name="Owner Space")
+
+    import_response = client.post(
+        "/api/v1/documents/import",
+        json={
+            "space_id": space["space_id"],
+            "source_name": "space-secret.md",
+            "content_type": "md",
+            "content": "# Space Secret\n\nOnly the space owner should see this.",
+        },
+    )
+    assert import_response.status_code == 201
+    assert import_response.json()["team_id"] == owner_team_id
+    assert import_response.json()["space_id"] == space["space_id"]
+    assert import_response.json()["conversation_id"] is None
+    document_id = import_response.json()["document_id"]
+
+    peer_team_id, peer_user_id = register_workspace_user_in_team(
+        client,
+        team_id=owner_team_id,
+        prefix="doc_space_peer",
+        display_name="Doc Space Peer",
+    )
+    assert peer_team_id == owner_team_id
+    assert peer_user_id != owner_user_id
+
+    list_response = client.get("/api/v1/documents")
+    assert list_response.status_code == 200
+    assert all(item["document_id"] != document_id for item in list_response.json())
+
+    foreign_space_list = client.get(
+        "/api/v1/documents",
+        params={"space_id": space["space_id"]},
+    )
+    assert foreign_space_list.status_code == 404
 
     get_response = client.get(f"/api/v1/documents/{document_id}")
     assert get_response.status_code == 404

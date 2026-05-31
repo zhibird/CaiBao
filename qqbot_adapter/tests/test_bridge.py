@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from qqbot_adapter.core.bridge import AgentBridge, _MIN_SEND_INTERVAL, _QQBOT_PASSIVE_REPLY_LIMIT
+from qqbot_adapter.core.bridge import AgentBridge, _MAX_MESSAGE_CHARS, _MIN_SEND_INTERVAL, _QQBOT_PASSIVE_REPLY_LIMIT
 from qqbot_adapter.core.bus import MessageBus
 from qqbot_adapter.core.events import InboundMessage, OutboundMessage, SSEEvent
 
@@ -269,6 +269,46 @@ class TestQQBotReplyMetadata:
         await bus.stop()
 
         assert len(received) == _QQBOT_PASSIVE_REPLY_LIMIT
+
+    @pytest.mark.asyncio
+    async def test_qqbot_long_message_marks_truncation_when_budget_is_short(self) -> None:
+        bus = MessageBus()
+        await bus.start()
+        received: list[OutboundMessage] = []
+
+        async def capture(msg: OutboundMessage) -> None:
+            received.append(msg)
+
+        bus.subscribe_outbound("qqbot", capture)
+        bridge = AgentBridge(
+            bus=bus, caibao_base_url="http://test",
+            bot_user_id="bot", bot_password="pw",
+        )
+        inbound = InboundMessage(
+            channel_type="qqbot",
+            chat_type="private",
+            chat_id="openid-a",
+            user_id="openid-a",
+            user_name="tester",
+            content="hello",
+            message_id="msg-in-1",
+        )
+
+        for index in range(_QQBOT_PASSIVE_REPLY_LIMIT - 1):
+            await bridge._publish_reply(inbound, f"preface {index}")
+
+        await bridge._send_long_message(
+            inbound,
+            "x" * (_MAX_MESSAGE_CHARS * 2 + 50),
+            is_final=True,
+        )
+
+        await asyncio.sleep(0.1)
+        await bus.stop()
+
+        assert len(received) == _QQBOT_PASSIVE_REPLY_LIMIT
+        assert "Answer truncated" in received[-1].content
+        assert len(received[-1].content) <= _MAX_MESSAGE_CHARS
 
 
 class TestDedupLogic:

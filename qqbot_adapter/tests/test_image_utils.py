@@ -1,11 +1,13 @@
 """测试图片工具：URL 提取、MIME 检测、base64 编解码。"""
 
+import httpx
 import pytest
 
 from qqbot_adapter.utils.image_utils import (
     base64_to_bytes,
     bytes_to_base64,
     build_data_uri,
+    download_images_from_urls,
     extract_image_urls_from_cq,
     guess_mime_type,
 )
@@ -97,6 +99,57 @@ class TestBase64:
     def test_data_uri_format(self) -> None:
         uri = build_data_uri(b"\x89PNG", "test.png")
         assert uri.startswith("data:image/png;base64,")
+
+
+class TestDownloadImages:
+    @pytest.mark.asyncio
+    async def test_private_host_is_blocked_before_transport(self) -> None:
+        called = False
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal called
+            called = True
+            return httpx.Response(200, content=b"private")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await download_images_from_urls(
+                ["http://127.0.0.1/private.png"],
+                http_client=client,
+            )
+
+        assert result == []
+        assert called is False
+
+    @pytest.mark.asyncio
+    async def test_oversized_response_is_rejected(self, monkeypatch) -> None:
+        monkeypatch.setattr("qqbot_adapter.utils.image_utils._host_is_blocked", lambda host: False)
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=b"x" * 6)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await download_images_from_urls(
+                ["https://cdn.example.com/image.png"],
+                http_client=client,
+                max_size=5,
+            )
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_public_image_downloads_with_mock_transport(self, monkeypatch) -> None:
+        monkeypatch.setattr("qqbot_adapter.utils.image_utils._host_is_blocked", lambda host: False)
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=b"abc")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            result = await download_images_from_urls(
+                ["https://cdn.example.com/image.png"],
+                http_client=client,
+            )
+
+        assert result == [b"abc"]
 
 
 class TestStripAtMention:

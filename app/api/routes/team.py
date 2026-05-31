@@ -1,11 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, Path, Response, status
 
-from app.api.deps import get_team_service
+from app.api.deps import get_team_service, require_dev_admin
 from app.core.exceptions import EntityConflictError
 from app.schemas.team import TeamCreate, TeamEnsure, TeamResponse
 from app.services.team_service import TeamService
 
-router = APIRouter(prefix="/teams")
+router = APIRouter(prefix="/teams", dependencies=[Depends(require_dev_admin)])
 
 
 @router.post("", response_model=TeamResponse, status_code=status.HTTP_201_CREATED)

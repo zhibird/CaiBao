@@ -3,7 +3,7 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -162,6 +162,25 @@ class Settings(BaseSettings):
         if value == "":
             return None
         return value
+
+    @model_validator(mode="after")
+    def _validate_production_security(self):
+        if self.app_env.strip().lower() not in {"prod", "production"}:
+            return self
+
+        weak_secrets = {
+            "",
+            "dev-auth-secret-change-me",
+            "change-me-before-production",
+            "test-auth-secret",
+        }
+        if self.auth_jwt_secret.strip() in weak_secrets or len(self.auth_jwt_secret.strip()) < 32:
+            raise ValueError("AUTH_JWT_SECRET must be a non-default value with at least 32 characters in production.")
+        if not self.auth_cookie_secure:
+            raise ValueError("AUTH_COOKIE_SECURE must be true in production.")
+        if self.dev_admin_enabled and self.dev_admin_token.strip() in {"", "dev-admin-token"}:
+            raise ValueError("DEV_ADMIN_TOKEN must be a non-default value when DEV_ADMIN_ENABLED is true in production.")
+        return self
 
 
 @lru_cache

@@ -1,11 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Response, status
 
-from app.api.deps import get_user_service
+from app.api.deps import get_user_service, require_dev_admin
 from app.core.exceptions import EntityConflictError, EntityNotFoundError
 from app.schemas.user import UserCreate, UserEnsure, UserResponse
 from app.services.user_service import UserService
 
-router = APIRouter(prefix="/users")
+router = APIRouter(prefix="/users", dependencies=[Depends(require_dev_admin)])
 
 
 @router.post("", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
