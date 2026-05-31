@@ -218,7 +218,7 @@ class Settings(BaseSettings):
 
     # Web tools
     web_tools_enabled: bool = True
-    web_search_provider: str = "disabled"
+    web_search_provider: str = "exa"
     web_search_api_key: str | None = None
     web_fetch_max_bytes: int = 1_000_000
     web_fetch_block_private_ips: bool = True

@@ -220,17 +220,19 @@ def web_search_handler(
     provider = settings.web_search_provider.strip().lower()
     api_key = (settings.web_search_api_key or "").strip()
 
-    if provider == "disabled" or not api_key:
-        raise DomainValidationError(
-            "Web search is not configured. Set WEB_SEARCH_PROVIDER and WEB_SEARCH_API_KEY in .env."
-        )
-
     query = str(arguments["query"]).strip()
     limit = int(arguments.get("limit", 5))
 
+    # Exa MCP 公开端点，无需 API Key（参考 akashic-agent）
+    if provider == "exa" or provider == "disabled":
+        return _exa_search(query=query, limit=limit)
     if provider == "brave":
+        if not api_key:
+            raise DomainValidationError("Brave search requires WEB_SEARCH_API_KEY.")
         return _brave_search(query=query, limit=limit, api_key=api_key)
     if provider == "tavily":
+        if not api_key:
+            raise DomainValidationError("Tavily search requires WEB_SEARCH_API_KEY.")
         return _tavily_search(query=query, limit=limit, api_key=api_key)
 
     raise DomainValidationError(f"Unsupported search provider: {provider}")
@@ -279,6 +281,87 @@ def _tavily_search(*, query: str, limit: int, api_key: str) -> dict[str, object]
         ],
         "provider": "tavily",
     }
+
+
+def _exa_search(*, query: str, limit: int) -> dict[str, object]:
+    """Exa MCP 公开端点搜索，无需 API Key。参考 akashic-agent 实现。"""
+    import json as _json
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "web_search_exa",
+            "arguments": {
+                "query": query,
+                "numResults": min(limit, 20),
+                "livecrawl": "fallback",
+                "type": "auto",
+            },
+        },
+    }
+
+    try:
+        response = httpx.post(
+            "https://mcp.exa.ai/mcp",
+            json=payload,
+            headers={
+                "accept": "application/json, text/event-stream",
+                "content-type": "application/json",
+            },
+            timeout=25.0,
+        )
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise DomainValidationError(f"Exa search failed: {exc}") from exc
+
+    # 解析 SSE 响应
+    text = response.text
+    for line in text.splitlines():
+        if line.startswith("data: "):
+            try:
+                data = _json.loads(line[6:])
+                content = data.get("result", {}).get("content", [])
+                if content:
+                    raw_text = content[0].get("text", "")
+                    results = _parse_exa_results(raw_text)
+                    return {
+                        "results": results[:limit],
+                        "provider": "exa",
+                    }
+            except (_json.JSONDecodeError, KeyError, IndexError):
+                continue
+
+    return {"results": [], "provider": "exa", "query": query}
+
+
+def _parse_exa_results(raw: str) -> list[dict[str, str]]:
+    """解析 Exa 返回的文本结果，提取标题/URL/摘要。"""
+    results: list[dict[str, str]] = []
+    for line in raw.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        item: dict[str, str] = {}
+        if line.startswith("Title: "):
+            item["title"] = line[7:]
+        elif line.startswith("URL: "):
+            item["url"] = line[5:]
+        elif line.startswith("Published Date: "):
+            item["published"] = line[16:]
+        elif line.startswith("Text: "):
+            item["snippet"] = line[6:][:500]
+        if item:
+            # 累积到最近一条
+            if results and "title" in item:
+                results.append(item)
+            elif results:
+                results[-1].update(item)
+            elif "title" in item:
+                results.append(item)
+    return results
+
 
 
 # ------------------------------------------------------------------
