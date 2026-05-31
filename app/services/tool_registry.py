@@ -257,6 +257,66 @@ AGENT_TOOL_DEFINITIONS = {
             },
         },
     ),
+    "web_search": ToolDefinition(
+        name="web_search",
+        display_name="搜索网页",
+        description=(
+            "Search the web and return results (title, URL, snippet). "
+            "Supports Brave and Tavily search providers. "
+            "Requires WEB_SEARCH_PROVIDER and WEB_SEARCH_API_KEY configured in .env."
+        ),
+        dangerous=False,
+        handler_key="generic.web_search",
+        source="generic",
+        provider="web_tools",
+        input_schema={
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {"type": "string", "minLength": 1, "maxLength": 500},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
+            },
+        },
+        output_schema={
+            "type": "object",
+            "properties": {
+                "results": {"type": "array"},
+                "provider": {"type": "string"},
+            },
+        },
+    ),
+    "web_fetch": ToolDefinition(
+        name="web_fetch",
+        display_name="抓取网页",
+        description=(
+            "Fetch a web page by URL and return its text content. "
+            "HTML is converted to plain text. Private/reserved IPs are blocked. "
+            "Use this to read documentation, news articles, or any web content."
+        ),
+        dangerous=False,
+        handler_key="generic.web_fetch",
+        source="generic",
+        provider="web_tools",
+        input_schema={
+            "type": "object",
+            "required": ["url"],
+            "properties": {
+                "url": {"type": "string", "minLength": 1, "maxLength": 2048},
+                "max_chars": {"type": "integer", "minimum": 100, "maximum": 50000, "default": 12000},
+                "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 30, "default": 15},
+            },
+        },
+        output_schema={
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "status_code": {"type": "integer"},
+                "final_url": {"type": "string"},
+                "content": {"type": "string"},
+                "truncated": {"type": "boolean"},
+            },
+        },
+    ),
     "generate_incident_report": ToolDefinition(
         name="generate_incident_report",
         display_name="生成事件报告",
