@@ -677,12 +677,15 @@ class LLMService:
     def _normalize_messages(messages: list[dict[str, object]]) -> list[dict[str, object]]:
         """Ensure all message content values are JSON-serializable strings."""
         import json as _json
+        import logging
 
+        _log = logging.getLogger(__name__)
         cleaned: list[dict[str, object]] = []
-        for msg in messages:
+        for i, msg in enumerate(messages):
             m = dict(msg)
             content = m.get("content")
-            if isinstance(content, dict):
+            if content is not None and not isinstance(content, (str, list)):
+                _log.warning("Normalizing non-string content at messages[%d] type=%s", i, type(content).__name__)
                 m["content"] = _json.dumps(content, ensure_ascii=False, default=str)
             if "tool_calls" in m and m["tool_calls"] is not None and not isinstance(m["tool_calls"], str):
                 m["tool_calls"] = _json.loads(_json.dumps(m["tool_calls"], ensure_ascii=False, default=str))
