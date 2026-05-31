@@ -675,7 +675,12 @@ class LLMService:
 
     @staticmethod
     def _normalize_messages(messages: list[dict[str, object]]) -> list[dict[str, object]]:
-        """Ensure all message content values are JSON-serializable strings."""
+        """Ensure all message content values are JSON-safe strings.
+
+        LLM providers (OpenAI/DeepSeek etc.) strictly require content to be
+        either a plain string or an array of typed content-parts.  Dicts,
+        Pydantic models, or untyped arrays will be serialised to JSON.
+        """
         import json as _json
         import logging
 
@@ -684,11 +689,35 @@ class LLMService:
         for i, msg in enumerate(messages):
             m = dict(msg)
             content = m.get("content")
-            if content is not None and not isinstance(content, (str, list)):
-                _log.warning("Normalizing non-string content at messages[%d] type=%s", i, type(content).__name__)
-                m["content"] = _json.dumps(content, ensure_ascii=False, default=str)
-            if "tool_calls" in m and m["tool_calls"] is not None and not isinstance(m["tool_calls"], str):
-                m["tool_calls"] = _json.loads(_json.dumps(m["tool_calls"], ensure_ascii=False, default=str))
+
+            # content = None → fine (assistant with tool_calls)
+            # content = str → fine
+            # content = list[typed-parts] → fine (multimodal)
+            # content = dict / anything-else → dump to JSON string
+            if content is not None and not isinstance(content, str):
+                if isinstance(content, list):
+                    # Check if list items are typed multimodal parts
+                    all_typed = all(
+                        isinstance(it, dict) and ("type" in it or "text" in it)
+                        for it in content
+                    )
+                    if not all_typed:
+                        _log.warning(
+                            "Normalizing untyped list content at messages[%d]", i,
+                        )
+                        m["content"] = _json.dumps(content, ensure_ascii=False, default=str)
+                else:
+                    _log.warning(
+                        "Normalizing %s content at messages[%d] role=%s",
+                        type(content).__name__, i, m.get("role", "?"),
+                    )
+                    m["content"] = _json.dumps(content, ensure_ascii=False, default=str)
+
+            # tool_calls must be a plain list-of-dicts, not a JSON string
+            if "tool_calls" in m and m["tool_calls"] is not None:
+                tc = m["tool_calls"]
+                if isinstance(tc, str):
+                    m["tool_calls"] = _json.loads(tc)
             cleaned.append(m)
         return cleaned
 
