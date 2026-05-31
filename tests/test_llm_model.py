@@ -1,5 +1,6 @@
 from uuid import uuid4
 
+from app.core.config import get_settings
 from tests.auth_helpers import register_workspace_user
 
 
@@ -34,8 +35,12 @@ def test_llm_model_config_is_isolated_by_account(client) -> None:
 
     list_a = client.get("/api/v1/llm/models")
     assert list_a.status_code == 200
-    assert len(list_a.json()["items"]) == 1
-    assert list_a.json()["items"][0]["model_name"] == "gpt-4.1-mini"
+    list_a_body = list_a.json()
+    settings = get_settings()
+    assert list_a_body["default_model"]["model_name"] == settings.llm_model
+    assert list_a_body["default_model"]["provider"] == settings.llm_provider
+    assert len(list_a_body["items"]) == 1
+    assert list_a_body["items"][0]["model_name"] == "gpt-4.1-mini"
 
     logout = client.post("/api/v1/auth/logout")
     assert logout.status_code == 204

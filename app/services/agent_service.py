@@ -38,6 +38,7 @@ from app.services.llm_model_service import LLMModelService
 from app.services.llm_router import LLMRouter
 from app.services.llm_service import LLMCompletionResult, LLMService, LLMStreamChunk
 from app.services.memory_markdown_store import MemoryMarkdownStore
+from app.services.persona_prompt import PersonaPromptBuilder
 from app.services.rag_chat_service import RagChatService
 
 from app.services.tool_service import ToolService
@@ -77,6 +78,7 @@ class AgentService:
         self.llm_model_service = llm_model_service
         self.event_bus = event_bus
         self.memory_store = memory_store
+        self.persona_prompt_builder = PersonaPromptBuilder(memory_store=memory_store)
         self.plugin_manager = plugin_manager
 
     # ------------------------------------------------------------------
@@ -1302,19 +1304,14 @@ class AgentService:
         space_id: str | None = None,
         include_memory: bool = True,
     ) -> list[dict[str, object]]:
-        memory_blocks = self._build_memory_prompt_blocks(
+        persona = self.persona_prompt_builder.build(
+            system_prompt=system_prompt,
             team_id=team_id, user_id=user_id, space_id=space_id,
             include_memory=include_memory,
         )
 
-        system = (system_prompt or "").strip()
-        if not system:
-            system = "You are CaiBao, an enterprise operations agent. Use tools when appropriate and answer based on available data."
-        if memory_blocks:
-            system = system + "\n\n" + memory_blocks
-
         messages: list[dict[str, object]] = [
-            {"role": "system", "content": system},
+            {"role": "system", "content": persona.system_prompt},
             {"role": "user", "content": task},
         ]
         if rag_answer.strip():

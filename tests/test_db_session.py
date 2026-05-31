@@ -157,3 +157,62 @@ def test_ensure_phase1_columns_normalizes_legacy_agent_runs_table(tmp_path, monk
     assert not {"current_step", "result_summary", "error_message", "updated_at"} & columns
     assert {"final_answer", "dry_run", "request_payload_json", "completed_at"} <= columns
     assert row_count == 2
+
+
+def test_ensure_phase1_columns_adds_memory_source_ref_columns(tmp_path, monkeypatch):
+    db_file = tmp_path / "legacy-memory-cards.db"
+    database_url = f"sqlite:///{db_file.resolve().as_posix()}"
+    engine = create_engine(database_url, future=True)
+    try:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                """
+                CREATE TABLE memory_cards (
+                    memory_id VARCHAR(36) NOT NULL PRIMARY KEY,
+                    team_id VARCHAR(64) NOT NULL,
+                    space_id VARCHAR(36),
+                    user_id VARCHAR(64) NOT NULL,
+                    scope_level VARCHAR(16) NOT NULL DEFAULT 'space',
+                    category VARCHAR(32) NOT NULL DEFAULT 'fact',
+                    title VARCHAR(128) NOT NULL,
+                    content TEXT NOT NULL,
+                    summary TEXT,
+                    weight FLOAT NOT NULL DEFAULT 0.8,
+                    status VARCHAR(16) NOT NULL DEFAULT 'active',
+                    confidence FLOAT NOT NULL DEFAULT 0.8,
+                    source_message_id VARCHAR(36),
+                    source_document_id VARCHAR(36),
+                    expires_at DATETIME,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL
+                )
+                """
+            )
+            connection.exec_driver_sql(
+                """
+                INSERT INTO memory_cards (
+                    memory_id, team_id, user_id, title, content
+                )
+                VALUES ('memory-old', 'team-a', 'user-a', 'Old', 'legacy card')
+                """
+            )
+
+        monkeypatch.setattr(session_module, "engine", engine)
+        session_module._ensure_phase1_columns()
+
+        with engine.begin() as connection:
+            inspector = inspect(connection)
+            columns = {col["name"] for col in inspector.get_columns("memory_cards")}
+            indexes = {idx["name"] for idx in inspector.get_indexes("memory_cards")}
+            memory_type = connection.exec_driver_sql(
+                "SELECT memory_type FROM memory_cards WHERE memory_id = 'memory-old'"
+            ).scalar_one()
+    finally:
+        engine.dispose()
+
+    assert {"source_ref", "memory_type"} <= columns
+    assert memory_type == "card"
+    assert {
+        "ix_memory_cards_source_ref",
+        "ix_memory_cards_team_user_space_ref_type",
+    } <= indexes

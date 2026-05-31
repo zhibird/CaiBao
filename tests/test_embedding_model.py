@@ -36,8 +36,11 @@ def test_embedding_model_config_is_isolated_by_account(client) -> None:
 
     list_a = client.get("/api/v1/embedding/models")
     assert list_a.status_code == 200
-    assert len(list_a.json()["items"]) == 1
-    assert list_a.json()["items"][0]["model_name"] == "text-embedding-3-small"
+    list_a_body = list_a.json()
+    assert list_a_body["default_model"]["model_name"] == "hashing_v1"
+    assert list_a_body["default_model"]["provider"] == "mock"
+    assert len(list_a_body["items"]) == 1
+    assert list_a_body["items"][0]["model_name"] == "text-embedding-3-small"
 
     logout = client.post("/api/v1/auth/logout")
     assert logout.status_code == 204

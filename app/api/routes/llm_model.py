@@ -1,9 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.api.deps import get_llm_model_service, require_current_active_user
+from app.core.config import get_settings
 from app.core.exceptions import DomainValidationError, EntityNotFoundError
 from app.models.user import User
 from app.schemas.llm_model import (
+    LLMDefaultModelItem,
     LLMModelConfigItem,
     LLMModelConfigListResponse,
     LLMModelConfigUpsertRequest,
@@ -31,6 +33,7 @@ def list_llm_models(
     return LLMModelConfigListResponse(
         team_id=current_user.team_id,
         user_id=current_user.user_id,
+        default_model=_build_default_model_item(llm_model_service),
         items=[
             LLMModelConfigItem(
                 config_id=item.config_id,
@@ -45,6 +48,18 @@ def list_llm_models(
             )
             for item in items
         ],
+    )
+
+
+def _build_default_model_item(llm_model_service: LLMModelService) -> LLMDefaultModelItem:
+    settings = get_settings()
+    api_key = settings.llm_api_key or ""
+    return LLMDefaultModelItem(
+        model_name=settings.llm_model,
+        provider=settings.llm_provider,
+        base_url=settings.llm_base_url,
+        has_api_key=bool(api_key.strip()),
+        masked_api_key=llm_model_service.mask_api_key(api_key),
     )
 
 

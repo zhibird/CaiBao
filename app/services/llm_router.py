@@ -63,13 +63,13 @@ class LLMRouter:
             role_key="fast",
             explicit_route=req_routes.get("fast"),
             app_route=app_routing.get("fast"),
-            fallback_model=planner.model_name,
+            fallback_model=self.settings.llm_fast_model or planner.model_name,
         )
         vision = self._resolve_role(
             role_key="vision",
             explicit_route=req_routes.get("vision"),
             app_route=app_routing.get("vision"),
-            fallback_model=planner.model_name,
+            fallback_model=self.settings.llm_vl_model or planner.model_name,
         )
 
         return {"planner": planner, "fast": fast, "vision": vision}
@@ -83,33 +83,33 @@ class LLMRouter:
         fallback_model: str | None,
     ) -> ModelRoute:
         # 1. Explicit per-request route
-        route = self._parse_route_value(explicit_route)
+        route = self._parse_route_value(explicit_route, role_key=role_key)
         if route is not None:
             return route
 
         # 2. Per-app routing config
-        route = self._parse_route_value(app_route)
+        route = self._parse_route_value(app_route, role_key=role_key)
         if route is not None:
             return route
 
         # 3. Fallback to the given model name or global default
         if fallback_model:
-            return self._build_default_route(fallback_model)
-        return self._build_default_route(self.settings.llm_model)
+            return self._build_default_route(fallback_model, role_key=role_key)
+        return self._global_route(role_key=role_key)
 
-    def _parse_route_value(self, raw: Any) -> ModelRoute | None:
+    def _parse_route_value(self, raw: Any, *, role_key: str) -> ModelRoute | None:
         if raw is None:
             return None
         if isinstance(raw, str) and raw.strip():
-            return self._build_default_route(raw.strip())
+            return self._build_default_route(raw.strip(), role_key=role_key)
         if isinstance(raw, dict) and raw.get("model_name"):
             return self._build_route_from_dict(raw)
         return None
 
-    def _build_default_route(self, model_name: str) -> ModelRoute:
+    def _build_default_route(self, model_name: str, *, role_key: str = "planner") -> ModelRoute:
         normalized = model_name.strip().lower()
         if normalized in {"default", "none", ""}:
-            return self._global_route()
+            return self._global_route(role_key=role_key)
 
         # Look up user-configured model
         from app.core.exceptions import EntityNotFoundError
@@ -130,12 +130,14 @@ class LLMRouter:
             )
 
         # Use name as-is with global defaults (empty base_url/api_key
-        # so _resolve_runtime falls through to global settings).
+        # so _resolve_runtime falls through to global settings when no
+        # role-specific TOML profile is configured).
+        role_base_url, role_api_key, source = self._role_runtime_defaults(role_key)
         return ModelRoute(
             model_name=model_name,
-            base_url="",
-            api_key="",
-            source="direct_name",
+            base_url=role_base_url,
+            api_key=role_api_key,
+            source=source,
             capabilities={"supports_tools": True},
         )
 
@@ -156,14 +158,64 @@ class LLMRouter:
             capabilities=capabilities,
         )
 
-    def _global_route(self) -> ModelRoute:
+    def _global_route(self, *, role_key: str = "planner") -> ModelRoute:
+        if role_key == "fast" and self.settings.llm_fast_model.strip():
+            base_url, api_key, _ = self._role_runtime_defaults("fast")
+            return ModelRoute(
+                model_name=self.settings.llm_fast_model,
+                base_url=base_url,
+                api_key=api_key,
+                source="global_fast_settings",
+                capabilities={"supports_tools": True},
+            )
+        if role_key == "vision" and self.settings.llm_vl_model.strip():
+            base_url, api_key, _ = self._role_runtime_defaults("vision")
+            return ModelRoute(
+                model_name=self.settings.llm_vl_model,
+                base_url=base_url,
+                api_key=api_key,
+                source="global_vision_settings",
+                capabilities={"supports_vision": True},
+            )
+        base_url, api_key = self._runtime_pair(self.settings.llm_base_url, self.settings.llm_api_key)
         return ModelRoute(
             model_name=self.settings.llm_model,
-            base_url=self.settings.llm_base_url,
-            api_key=self.settings.llm_api_key,
+            base_url=base_url,
+            api_key=api_key,
             source="global_settings",
             capabilities={"supports_tools": True},
         )
+
+    def _role_runtime_defaults(self, role_key: str) -> tuple[str, str | None, str]:
+        if role_key == "fast":
+            base_url, api_key = self._runtime_pair(
+                self.settings.llm_fast_base_url or self.settings.llm_base_url,
+                self.settings.llm_fast_api_key or self.settings.llm_api_key,
+            )
+            return (
+                base_url,
+                api_key,
+                "direct_name_fast_settings" if self.settings.llm_fast_model.strip() else "direct_name",
+            )
+        if role_key == "vision":
+            base_url, api_key = self._runtime_pair(
+                self.settings.llm_vl_base_url or self.settings.llm_base_url,
+                self.settings.llm_vl_api_key or self.settings.llm_api_key,
+            )
+            return (
+                base_url,
+                api_key,
+                "direct_name_vision_settings" if self.settings.llm_vl_model.strip() else "direct_name",
+            )
+        return "", "", "direct_name"
+
+    @staticmethod
+    def _runtime_pair(base_url: str | None, api_key: str | None) -> tuple[str, str]:
+        normalized_base_url = (base_url or "").strip()
+        normalized_api_key = (api_key or "").strip()
+        if not normalized_base_url or not normalized_api_key:
+            return "", ""
+        return normalized_base_url, normalized_api_key
 
     @staticmethod
     def routes_snapshot(routes: dict[str, ModelRoute]) -> dict[str, Any]:

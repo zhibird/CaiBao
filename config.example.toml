@@ -1,0 +1,46 @@
+# Copy this file to config.toml and fill your real keys locally.
+# Environment references such as "${DEEPSEEK_API_KEY}" are supported.
+
+[llm]
+provider = "deepseek"
+
+[llm.main]
+model = "deepseek-v4-flash"
+api_key = "${DEEPSEEK_API_KEY}"
+base_url = "https://api.deepseek.com/v1"
+enable_thinking = true
+multimodal = false
+
+[llm.fast]
+model = "qwen-flash"
+api_key = "${DASHSCOPE_API_KEY}"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+[llm.vl]
+model = "qwen-vl-plus"
+api_key = "${DASHSCOPE_API_KEY}"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+[agent]
+system_prompt = "You are CaiBao, a helpful AI assistant with access to tools. Always respond in the same language the user uses."
+max_tokens = 8192
+max_iterations = 40
+dev_mode = false
+
+# Akashic-style persona: the stable assistant self-model is stored per workspace
+# in memory/SELF.md and injected together with MEMORY.md / RECENT_CONTEXT.md.
+
+[agent.context]
+memory_window = 40
+
+[agent.tools]
+search_enabled = true
+
+[memory]
+enabled = true
+engine = ""
+
+[memory.embedding]
+model = "text-embedding-v3"
+api_key = "${DASHSCOPE_API_KEY}"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"

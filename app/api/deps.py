@@ -426,6 +426,7 @@ def get_rag_chat_service(
         llm_service=llm_service,
         llm_model_service=llm_model_service,
         enhanced_retrieval=enhanced,
+        memory_store=_get_memory_store(),
     )
 
 
@@ -455,9 +456,10 @@ def _get_consolidation_service(llm_service=None):
     if _consolidation_svc_singleton is None or llm_service is not None:
         from app.services.memory_consolidation_service import MemoryConsolidationService
         from app.core.config import get_settings as _gs
-        model = _gs().llm_model or ""
-        base = _gs().llm_base_url or ""
-        key = _gs().llm_api_key or ""
+        settings = _gs()
+        model = settings.llm_fast_model or settings.llm_model or ""
+        base = settings.llm_fast_base_url or settings.llm_base_url or ""
+        key = settings.llm_fast_api_key or settings.llm_api_key or ""
         if not base or not key:
             model = base = key = ""  # let LLMService use provider defaults
         if _consolidation_svc_singleton is None:

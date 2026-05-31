@@ -11,6 +11,7 @@ import httpx
 
 from app.core.config import Settings, get_settings
 from app.core.exceptions import DomainValidationError
+from app.services.persona_prompt import DEFAULT_AGENT_SYSTEM_PROMPT
 from app.services.model_base_url import normalize_openai_compatible_base_url
 
 
@@ -73,6 +74,27 @@ class LLMService:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
 
+    def _resolve_vision_runtime_override(
+        self,
+        *,
+        model: str | None,
+        base_url: str | None,
+        api_key: str | None,
+        image_attachments: list[VisionAttachment] | None,
+    ) -> tuple[str | None, str | None, str | None]:
+        if not image_attachments or model or base_url or api_key or self.settings.llm_multimodal:
+            return model, base_url, api_key
+
+        vl_model = self.settings.llm_vl_model.strip()
+        if not vl_model:
+            return model, base_url, api_key
+
+        role_base_url = (self.settings.llm_vl_base_url or self.settings.llm_base_url or "").strip()
+        role_api_key = (self.settings.llm_vl_api_key or self.settings.llm_api_key or "").strip()
+        if role_base_url and role_api_key:
+            return vl_model, role_base_url, role_api_key
+        return vl_model, None, None
+
     def answer_question(
         self,
         question: str,
@@ -83,10 +105,17 @@ class LLMService:
         force_mock: bool = False,
         image_attachments: list[VisionAttachment] | None = None,
         conversation_messages: list[dict[str, object]] | None = None,
+        system_prompt: str | None = None,
     ) -> LLMAnswer:
         if force_mock:
             return self._mock_answer(question=question, hits=hits)
 
+        model, base_url, api_key = self._resolve_vision_runtime_override(
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            image_attachments=image_attachments,
+        )
         runtime = self._resolve_runtime(base_url=base_url, api_key=api_key)
         if runtime is None:
             return self._mock_answer(question=question, hits=hits)
@@ -99,6 +128,7 @@ class LLMService:
             api_key=runtime[1],
             image_attachments=image_attachments,
             conversation_messages=conversation_messages,
+            system_prompt=system_prompt,
         )
 
     def answer_chat(
@@ -111,11 +141,18 @@ class LLMService:
         image_attachments: list[VisionAttachment] | None = None,
         fallback_text_context: str | None = None,
         conversation_messages: list[dict[str, object]] | None = None,
+        system_prompt: str | None = None,
     ) -> LLMAnswer:
         """General chat answer without retrieval context."""
         if force_mock:
             return self._mock_chat_answer(message=message)
 
+        model, base_url, api_key = self._resolve_vision_runtime_override(
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            image_attachments=image_attachments,
+        )
         runtime = self._resolve_runtime(base_url=base_url, api_key=api_key)
         if runtime is None:
             return self._mock_chat_answer(message=message)
@@ -128,6 +165,7 @@ class LLMService:
             image_attachments=image_attachments,
             fallback_text_context=fallback_text_context,
             conversation_messages=conversation_messages,
+            system_prompt=system_prompt,
         )
 
     # ------------------------------------------------------------------
@@ -552,21 +590,28 @@ class LLMService:
         api_key: str = "",
         image_attachments: list[VisionAttachment] | None = None,
         conversation_messages: list[dict[str, object]] | None = None,
+        system_prompt: str | None = None,
     ) -> LLMAnswer:
         context = self._build_context(hits)
 
-        system_prompt = (
-            "You are CaiBao, an enterprise assistant. Use prior conversation only to resolve references and user intent. "
-            "Answer strictly based on the provided context for factual claims. If context is insufficient, say so explicitly."
+        base_prompt = self._resolve_system_prompt(system_prompt)
+        resolved_system_prompt = (
+            f"{base_prompt}\n\n---\n\n"
+            "## Retrieval Rules\n\n"
+            "Use prior conversation only to resolve references and user intent. "
+            "Answer strictly based on the provided context for factual claims. "
+            "If context is insufficient, say so explicitly."
         )
         if image_attachments:
-            system_prompt += " Attached images are primary evidence when relevant. Use context as supporting material."
+            resolved_system_prompt += (
+                " Attached images are primary evidence when relevant. Use context as supporting material."
+            )
         user_prompt = f"Question:\n{question}\n\nContext:\n{context}"
 
         try:
             return self._request_chat_answer(
                 model=model,
-                system_prompt=system_prompt,
+                system_prompt=resolved_system_prompt,
                 user_prompt=user_prompt,
                 base_url=base_url,
                 api_key=api_key,
@@ -577,7 +622,7 @@ class LLMService:
             if image_attachments and self._should_retry_without_images(str(exc)):
                 return self._request_chat_answer(
                     model=model,
-                    system_prompt=system_prompt,
+                    system_prompt=resolved_system_prompt,
                     user_prompt=user_prompt,
                     base_url=base_url,
                     api_key=api_key,
@@ -595,12 +640,13 @@ class LLMService:
         image_attachments: list[VisionAttachment] | None = None,
         fallback_text_context: str | None = None,
         conversation_messages: list[dict[str, object]] | None = None,
+        system_prompt: str | None = None,
     ) -> LLMAnswer:
-        system_prompt = "You are CaiBao, a helpful enterprise assistant."
+        resolved_system_prompt = self._resolve_system_prompt(system_prompt)
         try:
             return self._request_chat_answer(
                 model=model,
-                system_prompt=system_prompt,
+                system_prompt=resolved_system_prompt,
                 user_prompt=message,
                 base_url=base_url,
                 api_key=api_key,
@@ -615,7 +661,7 @@ class LLMService:
                 )
                 return self._request_chat_answer(
                     model=model,
-                    system_prompt=system_prompt,
+                    system_prompt=resolved_system_prompt,
                     user_prompt=fallback_prompt,
                     base_url=base_url,
                     api_key=api_key,
@@ -623,6 +669,9 @@ class LLMService:
                     conversation_messages=conversation_messages,
                 )
             raise
+
+    def _resolve_system_prompt(self, override: str | None = None) -> str:
+        return (override or "").strip() or self.settings.agent_system_prompt.strip() or DEFAULT_AGENT_SYSTEM_PROMPT
 
     def _build_payload(
         self,
@@ -640,6 +689,8 @@ class LLMService:
             "temperature": self.settings.llm_temperature,
             "max_tokens": self.settings.llm_max_tokens,
         }
+        if self.settings.llm_enable_thinking and selected_model == self.settings.llm_model:
+            payload["enable_thinking"] = True
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice

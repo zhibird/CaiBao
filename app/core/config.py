@@ -1,7 +1,10 @@
 import os
+import re
 import sys
+import tomllib
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -26,6 +29,133 @@ def _default_runtime_root() -> Path:
 DEFAULT_RUNTIME_ROOT = _default_runtime_root()
 DEFAULT_UPLOAD_ROOT_DIR = str(DEFAULT_RUNTIME_ROOT / "uploads")
 
+_ENV_REF_RE = re.compile(r"\$\{(?P<name>[A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _resolve_config_toml_path() -> Path:
+    raw = (
+        os.environ.get("CONFIG_TOML_PATH")
+        or os.environ.get("CAIBAO_CONFIG_TOML")
+        or "config.toml"
+    ).strip()
+    path = Path(raw).expanduser()
+    if path.is_absolute():
+        return path
+    return PROJECT_ROOT / path
+
+
+def _expand_toml_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _ENV_REF_RE.sub(lambda match: os.environ.get(match.group("name"), ""), value)
+    if isinstance(value, dict):
+        return {key: _expand_toml_value(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_expand_toml_value(child) for child in value]
+    return value
+
+
+def _toml_table(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _copy_toml_fields(source: dict[str, Any], target: dict[str, Any], mapping: dict[str, str]) -> None:
+    for source_key, target_key in mapping.items():
+        if source_key in source:
+            target[target_key] = source[source_key]
+
+
+def _load_config_toml_settings() -> dict[str, Any]:
+    path = _resolve_config_toml_path()
+    if not path.exists():
+        return {}
+
+    with path.open("rb") as file:
+        data = _expand_toml_value(tomllib.load(file))
+
+    settings: dict[str, Any] = {"config_toml_path": str(path)}
+
+    llm = _toml_table(data.get("llm"))
+    llm_main = _toml_table(llm.get("main"))
+    llm_fast = _toml_table(llm.get("fast"))
+    llm_vl = _toml_table(llm.get("vl"))
+
+    provider = llm_main.get("provider", llm.get("provider"))
+    if provider is not None:
+        settings["llm_provider"] = provider
+    _copy_toml_fields(
+        llm_main,
+        settings,
+        {
+            "model": "llm_model",
+            "base_url": "llm_base_url",
+            "api_key": "llm_api_key",
+            "temperature": "llm_temperature",
+            "max_tokens": "llm_max_tokens",
+            "timeout_seconds": "llm_timeout_seconds",
+            "enable_thinking": "llm_enable_thinking",
+            "multimodal": "llm_multimodal",
+        },
+    )
+    _copy_toml_fields(
+        llm_fast,
+        settings,
+        {
+            "model": "llm_fast_model",
+            "base_url": "llm_fast_base_url",
+            "api_key": "llm_fast_api_key",
+        },
+    )
+    _copy_toml_fields(
+        llm_vl,
+        settings,
+        {
+            "model": "llm_vl_model",
+            "base_url": "llm_vl_base_url",
+            "api_key": "llm_vl_api_key",
+        },
+    )
+
+    agent = _toml_table(data.get("agent"))
+    _copy_toml_fields(
+        agent,
+        settings,
+        {
+            "system_prompt": "agent_system_prompt",
+            "max_tokens": "llm_max_tokens",
+            "max_iterations": "agent_max_iterations",
+            "dev_mode": "agent_dev_mode",
+        },
+    )
+    agent_context = _toml_table(agent.get("context"))
+    _copy_toml_fields(agent_context, settings, {"memory_window": "llm_history_turns"})
+    agent_tools = _toml_table(agent.get("tools"))
+    _copy_toml_fields(agent_tools, settings, {"search_enabled": "web_tools_enabled"})
+
+    memory = _toml_table(data.get("memory"))
+    _copy_toml_fields(
+        memory,
+        settings,
+        {
+            "enabled": "memory_enabled",
+            "engine": "memory_engine",
+        },
+    )
+    memory_embedding = _toml_table(memory.get("embedding"))
+    _copy_toml_fields(
+        memory_embedding,
+        settings,
+        {
+            "provider": "embedding_provider",
+            "model": "embedding_model",
+            "base_url": "embedding_base_url",
+            "api_key": "embedding_api_key",
+            "batch_size": "embedding_batch_size",
+            "timeout_seconds": "embedding_timeout_seconds",
+        },
+    )
+
+    return settings
+
 
 class Settings(BaseSettings):
     app_name: str = "CaiBao"
@@ -47,11 +177,20 @@ class Settings(BaseSettings):
     dev_admin_account_id: str = "dev_admin"
     dev_admin_display_name: str = "Developer Admin"
     dev_admin_token: str = "dev-admin-token"
+    config_toml_path: str = "config.toml"
 
     llm_provider: str = "mock"
     llm_base_url: str = "https://api.openai.com/v1"
     llm_api_key: str | None = None
     llm_model: str = "gpt-4.1-mini"
+    llm_enable_thinking: bool = False
+    llm_multimodal: bool = True
+    llm_fast_model: str = ""
+    llm_fast_base_url: str = ""
+    llm_fast_api_key: str | None = None
+    llm_vl_model: str = ""
+    llm_vl_base_url: str = ""
+    llm_vl_api_key: str | None = None
     llm_temperature: float = 0.2
     llm_max_tokens: int = 2048
     llm_timeout_seconds: float = 30.0
@@ -65,6 +204,14 @@ class Settings(BaseSettings):
     embedding_mock_dim: int = 256
     embedding_batch_size: int = 32
     embedding_timeout_seconds: float = 30.0
+
+    agent_system_prompt: str = (
+        "You are CaiBao, a helpful AI assistant with access to tools. "
+        "Always respond in the same language the user uses."
+    )
+    agent_max_iterations: int = 40
+    agent_dev_mode: bool = False
+
     upload_root_dir: str = DEFAULT_UPLOAD_ROOT_DIR
     upload_max_file_size_mb: int = 20
     db_legacy_init_enabled: bool | None = None
@@ -96,6 +243,8 @@ class Settings(BaseSettings):
     mcp_max_output_bytes: int = 200_000
 
     # Markdown memory
+    memory_enabled: bool = True
+    memory_engine: str = ""
     memory_markdown_enabled: bool = True
     memory_root_dir: str = "data/memory"
     memory_consolidation_min_turns: int = 4
@@ -152,9 +301,11 @@ class Settings(BaseSettings):
         dotenv_settings,
         file_secret_settings,
     ):
-        # Keep standard priority: init args > env vars > .env > file secrets.
+        # Keep real environment variables highest, while allowing config.toml
+        # to override the legacy project .env defaults.
+        # init args > env vars > config.toml > .env > file secrets.
         # Root .env path is fixed via model_config.env_file above.
-        return init_settings, env_settings, dotenv_settings, file_secret_settings
+        return init_settings, env_settings, _load_config_toml_settings, dotenv_settings, file_secret_settings
 
     @field_validator("auth_cookie_domain", mode="before")
     @classmethod

@@ -34,12 +34,29 @@ class MemoryMarkdownStore:
     Directory layout::
 
         {root}/{team_id}/{user_id}/{space_id or "global"}/
+            SELF.md
             MEMORY.md
             HISTORY.md
             RECENT_CONTEXT.md
             PENDING.md
             journal/YYYY-MM-DD.md
     """
+
+    DEFAULT_SELF_MD = """# CaiBao 的自我认知
+
+## 人格与形象
+- 我是 CaiBao，一个温和、可靠、主动参与思考的长期协作伙伴。
+- 我优先给出清晰结论，再补充必要细节；不把自己伪装成没有立场的工具。
+- 我可以轻松一点、聪明一点，但不喧宾夺主；颜文字只在合适时少量使用。
+
+## 我对当前用户的理解
+- 我会从长期记忆和近期上下文中逐步形成对当前用户的理解。
+- 没有证据时不编造画像；用户当前这轮明确表达永远优先于旧记忆。
+
+## 我们关系的定义
+- 我与当前用户的关系以透明、尊重边界和持续协作为基础。
+- 我会尽量帮用户把事情推进，而不是只做礼貌的问答机器。
+"""
 
     def __init__(self, root_dir: str | None = None) -> None:
         self.root = Path(root_dir or get_settings().memory_root_dir).resolve()
@@ -68,11 +85,33 @@ class MemoryMarkdownStore:
         d.mkdir(parents=True, exist_ok=True)
         journal = d / "journal"
         journal.mkdir(exist_ok=True)
-        for name in ("MEMORY.md", "HISTORY.md", "RECENT_CONTEXT.md", "PENDING.md"):
+        default_contents = {
+            "SELF.md": self.DEFAULT_SELF_MD,
+            "MEMORY.md": "",
+            "HISTORY.md": "",
+            "RECENT_CONTEXT.md": "",
+            "PENDING.md": "",
+        }
+        for name, default_content in default_contents.items():
             f = d / name
             if not f.exists():
-                f.write_text("", encoding="utf-8")
+                f.write_text(default_content, encoding="utf-8")
         return d
+
+    # ------------------------------------------------------------------
+    # SELF.md — assistant self-model / relationship understanding
+    # ------------------------------------------------------------------
+
+    def read_self_model(self, team_id: str, user_id: str, space_id: str | None) -> str:
+        f = self._workspace_dir(team_id, user_id, space_id) / "SELF.md"
+        if not f.exists():
+            return ""
+        return f.read_text("utf-8").strip()
+
+    def write_self_model(self, team_id: str, user_id: str, space_id: str | None, text: str) -> None:
+        d = self._workspace_dir(team_id, user_id, space_id)
+        f = d / "SELF.md"
+        self._atomic_write(f, text.strip() + "\n")
 
     # ------------------------------------------------------------------
     # MEMORY.md — long-term facts / preferences

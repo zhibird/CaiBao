@@ -170,6 +170,20 @@ def _ensure_agent_steps_columns(step_cols: set) -> None:
     _add_col("agent_steps", "latency_ms", "INTEGER", step_cols)
 
 
+def _ensure_memory_card_columns(memory_cols: set) -> None:
+    _add_col("memory_cards", "source_ref", "VARCHAR(128)", memory_cols)
+    _add_col("memory_cards", "memory_type", "VARCHAR(32) NOT NULL DEFAULT 'card'", memory_cols)
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_memory_cards_source_ref "
+            "ON memory_cards(source_ref)"
+        )
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_memory_cards_team_user_space_ref_type "
+            "ON memory_cards(team_id, user_id, space_id, source_ref, memory_type)"
+        )
+
+
 def _add_col(table: str, col: str, typedef: str, existing: set) -> None:
     if col not in existing:
         with engine.begin() as conn:
@@ -393,6 +407,10 @@ def _ensure_phase1_columns() -> None:
     if "agent_steps" in table_names:
         step_cols = {item["name"] for item in inspector.get_columns("agent_steps")}
         _ensure_agent_steps_columns(step_cols)
+
+    if "memory_cards" in table_names:
+        memory_cols = {item["name"] for item in inspector.get_columns("memory_cards")}
+        _ensure_memory_card_columns(memory_cols)
 
     if "documents" in table_names:
         document_cols = {item["name"] for item in inspector.get_columns("documents")}

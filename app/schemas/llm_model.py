@@ -25,8 +25,17 @@ class LLMModelConfigItem(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class LLMDefaultModelItem(BaseModel):
+    model_name: str
+    provider: str
+    base_url: str
+    has_api_key: bool
+    masked_api_key: str
+
+
 class LLMModelConfigListResponse(BaseModel):
     team_id: str
     user_id: str
+    default_model: LLMDefaultModelItem
     items: list[LLMModelConfigItem]
 

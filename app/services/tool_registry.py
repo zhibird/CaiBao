@@ -181,6 +181,82 @@ AGENT_TOOL_DEFINITIONS = {
         },
         output_schema={"type": "object", "properties": {"conclusion": {"type": "object"}}},
     ),
+    "forget_memory": ToolDefinition(
+        name="forget_memory",
+        display_name="删除记忆",
+        description=(
+            "Delete a memory card by its memory_id. "
+            "Use this to remove outdated, incorrect, or irrelevant memories. "
+            "The memory_id can be found from recall_memory results."
+        ),
+        dangerous=True,
+        handler_key="builtin.forget_memory",
+        permission_scope="space",
+        input_schema={
+            "type": "object",
+            "required": ["memory_id"],
+            "properties": {
+                "memory_id": {"type": "string", "minLength": 1, "maxLength": 36},
+            },
+        },
+        output_schema={"type": "object", "properties": {"message": {"type": "string"}}},
+    ),
+    "recall_memory": ToolDefinition(
+        name="recall_memory",
+        display_name="检索记忆",
+        description=(
+            "Semantically search the workspace memory cards by query text. "
+            "Returns memory cards ranked by relevance. Useful for recalling "
+            "past decisions, user preferences, or previously stored facts. "
+            "Use this before answering questions that may have been addressed before."
+        ),
+        dangerous=False,
+        handler_key="builtin.recall_memory",
+        permission_scope="space",
+        input_schema={
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {"type": "string", "minLength": 1, "maxLength": 1000},
+                "space_id": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+            },
+        },
+        output_schema={
+            "type": "object",
+            "properties": {
+                "memories": {"type": "array"},
+                "query": {"type": "string"},
+                "count": {"type": "integer"},
+            },
+        },
+    ),
+    "message_lookup": ToolDefinition(
+        name="message_lookup",
+        display_name="查看聊天记录",
+        description=(
+            "Look up recent chat messages in the current conversation. "
+            "Use this when you need context from earlier in the conversation "
+            "or when the user asks about something previously discussed."
+        ),
+        dangerous=False,
+        handler_key="builtin.message_lookup",
+        permission_scope="team",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "conversation_id": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+            },
+        },
+        output_schema={
+            "type": "object",
+            "properties": {
+                "messages": {"type": "array"},
+                "count": {"type": "integer"},
+            },
+        },
+    ),
     "generate_incident_report": ToolDefinition(
         name="generate_incident_report",
         display_name="生成事件报告",

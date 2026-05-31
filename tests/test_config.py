@@ -4,6 +4,26 @@ from pydantic import ValidationError
 from app.core.config import DEFAULT_UPLOAD_ROOT_DIR, Settings
 
 
+def _clear_model_env(monkeypatch):
+    for key in (
+        "LLM_PROVIDER",
+        "LLM_BASE_URL",
+        "LLM_API_KEY",
+        "LLM_MODEL",
+        "LLM_FAST_MODEL",
+        "LLM_FAST_BASE_URL",
+        "LLM_FAST_API_KEY",
+        "LLM_VL_MODEL",
+        "LLM_VL_BASE_URL",
+        "LLM_VL_API_KEY",
+        "EMBEDDING_PROVIDER",
+        "EMBEDDING_BASE_URL",
+        "EMBEDDING_API_KEY",
+        "EMBEDDING_MODEL",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
 def test_settings_requires_database_url(monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)
 
@@ -45,6 +65,123 @@ def test_blank_auth_cookie_domain_normalizes_to_none(monkeypatch):
     settings = Settings(_env_file=None)
 
     assert settings.auth_cookie_domain is None
+
+
+def test_config_toml_populates_model_profiles(monkeypatch, tmp_path):
+    _clear_model_env(monkeypatch)
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///config-toml.db")
+    monkeypatch.setenv("DEEPSEEK_KEY", "sk-deepseek")
+    monkeypatch.setenv("DASHSCOPE_KEY", "sk-dashscope")
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[llm]
+provider = "deepseek"
+
+[llm.main]
+model = "deepseek-v4-flash"
+api_key = "${DEEPSEEK_KEY}"
+base_url = "https://api.deepseek.com/v1"
+enable_thinking = true
+multimodal = false
+
+[llm.fast]
+model = "qwen-flash"
+api_key = "${DASHSCOPE_KEY}"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+[llm.vl]
+model = "qwen-vl-plus"
+api_key = "${DASHSCOPE_KEY}"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+[agent]
+system_prompt = "You are CaiBao."
+max_tokens = 8192
+max_iterations = 40
+dev_mode = true
+
+[agent.context]
+memory_window = 40
+
+[memory.embedding]
+model = "text-embedding-v3"
+api_key = "${DASHSCOPE_KEY}"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CONFIG_TOML_PATH", str(config_path))
+
+    settings = Settings(_env_file=None)
+
+    assert settings.llm_provider == "deepseek"
+    assert settings.llm_model == "deepseek-v4-flash"
+    assert settings.llm_api_key == "sk-deepseek"
+    assert settings.llm_enable_thinking is True
+    assert settings.llm_multimodal is False
+    assert settings.llm_fast_model == "qwen-flash"
+    assert settings.llm_fast_api_key == "sk-dashscope"
+    assert settings.llm_vl_model == "qwen-vl-plus"
+    assert settings.agent_system_prompt == "You are CaiBao."
+    assert settings.llm_max_tokens == 8192
+    assert settings.agent_max_iterations == 40
+    assert settings.agent_dev_mode is True
+    assert settings.llm_history_turns == 40
+    assert settings.embedding_model == "text-embedding-v3"
+    assert settings.embedding_api_key == "sk-dashscope"
+
+
+def test_env_overrides_config_toml(monkeypatch, tmp_path):
+    _clear_model_env(monkeypatch)
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///config-toml.db")
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[llm.main]
+model = "from-toml"
+base_url = "https://toml.example/v1"
+api_key = "toml-key"
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CONFIG_TOML_PATH", str(config_path))
+    monkeypatch.setenv("LLM_MODEL", "from-env")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.llm_model == "from-env"
+    assert settings.llm_base_url == "https://toml.example/v1"
+
+
+def test_config_toml_overrides_dotenv_defaults(monkeypatch, tmp_path):
+    _clear_model_env(monkeypatch)
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+[llm.main]
+model = "from-toml"
+api_key = "${MISSING_LLM_KEY}"
+""",
+        encoding="utf-8",
+    )
+    dotenv_path = tmp_path / ".env"
+    dotenv_path.write_text(
+        """
+DATABASE_URL=sqlite:///dotenv-defaults.db
+LLM_MODEL=from-dotenv
+LLM_API_KEY=dotenv-key
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CONFIG_TOML_PATH", str(config_path))
+
+    settings = Settings(_env_file=str(dotenv_path))
+
+    assert settings.database_url == "sqlite:///dotenv-defaults.db"
+    assert settings.llm_model == "from-toml"
+    assert settings.llm_api_key == ""
 
 
 def test_prod_rejects_default_jwt_secret(monkeypatch):

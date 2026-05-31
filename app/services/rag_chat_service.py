@@ -7,6 +7,8 @@ from app.services.llm_model_service import LLMModelService
 from app.services.llm_service import AssistantContentPart, LLMAnswer, LLMService, VisionAttachment
 from app.core.config import get_settings
 from app.services.memory_service import MemoryService
+from app.services.memory_markdown_store import MemoryMarkdownStore
+from app.services.persona_prompt import PersonaPromptBuilder
 from app.services.retrieval_enhancer import EnhancedRetrievalService
 from app.services.retrieval_service import RetrievalService
 from app.services.user_service import UserService
@@ -23,6 +25,7 @@ class RagChatService:
         llm_service: LLMService,
         llm_model_service: LLMModelService,
         enhanced_retrieval: EnhancedRetrievalService | None = None,
+        memory_store: MemoryMarkdownStore | None = None,
     ) -> None:
         self.user_service = user_service
         self.chat_history_service = chat_history_service
@@ -32,6 +35,7 @@ class RagChatService:
         self.llm_service = llm_service
         self.llm_model_service = llm_model_service
         self.enhanced_retrieval = enhanced_retrieval
+        self.persona_prompt_builder = PersonaPromptBuilder(memory_store=memory_store)
 
     def ask(self, payload: ChatAskRequest, *, before_message_id: str | None = None) -> ChatAskResponse:
         self.user_service.ensure_user_in_team(
@@ -85,6 +89,13 @@ class RagChatService:
             embedding_model=payload.embedding_model,
         )
         llm_context_messages = [*conversation_messages, *memory_messages]
+        persona = self.persona_prompt_builder.build(
+            system_prompt=None,
+            team_id=payload.team_id,
+            user_id=payload.user_id,
+            space_id=effective_space_id,
+            include_memory=payload.include_memory,
+        )
 
         requested_model = payload.model.strip() if payload.model else None
         force_mock = False
@@ -127,6 +138,7 @@ class RagChatService:
                 image_attachments=image_attachments,
                 fallback_text_context=fallback_text_context,
                 conversation_messages=llm_context_messages,
+                system_prompt=persona.system_prompt,
             )
             return ChatAskResponse.from_result(
                 user_id=payload.user_id,
@@ -143,13 +155,10 @@ class RagChatService:
             )
 
         if self.enhanced_retrieval:
-            # Use the global default model for retrieval enhancement (not the
-            # per-request user model). In future the LLMRouter fast route can
-            # be resolved here for a dedicated lightweight model.
             settings = get_settings()
-            fast_model = settings.llm_model or runtime_selected_model or ""
-            fast_base = settings.llm_base_url or ""
-            fast_key = settings.llm_api_key or ""
+            fast_model = settings.llm_fast_model or settings.llm_model or runtime_selected_model or ""
+            fast_base = settings.llm_fast_base_url or settings.llm_base_url or ""
+            fast_key = settings.llm_fast_api_key or settings.llm_api_key or ""
             if not fast_base or not fast_key:
                 fast_model = fast_base = fast_key = ""  # let LLMService use defaults
             enhanced = self.enhanced_retrieval.search_chunks_enhanced(
@@ -183,6 +192,7 @@ class RagChatService:
             force_mock=force_mock,
             image_attachments=image_attachments,
             conversation_messages=llm_context_messages,
+            system_prompt=persona.system_prompt,
         )
 
         hits = [RetrievalHit.model_validate(item) for item in raw_hits]

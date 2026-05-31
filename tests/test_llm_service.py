@@ -6,6 +6,7 @@ import httpx
 from app.core.config import Settings
 from app.core.exceptions import DomainValidationError
 from app.services.llm_service import LLMService, VisionAttachment
+from app.services.persona_prompt import DEFAULT_AGENT_SYSTEM_PROMPT
 
 
 class _FakeResponse:
@@ -52,6 +53,7 @@ def test_llm_service_default_uses_env_runtime_when_credentials_exist(monkeypatch
         llm_base_url="https://api.openai.com/v1",
         llm_api_key="sk-test",
         llm_model="gpt-4.1-mini",
+        llm_enable_thinking=False,
     )
     service = LLMService(settings=settings)
 
@@ -64,7 +66,7 @@ def test_llm_service_default_uses_env_runtime_when_credentials_exist(monkeypatch
     assert captured_payload["json"] == {
         "model": "gpt-4.1-mini",
         "messages": [
-            {"role": "system", "content": "You are CaiBao, a helpful enterprise assistant."},
+            {"role": "system", "content": DEFAULT_AGENT_SYSTEM_PROMPT},
             {"role": "user", "content": "hello"},
         ],
         "temperature": settings.llm_temperature,
@@ -112,7 +114,7 @@ def test_llm_service_includes_conversation_history_before_current_user(monkeypat
 
     assert answer.answer == "memory-aware-answer"
     assert captured_payload["json"]["messages"] == [  # type: ignore[index]
-        {"role": "system", "content": "You are CaiBao, a helpful enterprise assistant."},
+        {"role": "system", "content": DEFAULT_AGENT_SYSTEM_PROMPT},
         {"role": "user", "content": "Remember that the project codename is Apollo."},
         {"role": "assistant", "content": "Noted. The project codename is Apollo."},
         {"role": "user", "content": "What project are we discussing?"},
@@ -165,13 +167,13 @@ def test_llm_service_auto_falls_back_to_compat_history_mode(monkeypatch) -> None
     assert answer.answer == "compat-answer"
     assert len(captured_payloads) == 2
     assert captured_payloads[0]["messages"] == [  # type: ignore[index]
-        {"role": "system", "content": "You are CaiBao, a helpful enterprise assistant."},
+        {"role": "system", "content": DEFAULT_AGENT_SYSTEM_PROMPT},
         {"role": "user", "content": "Remember that the project codename is Apollo."},
         {"role": "assistant", "content": "Noted. The project codename is Apollo."},
         {"role": "user", "content": "What project are we discussing?"},
     ]
     assert captured_payloads[1]["messages"] == [  # type: ignore[index]
-        {"role": "system", "content": "You are CaiBao, a helpful enterprise assistant."},
+        {"role": "system", "content": DEFAULT_AGENT_SYSTEM_PROMPT},
         {
             "role": "user",
             "content": (
@@ -277,6 +279,57 @@ def test_llm_service_sends_multimodal_payload_when_images_are_provided(monkeypat
     }
 
 
+def test_llm_service_routes_images_to_vl_profile_when_main_is_text_only(monkeypatch) -> None:
+    captured_payload: dict[str, object] = {}
+
+    def _fake_post(url, headers, json, timeout):  # noqa: ANN001
+        captured_payload["url"] = url
+        captured_payload["headers"] = headers
+        captured_payload["json"] = json
+        return _FakeResponse(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "vl-answer",
+                        }
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr("app.services.llm_service.httpx.post", _fake_post)
+
+    settings = Settings(
+        llm_provider="deepseek",
+        llm_base_url="https://api.deepseek.com/v1",
+        llm_api_key="sk-main",
+        llm_model="deepseek-v4-flash",
+        llm_multimodal=False,
+        llm_vl_model="qwen-vl-plus",
+        llm_vl_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        llm_vl_api_key="sk-vl",
+    )
+    service = LLMService(settings=settings)
+
+    answer = service.answer_chat(
+        "Describe the attached image.",
+        image_attachments=[
+            VisionAttachment(
+                document_id="doc-1",
+                source_name="receipt.png",
+                mime_type="image/png",
+                data_url="data:image/png;base64,AAAA",
+            )
+        ],
+    )
+
+    assert answer.answer == "vl-answer"
+    assert captured_payload["url"] == "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+    assert captured_payload["headers"]["Authorization"] == "Bearer sk-vl"
+    assert captured_payload["json"]["model"] == "qwen-vl-plus"
+
+
 def test_llm_service_falls_back_to_text_when_vision_is_rejected(monkeypatch) -> None:
     captured_payloads: list[dict[str, object]] = []
     call_count = {"count": 0}
@@ -329,6 +382,40 @@ def test_llm_service_falls_back_to_text_when_vision_is_rejected(monkeypatch) -> 
     assert captured_payloads[1]["messages"][1]["content"] == (  # type: ignore[index]
         "Read the attached image.\n\nAttachment text fallback:\n[invoice.png]\nOCR result"
     )
+
+
+def test_llm_service_sends_enable_thinking_for_main_model(monkeypatch) -> None:
+    captured_payload: dict[str, object] = {}
+
+    def _fake_post(url, headers, json, timeout):  # noqa: ANN001
+        captured_payload["json"] = json
+        return _FakeResponse(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "thinking-answer",
+                        }
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr("app.services.llm_service.httpx.post", _fake_post)
+
+    settings = Settings(
+        llm_provider="deepseek",
+        llm_base_url="https://api.deepseek.com/v1",
+        llm_api_key="sk-main",
+        llm_model="deepseek-v4-flash",
+        llm_enable_thinking=True,
+    )
+    service = LLMService(settings=settings)
+
+    result = service.complete_chat(messages=[{"role": "user", "content": "hello"}])
+
+    assert result.assistant_text == "thinking-answer"
+    assert captured_payload["json"]["enable_thinking"] is True
 
 
 def test_llm_service_continues_when_model_hits_token_limit(monkeypatch) -> None:

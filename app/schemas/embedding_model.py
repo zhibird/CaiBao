@@ -27,7 +27,16 @@ class EmbeddingModelConfigItem(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class EmbeddingDefaultModelItem(BaseModel):
+    model_name: str
+    provider: str
+    base_url: str | None
+    has_api_key: bool
+    masked_api_key: str
+
+
 class EmbeddingModelConfigListResponse(BaseModel):
     team_id: str
     user_id: str
+    default_model: EmbeddingDefaultModelItem
     items: list[EmbeddingModelConfigItem]

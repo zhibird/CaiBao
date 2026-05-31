@@ -311,6 +311,91 @@ class TestQQBotReplyMetadata:
         assert len(received[-1].content) <= _MAX_MESSAGE_CHARS
 
 
+class TestSyncProcessingNotice:
+    """Official QQBot sync-mode processing notice behavior."""
+
+    @pytest.mark.asyncio
+    async def test_fast_sync_reply_does_not_send_processing_notice(self) -> None:
+        bus = MessageBus()
+        await bus.start()
+        received: list[OutboundMessage] = []
+
+        async def capture(msg: OutboundMessage) -> None:
+            received.append(msg)
+
+        bus.subscribe_outbound("qqbot", capture)
+        bridge = AgentBridge(
+            bus=bus,
+            caibao_base_url="http://test",
+            bot_user_id="bot",
+            bot_password="pw",
+            sync_processing_notice_delay_seconds=0.05,
+        )
+
+        async def fake_run_sync(msg: InboundMessage) -> dict[str, str]:
+            return {"answer": "done", "status": "completed"}
+
+        bridge._run_sync = fake_run_sync  # type: ignore[method-assign]
+        inbound = InboundMessage(
+            channel_type="qqbot",
+            chat_type="private",
+            chat_id="openid-fast",
+            user_id="openid-fast",
+            user_name="tester",
+            content="hello",
+            message_id="msg-fast",
+        )
+
+        await bridge._handle_message_sync(inbound)
+        await asyncio.sleep(0.1)
+        await bus.stop()
+
+        assert [msg.content for msg in received] == ["done"]
+
+    @pytest.mark.asyncio
+    async def test_slow_sync_reply_sends_playful_processing_notice(self) -> None:
+        bus = MessageBus()
+        await bus.start()
+        received: list[OutboundMessage] = []
+
+        async def capture(msg: OutboundMessage) -> None:
+            received.append(msg)
+
+        bus.subscribe_outbound("qqbot", capture)
+        notice = "⏳ 稍等一下，我在认真整理思路中 (ง •̀_•́)ง"
+        bridge = AgentBridge(
+            bus=bus,
+            caibao_base_url="http://test",
+            bot_user_id="bot",
+            bot_password="pw",
+            sync_processing_notice_delay_seconds=0.01,
+            sync_processing_notice=notice,
+        )
+
+        async def fake_run_sync(msg: InboundMessage) -> dict[str, str]:
+            await asyncio.sleep(0.05)
+            return {"answer": "done", "status": "completed"}
+
+        bridge._run_sync = fake_run_sync  # type: ignore[method-assign]
+        inbound = InboundMessage(
+            channel_type="qqbot",
+            chat_type="private",
+            chat_id="openid-slow",
+            user_id="openid-slow",
+            user_name="tester",
+            content="hello",
+            message_id="msg-slow",
+        )
+
+        await bridge._handle_message_sync(inbound)
+        await asyncio.sleep(0.2)
+        await bus.stop()
+
+        assert received[0].content == notice
+        assert received[0].tool_status == "thinking"
+        assert received[-1].content == "done"
+
+
 class TestDedupLogic:
     """去重逻辑测试（纯静态分析，不依赖 API）。"""
 

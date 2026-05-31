@@ -126,6 +126,7 @@ async def main(config_path: str) -> None:
 
         # 4. AgentBridge
         caibao_cfg = config.get("caibao", {})
+        message_cfg = config.get("message", {})
         bridge = AgentBridge(
             bus=bus,
             caibao_base_url=caibao_cfg.get("base_url", "http://127.0.0.1:8000"),
@@ -133,6 +134,12 @@ async def main(config_path: str) -> None:
             bot_password=caibao_cfg.get("bot_password", ""),
             http_timeout=caibao_cfg.get("http_timeout", 120.0),
             system_prompt=caibao_cfg.get("system_prompt") or None,
+            sync_processing_notice_enabled=message_cfg.get("show_sync_processing_notice", True),
+            sync_processing_notice_delay_seconds=message_cfg.get("processing_notice_delay_seconds", 1.5),
+            sync_processing_notice=message_cfg.get(
+                "sync_processing_notice",
+                "⏳ 稍等一下，我在认真整理思路中 (ง •̀_•́)ง",
+            ),
         )
 
         _logger.info(

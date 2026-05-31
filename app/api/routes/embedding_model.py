@@ -1,9 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.api.deps import get_embedding_model_service, require_current_active_user
+from app.core.config import get_settings
 from app.core.exceptions import DomainValidationError, EntityNotFoundError
 from app.models.user import User
 from app.schemas.embedding_model import (
+    EmbeddingDefaultModelItem,
     EmbeddingModelConfigItem,
     EmbeddingModelConfigListResponse,
     EmbeddingModelConfigUpsertRequest,
@@ -31,6 +33,7 @@ def list_embedding_models(
     return EmbeddingModelConfigListResponse(
         team_id=current_user.team_id,
         user_id=current_user.user_id,
+        default_model=_build_default_embedding_item(embedding_model_service),
         items=[
             EmbeddingModelConfigItem(
                 config_id=item.config_id,
@@ -46,6 +49,23 @@ def list_embedding_models(
             )
             for item in items
         ],
+    )
+
+
+def _build_default_embedding_item(embedding_model_service: EmbeddingModelService) -> EmbeddingDefaultModelItem:
+    settings = get_settings()
+    provider = settings.embedding_provider.strip().lower()
+    base_url = settings.embedding_base_url.strip() or None
+    api_key = settings.embedding_api_key or ""
+    if provider == "mock" and base_url and api_key.strip():
+        provider = "openai"
+    model_name = "hashing_v1" if provider == "mock" else settings.embedding_model
+    return EmbeddingDefaultModelItem(
+        model_name=model_name,
+        provider=provider,
+        base_url=None if provider == "mock" else base_url,
+        has_api_key=bool(api_key.strip()),
+        masked_api_key=embedding_model_service.mask_api_key(api_key),
     )
 
 

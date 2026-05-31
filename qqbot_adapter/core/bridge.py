@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -39,6 +40,7 @@ _MIN_SEND_INTERVAL = 0.3
 _QQBOT_PASSIVE_REPLY_LIMIT = 5
 _QQBOT_REPLY_COUNT_CACHE_LIMIT = 2048
 _QQBOT_TRUNCATION_NOTICE = "\n\n[Answer truncated: QQBot passive reply limit reached.]"
+_DEFAULT_SYNC_PROCESSING_NOTICE = "⏳ 稍等一下，我在认真整理思路中 (ง •̀_•́)ง"
 
 # SSE 流式失败时触发同步降级的异常类型
 _STREAMING_FALLBACK_ERRORS = (
@@ -98,6 +100,9 @@ class AgentBridge:
         bot_password: str,
         http_timeout: float = 120.0,
         system_prompt: str | None = None,
+        sync_processing_notice_enabled: bool = True,
+        sync_processing_notice_delay_seconds: float = 1.5,
+        sync_processing_notice: str = _DEFAULT_SYNC_PROCESSING_NOTICE,
     ) -> None:
         self.bus = bus
         self.caibao_url = caibao_base_url.rstrip("/")
@@ -105,6 +110,9 @@ class AgentBridge:
         self.bot_password = bot_password
         self.http_timeout = http_timeout
         self.system_prompt = system_prompt
+        self.sync_processing_notice_enabled = sync_processing_notice_enabled
+        self.sync_processing_notice_delay_seconds = max(0.0, float(sync_processing_notice_delay_seconds))
+        self.sync_processing_notice = sync_processing_notice.strip() or _DEFAULT_SYNC_PROCESSING_NOTICE
 
         # httpx 客户端（带 cookie 持久化，用于 CaiBao JWT 认证）
         self._client: httpx.AsyncClient | None = None
@@ -426,13 +434,17 @@ class AgentBridge:
 
     async def _handle_message_sync(self, inbound: InboundMessage) -> None:
         """同步降级路径：POST /api/v1/agent/run → 一次性返回完整答案。"""
-        await self._publish_reply(
-            inbound,
-            "⏳ 正在处理（同步模式，请稍候）...",
-            tool_status="thinking",
-        )
+        notice_task = None
+        if self.sync_processing_notice_enabled:
+            notice_task = asyncio.create_task(self._send_sync_processing_notice_later(inbound))
 
-        result = await self._run_sync(inbound)
+        try:
+            result = await self._run_sync(inbound)
+        finally:
+            if notice_task is not None and not notice_task.done():
+                notice_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await notice_task
 
         answer = str(result.get("answer", "") or "")
         status = str(result.get("status", ""))
@@ -486,6 +498,15 @@ class AgentBridge:
             await self._send_long_message(inbound, answer, is_final=True)
         elif status == "failed":
             await self._publish_reply(inbound, "❌ Agent 执行失败，请检查任务内容或稍后重试。")
+
+    async def _send_sync_processing_notice_later(self, inbound: InboundMessage) -> None:
+        if self.sync_processing_notice_delay_seconds > 0:
+            await asyncio.sleep(self.sync_processing_notice_delay_seconds)
+        await self._publish_reply(
+            inbound,
+            self.sync_processing_notice,
+            tool_status="thinking",
+        )
 
     # ------------------------------------------------------------------
     # CaiBao API 调用

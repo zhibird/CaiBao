@@ -27,6 +27,9 @@ class ToolService:
         "list_recent_documents": "_list_recent_documents",
         "create_incident": "_create_incident",
         "create_memory_card": "_create_memory_card",
+        "forget_memory": "_forget_memory",
+        "recall_memory": "_recall_memory",
+        "message_lookup": "_message_lookup",
         "promote_to_conclusion": "_promote_to_conclusion",
         "generate_incident_report": "_generate_incident_report",
         "web_fetch": "_delegate_generic",
@@ -324,6 +327,122 @@ class ToolService:
                 "category": memory.category,
                 "status": memory.status,
             },
+        }
+
+    def _forget_memory(
+        self,
+        *,
+        team_id: str,
+        user_id: str,
+        arguments: dict[str, object],
+    ) -> dict[str, object]:
+        """Delete a memory card by memory_id."""
+        memory_id = str(arguments.get("memory_id", "")).strip()
+        if not memory_id:
+            raise DomainValidationError("forget_memory requires a non-empty 'memory_id'.")
+
+        memory = self.db.get(MemoryCard, memory_id)
+        if memory is None:
+            raise EntityNotFoundError(f"Memory card '{memory_id}' not found.")
+        if memory.team_id != team_id:
+            raise EntityNotFoundError(f"Memory card '{memory_id}' not found.")
+
+        title = memory.title or memory_id
+        self.db.delete(memory)
+        self.db.commit()
+        return {
+            "tool_name": "forget_memory",
+            "message": f"Memory card '{title}' deleted.",
+            "memory_id": memory_id,
+        }
+
+    def _recall_memory(
+        self,
+        *,
+        team_id: str,
+        user_id: str,
+        arguments: dict[str, object],
+    ) -> dict[str, object]:
+        """Semantically search memory cards by query text (keyword fallback)."""
+        query = str(arguments.get("query", "")).strip()
+        if not query:
+            raise DomainValidationError("recall_memory requires a non-empty 'query'.")
+        limit = self._parse_limit(arguments.get("limit", 5))
+        space_id = self._optional_space_id(team_id=team_id, user_id=user_id, arguments=arguments)
+
+        escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like_query = f"%{escaped}%"
+
+        stmt = select(MemoryCard).where(
+            MemoryCard.team_id == team_id,
+            MemoryCard.status == "active",
+            or_(
+                MemoryCard.title.ilike(like_query, escape="\\"),
+                MemoryCard.content.ilike(like_query, escape="\\"),
+            ),
+        )
+        if space_id is not None:
+            stmt = stmt.where(MemoryCard.space_id == space_id)
+        stmt = stmt.order_by(
+            MemoryCard.updated_at.desc(), MemoryCard.weight.desc(),
+        ).limit(limit)
+
+        cards = list(self.db.scalars(stmt).all())
+        return {
+            "tool_name": "recall_memory",
+            "query": query,
+            "count": len(cards),
+            "memories": [
+                {
+                    "memory_id": c.memory_id,
+                    "title": c.title,
+                    "category": c.category,
+                    "summary": c.summary or "",
+                    "snippet": self._snippet(c.content, query=query),
+                    "weight": c.weight,
+                    "updated_at": c.updated_at.isoformat(),
+                }
+                for c in cards
+            ],
+        }
+
+    def _message_lookup(
+        self,
+        *,
+        team_id: str,
+        user_id: str,
+        arguments: dict[str, object],
+    ) -> dict[str, object]:
+        """Look up recent chat messages in a conversation."""
+        from app.models.chat_history import ChatHistory
+
+        conv_id = str(arguments.get("conversation_id", "")).strip() or None
+        limit = self._parse_limit(arguments.get("limit", 5))
+
+        stmt = select(ChatHistory).where(
+            ChatHistory.team_id == team_id,
+            ChatHistory.user_id == user_id,
+        )
+        if conv_id:
+            stmt = stmt.where(ChatHistory.conversation_id == conv_id)
+        stmt = stmt.order_by(ChatHistory.created_at.desc()).limit(limit)
+
+        messages = list(self.db.scalars(stmt).all())
+        messages.reverse()  # 最早的在前
+
+        return {
+            "tool_name": "message_lookup",
+            "count": len(messages),
+            "messages": [
+                {
+                    "message_id": m.message_id,
+                    "channel": m.channel,
+                    "request": m.request_text,
+                    "response": m.response_text[:500] if m.response_text else "",
+                    "created_at": m.created_at.isoformat(),
+                }
+                for m in messages
+            ],
         }
 
     def _promote_to_conclusion(

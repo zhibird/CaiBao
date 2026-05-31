@@ -25,7 +25,7 @@ class TestEnsureWorkspace:
     def test_creates_all_files(self, store):
         d = store.ensure_workspace("t1", "u1", "s1")
         assert d.exists()
-        for name in ("MEMORY.md", "HISTORY.md", "RECENT_CONTEXT.md", "PENDING.md"):
+        for name in ("SELF.md", "MEMORY.md", "HISTORY.md", "RECENT_CONTEXT.md", "PENDING.md"):
             assert (d / name).exists()
         assert (d / "journal").is_dir()
 
@@ -43,6 +43,18 @@ class TestLongTermMemory:
     def test_read_empty_returns_empty_string(self, ws):
         result = ws.read_long_term("team-1", "user-1", "space-1")
         assert result == ""
+
+
+class TestSelfModel:
+    def test_default_self_model_is_created(self, ws):
+        result = ws.read_self_model("team-1", "user-1", "space-1")
+        assert "CaiBao 的自我认知" in result
+        assert "人格与形象" in result
+
+    def test_write_and_read_self_model_roundtrip(self, ws):
+        ws.write_self_model("team-1", "user-1", "space-1", "# CaiBao 的自我认知\n\n- test")
+        result = ws.read_self_model("team-1", "user-1", "space-1")
+        assert result.endswith("- test")
 
 
 class TestHistory:

@@ -69,6 +69,8 @@ const state = {
   selectedEmbedding: DEFAULT_EMBEDDING_ID,
   modelConfigs: [],
   embeddingConfigs: [],
+  defaultModelName: "",
+  defaultEmbeddingName: "",
   conversations: [],
   history: [],
   documents: [],
@@ -938,11 +940,17 @@ function getProcessingDocumentCount() {
 }
 
 function formatModelDisplayName(model) {
-  return formatModelOptionLabel(model || DEFAULT_MODEL_ID).replace(" (.env)", "");
+  if ((model || DEFAULT_MODEL_ID) === DEFAULT_MODEL_ID) {
+    return state.defaultModelName || DEFAULT_MODEL_ID;
+  }
+  return formatModelOptionLabel(model || DEFAULT_MODEL_ID).replace(" (.env)", "").replace(" (config)", "");
 }
 
 function formatEmbeddingDisplayName(model) {
-  return formatEmbeddingOptionLabel(model || DEFAULT_EMBEDDING_ID).replace(" (.env)", "");
+  if ((model || DEFAULT_EMBEDDING_ID) === DEFAULT_EMBEDDING_ID) {
+    return state.defaultEmbeddingName || DEFAULT_EMBEDDING_ID;
+  }
+  return formatEmbeddingOptionLabel(model || DEFAULT_EMBEDDING_ID).replace(" (.env)", "").replace(" (config)", "");
 }
 
 function getChatModeHint(readyCount, processingCount) {
@@ -1278,7 +1286,7 @@ function legacyInitEmbeddingOptions() {
 
 function formatModelOptionLabel(model) {
   if (model === DEFAULT_MODEL_ID) {
-    return "default (.env)";
+    return state.defaultModelName ? `default (${state.defaultModelName})` : "default (config)";
   }
   if (model === NONE_MODEL_ID) {
     return "none (mock)";
@@ -1288,7 +1296,7 @@ function formatModelOptionLabel(model) {
 
 function formatEmbeddingOptionLabel(model) {
   if (model === DEFAULT_EMBEDDING_ID) {
-    return "default (.env)";
+    return state.defaultEmbeddingName ? `default (${state.defaultEmbeddingName})` : "default (config)";
   }
   if (model === MOCK_EMBEDDING_ID) {
     return "mock (hashing)";
@@ -1471,6 +1479,7 @@ async function loadAllData() {
 async function loadModelConfigs() {
   if (!ensureIdentity()) {
     state.modelConfigs = [];
+    state.defaultModelName = "";
     initModelOptions();
     return;
   }
@@ -1481,12 +1490,14 @@ async function loadModelConfigs() {
   });
   const response = await apiRequest(`/llm/models?${query.toString()}`);
   state.modelConfigs = Array.isArray(response.items) ? response.items : [];
+  state.defaultModelName = response.default_model?.model_name || "";
   initModelOptions();
 }
 
 async function loadEmbeddingConfigs() {
   if (!ensureIdentity()) {
     state.embeddingConfigs = [];
+    state.defaultEmbeddingName = "";
     initEmbeddingOptions();
     return;
   }
@@ -1497,6 +1508,7 @@ async function loadEmbeddingConfigs() {
   });
   const response = await apiRequest(`/embedding/models?${query.toString()}`);
   state.embeddingConfigs = Array.isArray(response.items) ? response.items : [];
+  state.defaultEmbeddingName = response.default_model?.model_name || "";
   initEmbeddingOptions();
 }
 
