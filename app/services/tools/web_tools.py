@@ -223,8 +223,13 @@ def web_search_handler(
     query = str(arguments["query"]).strip()
     limit = int(arguments.get("limit", 5))
 
+    if provider == "disabled":
+        raise DomainValidationError(
+            "Web search is not configured. "
+            "Set web_search_provider in config (e.g. 'exa' for free Exa MCP search)."
+        )
     # Exa MCP 公开端点，无需 API Key（参考 akashic-agent）
-    if provider == "exa" or provider == "disabled":
+    if provider == "exa":
         return _exa_search(query=query, limit=limit)
     if provider == "brave":
         if not api_key:
