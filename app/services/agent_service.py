@@ -477,6 +477,7 @@ class AgentService:
             rag_answer=rag_answer,
             team_id=team_id, user_id=user_id, space_id=space_id,
             include_memory=payload.include_memory,
+            channel=payload.trigger_channel,
         )
         tools = self._build_tools(payload=payload, run=run)
 
@@ -579,6 +580,7 @@ class AgentService:
             rag_answer=rag_answer,
             team_id=team_id, user_id=user_id, space_id=space_id,
             include_memory=payload.include_memory,
+            channel=payload.trigger_channel,
         )
         tools = self._build_tools(payload=payload, run=run)
 
@@ -1303,9 +1305,11 @@ class AgentService:
         user_id: str = "",
         space_id: str | None = None,
         include_memory: bool = True,
+        channel: str | None = None,
     ) -> list[dict[str, object]]:
         persona = self.persona_prompt_builder.build(
             system_prompt=system_prompt,
+            channel=channel,
             team_id=team_id, user_id=user_id, space_id=space_id,
             include_memory=include_memory,
         )

@@ -91,6 +91,7 @@ class RagChatService:
         llm_context_messages = [*conversation_messages, *memory_messages]
         persona = self.persona_prompt_builder.build(
             system_prompt=None,
+            channel="web",
             team_id=payload.team_id,
             user_id=payload.user_id,
             space_id=effective_space_id,
