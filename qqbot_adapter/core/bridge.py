@@ -101,7 +101,7 @@ class AgentBridge:
         http_timeout: float = 120.0,
         system_prompt: str | None = None,
         sync_processing_notice_enabled: bool = True,
-        sync_processing_notice_delay_seconds: float = 1.5,
+        sync_processing_notice_delay_seconds: float = 6.0,
         sync_processing_notice: str = _DEFAULT_SYNC_PROCESSING_NOTICE,
     ) -> None:
         self.bus = bus

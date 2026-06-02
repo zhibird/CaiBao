@@ -55,5 +55,5 @@ streaming_flush_chars = 300
 max_message_chars = 3500
 show_sources = true
 show_sync_processing_notice = true
-processing_notice_delay_seconds = 1.5
+processing_notice_delay_seconds = 6.0
 sync_processing_notice = "⏳ 稍等一下，我在认真整理思路中 (ง •̀_•́)ง"
