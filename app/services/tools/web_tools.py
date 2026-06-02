@@ -1,22 +1,67 @@
+"""Web tools: web_fetch (抓取网页) and web_search (网络搜索).
+
+web_fetch — Inspired by akashic-agent's WebFetchTool:
+  - lxml DOM-based HTML → text (properly removes script/style/noscript)
+  - html2text for HTML → Markdown
+  - User-Agent + Accept header negotiation
+  - Binary content detection & rejection
+  - SSRF protection with DNS-resolved IP filtering
+
+web_search — Inspired by akashic-agent's WebSearchTool:
+  - Exa MCP public endpoint (free, no API key)
+  - Brave / Tavily with API key
+  - MCP JSON-RPC 2.0 over SSE
+"""
+
 from __future__ import annotations
 
-import html
+import html as _html
 import ipaddress
+import json as _json
 import re
 import socket
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
+import html2text as _html2text
 import httpx
+from lxml import html as lxml_html
+from lxml.etree import ParserError
 
 from app.core.config import get_settings
 from app.core.exceptions import DomainValidationError
 from app.services.tool_registry import ToolDefinition
 
+# ── constants ──────────────────────────────────────────────────────────────
+
+_MAX_BYTES = 5 * 1024 * 1024          # 5 MB, same as akashic-agent / OpenCode
+_MAX_TEXT_CHARS = 50_000               # ~12K tokens
+_DEFAULT_TIMEOUT = 30
+_MAX_TIMEOUT = 120
+_USER_AGENT = "caibao/1.0"
+_DEFAULT_NUM_RESULTS = 8
+_MCP_URL = "https://mcp.exa.ai/mcp"
+
+_ACCEPT = {
+    "markdown": "text/markdown;q=1.0, text/x-markdown;q=0.9, text/plain;q=0.8, text/html;q=0.7, */*;q=0.1",
+    "text":     "text/plain;q=1.0, text/markdown;q=0.9, text/html;q=0.8, */*;q=0.1",
+    "html":     "text/html;q=1.0, application/xhtml+xml;q=0.9, text/plain;q=0.8, */*;q=0.1",
+}
+
+_BINARY_CONTENT_TYPES = frozenset({
+    "application/pdf", "application/octet-stream",
+    "image/", "video/", "audio/",
+})
+
+# ── tool definitions ───────────────────────────────────────────────────────
 
 _WEB_FETCH_DEFINITION = ToolDefinition(
     name="web_fetch",
     display_name="抓取网页",
-    description="Fetch a web page by URL and return its text content (HTML converted to plain text).",
+    description=(
+        "Fetch a web page by URL and return its text content. "
+        "Supports text / markdown / html output formats. "
+        "HTTP/HTTPS only, 5 MB limit."
+    ),
     dangerous=False,
     handler_key="generic.web_fetch",
     permission_scope="team",
@@ -27,17 +72,28 @@ _WEB_FETCH_DEFINITION = ToolDefinition(
         "required": ["url"],
         "properties": {
             "url": {"type": "string", "minLength": 1, "maxLength": 2048},
-            "max_chars": {"type": "integer", "minimum": 100, "maximum": 50000, "default": 12000},
-            "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 30, "default": 15},
+            "format": {
+                "type": "string",
+                "enum": ["text", "markdown", "html"],
+                "description": "Return format: text / markdown / html. Default markdown.",
+            },
+            "timeout": {
+                "type": "integer",
+                "minimum": 1, "maximum": 120, "default": 30,
+                "description": "Timeout in seconds.",
+            },
         },
     },
     output_schema={
         "type": "object",
         "properties": {
-            "title": {"type": "string"},
-            "status_code": {"type": "integer"},
+            "url": {"type": "string"},
             "final_url": {"type": "string"},
-            "content": {"type": "string"},
+            "status": {"type": "integer"},
+            "content_type": {"type": "string"},
+            "format": {"type": "string"},
+            "length": {"type": "integer"},
+            "text": {"type": "string"},
             "truncated": {"type": "boolean"},
         },
     },
@@ -46,7 +102,11 @@ _WEB_FETCH_DEFINITION = ToolDefinition(
 _WEB_SEARCH_DEFINITION = ToolDefinition(
     name="web_search",
     display_name="搜索网页",
-    description="Search the web and return results (title, URL, snippet). Requires a search provider API key.",
+    description=(
+        "Search the web using keywords. Returns title, snippet, and URL of each result. "
+        "Best for current events, news, pricing, and time-sensitive queries. "
+        "Use web_fetch afterwards to read full page content."
+    ),
     dangerous=False,
     handler_key="generic.web_search",
     permission_scope="team",
@@ -57,7 +117,21 @@ _WEB_SEARCH_DEFINITION = ToolDefinition(
         "required": ["query"],
         "properties": {
             "query": {"type": "string", "minLength": 1, "maxLength": 500},
-            "limit": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
+            "num_results": {
+                "type": "integer",
+                "minimum": 1, "maximum": 20, "default": 8,
+                "description": "Number of results to return, default 8, max 20.",
+            },
+            "livecrawl": {
+                "type": "string",
+                "enum": ["fallback", "preferred"],
+                "description": "Crawl mode: fallback (cached-first) or preferred (live-first). Default fallback.",
+            },
+            "type": {
+                "type": "string",
+                "enum": ["auto", "fast", "deep"],
+                "description": "Search depth: auto / fast / deep. Default auto.",
+            },
         },
     },
     output_schema={
@@ -65,6 +139,7 @@ _WEB_SEARCH_DEFINITION = ToolDefinition(
         "properties": {
             "results": {"type": "array"},
             "provider": {"type": "string"},
+            "query": {"type": "string"},
         },
     },
 )
@@ -74,26 +149,26 @@ def create_web_tools() -> list[ToolDefinition]:
     return [_WEB_FETCH_DEFINITION, _WEB_SEARCH_DEFINITION]
 
 
-# ------------------------------------------------------------------
-# SSRF protection: DNS-resolved IP filtering
-# ------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+# SSRF protection
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _host_is_dangerous(host: str) -> bool:
     """Block private, loopback, link-local, and reserved IPs.
-    Uses DNS resolution so domain→IP attacks are caught, not just literal IPs."""
-    # Block literal localhost variants
-    if host.lower() in {"localhost", "0.0.0.0", "::1", "0:0:0:0:0:0:0:1", "[::1]", "[0:0:0:0:0:0:0:1]"}:
-        return True
 
-    # Resolve DNS
+    Uses DNS resolution so domain→IP attacks are caught, not just literal IPs.
+    """
+    if host.lower().strip().rstrip(".") in {
+        "localhost", "0.0.0.0", "::1", "0:0:0:0:0:0:0:1",
+        "[::1]", "[0:0:0:0:0:0:0:1]",
+    }:
+        return True
     try:
         addrs = socket.getaddrinfo(host, None, 0, socket.SOCK_STREAM)
     except (socket.gaierror, OSError):
-        return True  # Block unresolvable hosts
-
+        return True  # block unresolvable
     for family, _, _, _, sockaddr in addrs:
         ip_str = sockaddr[0]
-        # Strip scope ID from IPv6 (e.g., fe80::1%eth0)
         if "%" in ip_str:
             ip_str = ip_str.split("%", 1)[0]
         try:
@@ -101,23 +176,38 @@ def _host_is_dangerous(host: str) -> bool:
         except ValueError:
             return True
         if (
-            ip.is_private       # 10.x, 172.16-31, 192.168
-            or ip.is_loopback   # 127.x, ::1
-            or ip.is_link_local # 169.254.x, fe80::
-            or ip.is_reserved   # 240.0.0.0/4 and others
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
             or ip.is_multicast
             or ip.is_unspecified
         ):
             return True
-        # Block AWS/cloud metadata endpoints
         if ip_str == "169.254.169.254":
             return True
     return False
 
 
-# ------------------------------------------------------------------
+def _validate_url_target(url: str) -> str | None:
+    """SSRF guard — reject private / loopback / reserved addresses."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        return "URL missing hostname"
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved:
+            return f"Cannot access private/local address: {host}"
+    except ValueError:
+        if host in {"localhost", "0.0.0.0"} or host.endswith(".local") or host.endswith(".localhost"):
+            return f"Cannot access local domain: {host}"
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Handlers
-# ------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
 
 def web_fetch_handler(
     *,
@@ -127,87 +217,96 @@ def web_fetch_handler(
 ) -> dict[str, object]:
     settings = get_settings()
     url = str(arguments["url"]).strip()
-    max_chars = int(arguments.get("max_chars", 12000))
-    timeout = min(int(arguments.get("timeout_seconds", 15)), 30)
+    fmt = str(arguments.get("format", "markdown")).strip()
+    timeout = min(int(arguments.get("timeout", _DEFAULT_TIMEOUT)), _MAX_TIMEOUT)
 
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"}:
+    # ── scheme check ──
+    if not url.startswith(("http://", "https://")):
         raise DomainValidationError("web_fetch only supports http and https URLs.")
 
-    # Block private IPs
-    host = parsed.hostname
-    if host and settings.web_fetch_block_private_ips:
-        if _host_is_dangerous(host) or host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}:
-            raise DomainValidationError(f"web_fetch cannot access private/local host: {host}")
+    # ── SSRF guard ──
+    err = _validate_url_target(url)
+    if err:
+        raise DomainValidationError(err)
 
-    # Fetch with manual redirect following — check each hop before following.
-    # Stream response bodies so web_fetch_max_bytes is enforced; otherwise
-    # response.text would buffer the full response before truncation.
-    max_redirects = 3
-    current_url = url
-    response = None
-    raw_text = ""
-    max_bytes = settings.web_fetch_max_bytes
-
-    with httpx.Client(follow_redirects=False, timeout=timeout) as client:
-        for _ in range(max_redirects + 1):
-            hop_host = urlparse(current_url).hostname
-            if hop_host and settings.web_fetch_block_private_ips:
-                if _host_is_dangerous(hop_host) or hop_host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}:
-                    raise DomainValidationError(f"web_fetch cannot access private/local host: {hop_host}")
-
-            try:
-                with client.stream("GET", current_url) as response:
-                    if response.status_code in (301, 302, 303, 307, 308):
-                        location = response.headers.get("location", "")
-                        if not location:
-                            break
-                        from urllib.parse import urljoin
-                        current_url = urljoin(current_url, location)
-                        parsed = urlparse(current_url)
-                        if parsed.scheme not in {"http", "https"}:
-                            raise DomainValidationError("web_fetch redirect target is not http/https.")
-                        continue  # follow redirect without reading body
-
-                    # Read body in chunks, abort when exceeding max_bytes
-                    chunks: list[str] = []
-                    total = 0
-                    for chunk in response.iter_text(chunk_size=8192):
-                        total += len(chunk.encode("utf-8", errors="replace"))
-                        if total > max_bytes:
-                            raw_text = "".join(chunks)
-                            raw_text += "\n\n[web_fetch aborted: response exceeded max_bytes limit]"
-                            break
-                        chunks.append(chunk)
-                    else:
-                        raw_text = "".join(chunks)
-            except httpx.HTTPError as exc:
-                raise DomainValidationError(f"web_fetch failed: {exc}") from exc
-
-            break  # exit redirect loop after handling the first non-redirect response
-
-    content_type = response.headers.get("content-type", "") if response else ""
-    is_html = "text/html" in content_type.lower() or raw_text.lstrip().startswith("<")
-
-    title = _extract_title(raw_text) if is_html else ""
-    title = title or parsed.hostname or ""
-
-    if is_html:
-        text = _html_to_text(raw_text)
-    else:
-        text = raw_text
-
-    truncated = len(text) > max_chars
-    if truncated:
-        text = text[:max_chars]
-
-    return {
-        "title": title,
-        "status_code": response.status_code,
-        "final_url": str(response.url),
-        "content": text,
-        "truncated": truncated,
+    # ── fetch ──
+    client_kwargs = {
+        "follow_redirects": True,
+        "timeout": timeout,
+        "headers": {
+            "User-Agent": _USER_AGENT,
+            "Accept": _ACCEPT.get(fmt, "*/*"),
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        },
     }
+
+    try:
+        with httpx.Client(**client_kwargs) as client:
+            resp = client.get(url)
+    except httpx.TimeoutException:
+        raise DomainValidationError(f"web_fetch timed out after {timeout}s.")
+    except httpx.ConnectError:
+        raise DomainValidationError("web_fetch could not establish connection.")
+    except httpx.HTTPError as exc:
+        raise DomainValidationError(f"web_fetch request failed: {exc}") from exc
+
+    if resp.status_code != 200:
+        raise DomainValidationError(f"web_fetch returned HTTP {resp.status_code}.")
+
+    # ── size check ──
+    cl = resp.headers.get("content-length")
+    if cl and int(cl) > _MAX_BYTES:
+        raise DomainValidationError("web_fetch response exceeds 5 MB limit.")
+
+    body = resp.content
+    if len(body) > _MAX_BYTES:
+        raise DomainValidationError("web_fetch response exceeds 5 MB limit.")
+
+    content_type = resp.headers.get("content-type", "")
+    encoding = resp.encoding or "utf-8"
+
+    # ── binary rejection ──
+    for prefix in _BINARY_CONTENT_TYPES:
+        if prefix in content_type:
+            raise DomainValidationError(
+                f"web_fetch cannot process binary content ({content_type}). "
+                "Use a dedicated tool for this format."
+            )
+
+    is_html = "text/html" in content_type
+
+    # ── decode & transform ──
+    if fmt == "html":
+        text = body.decode(encoding, errors="replace")
+    elif fmt == "markdown" and is_html:
+        text = _html_to_markdown(body.decode(encoding, errors="replace"))
+    elif fmt == "text" and is_html:
+        text = _html_to_text(body)
+    else:
+        # non-HTML (JSON, plain text, etc.) — return as-is
+        text = body.decode(encoding, errors="replace")
+
+    # ── truncate ──
+    truncated = len(text) > _MAX_TEXT_CHARS
+    if truncated:
+        text = text[:_MAX_TEXT_CHARS]
+
+    result: dict[str, object] = {
+        "url": url,
+        "final_url": str(resp.url),
+        "status": resp.status_code,
+        "content_type": content_type,
+        "format": fmt,
+        "length": len(text),
+        "text": text,
+    }
+    if truncated:
+        result["truncated"] = True
+        result["note"] = (
+            f"Content truncated to {_MAX_TEXT_CHARS} chars. "
+            "Narrow your scope or use a different tool for more."
+        )
+    return result
 
 
 def web_search_handler(
@@ -221,38 +320,50 @@ def web_search_handler(
     api_key = (settings.web_search_api_key or "").strip()
 
     query = str(arguments["query"]).strip()
-    limit = int(arguments.get("limit", 5))
+    num_results = int(arguments.get("num_results", _DEFAULT_NUM_RESULTS))
+    livecrawl = str(arguments.get("livecrawl", "fallback"))
+    search_type = str(arguments.get("type", "auto"))
 
     if provider == "disabled":
         raise DomainValidationError(
             "Web search is not configured. "
             "Set web_search_provider in config (e.g. 'exa' for free Exa MCP search)."
         )
-    # Exa MCP 公开端点，无需 API Key（参考 akashic-agent）
     if provider == "exa":
-        return _exa_search(query=query, limit=limit)
+        return _exa_search(
+            query=query, num_results=num_results,
+            livecrawl=livecrawl, search_type=search_type,
+        )
     if provider == "brave":
         if not api_key:
             raise DomainValidationError("Brave search requires WEB_SEARCH_API_KEY.")
-        return _brave_search(query=query, limit=limit, api_key=api_key)
+        return _brave_search(query=query, limit=num_results, api_key=api_key)
     if provider == "tavily":
         if not api_key:
             raise DomainValidationError("Tavily search requires WEB_SEARCH_API_KEY.")
-        return _tavily_search(query=query, limit=limit, api_key=api_key)
+        return _tavily_search(query=query, limit=num_results, api_key=api_key)
 
     raise DomainValidationError(f"Unsupported search provider: {provider}")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Brave / Tavily
+# ═══════════════════════════════════════════════════════════════════════════
+
 def _brave_search(*, query: str, limit: int, api_key: str) -> dict[str, object]:
     try:
-        response = httpx.get(
+        resp = httpx.get(
             "https://api.search.brave.com/res/v1/web/search",
             params={"q": query, "count": min(limit, 10)},
-            headers={"Accept": "application/json", "Accept-Encoding": "gzip", "X-Subscription-Token": api_key},
+            headers={
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+                "X-Subscription-Token": api_key,
+            },
             timeout=15,
         )
-        response.raise_for_status()
-        data = response.json()
+        resp.raise_for_status()
+        data = resp.json()
     except httpx.HTTPError as exc:
         raise DomainValidationError(f"Brave search failed: {exc}") from exc
 
@@ -263,18 +374,19 @@ def _brave_search(*, query: str, limit: int, api_key: str) -> dict[str, object]:
             for r in web_results[:limit]
         ],
         "provider": "brave",
+        "query": query,
     }
 
 
 def _tavily_search(*, query: str, limit: int, api_key: str) -> dict[str, object]:
     try:
-        response = httpx.post(
+        resp = httpx.post(
             "https://api.tavily.com/search",
             json={"query": query, "max_results": min(limit, 10), "api_key": api_key},
             timeout=15,
         )
-        response.raise_for_status()
-        data = response.json()
+        resp.raise_for_status()
+        data = resp.json()
     except httpx.HTTPError as exc:
         raise DomainValidationError(f"Tavily search failed: {exc}") from exc
 
@@ -285,13 +397,22 @@ def _tavily_search(*, query: str, limit: int, api_key: str) -> dict[str, object]
             for r in results[:limit]
         ],
         "provider": "tavily",
+        "query": query,
     }
 
 
-def _exa_search(*, query: str, limit: int) -> dict[str, object]:
-    """Exa MCP 公开端点搜索，无需 API Key。参考 akashic-agent 实现。"""
-    import json as _json
+# ═══════════════════════════════════════════════════════════════════════════
+# Exa MCP search (JSON-RPC 2.0 over SSE)
+# ═══════════════════════════════════════════════════════════════════════════
 
+def _exa_search(
+    *,
+    query: str,
+    num_results: int,
+    livecrawl: str = "fallback",
+    search_type: str = "auto",
+) -> dict[str, object]:
+    """Exa MCP public endpoint — free, no API key required."""
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -300,16 +421,16 @@ def _exa_search(*, query: str, limit: int) -> dict[str, object]:
             "name": "web_search_exa",
             "arguments": {
                 "query": query,
-                "numResults": min(limit, 20),
-                "livecrawl": "fallback",
-                "type": "auto",
+                "numResults": min(num_results, 20),
+                "livecrawl": livecrawl,
+                "type": search_type,
             },
         },
     }
 
     try:
-        response = httpx.post(
-            "https://mcp.exa.ai/mcp",
+        resp = httpx.post(
+            _MCP_URL,
             json=payload,
             headers={
                 "accept": "application/json, text/event-stream",
@@ -317,76 +438,123 @@ def _exa_search(*, query: str, limit: int) -> dict[str, object]:
             },
             timeout=25.0,
         )
-        response.raise_for_status()
+        resp.raise_for_status()
     except httpx.HTTPError as exc:
         raise DomainValidationError(f"Exa search failed: {exc}") from exc
 
-    # 解析 SSE 响应
-    text = response.text
-    for line in text.splitlines():
-        if line.startswith("data: "):
+    # Parse SSE response — each "data:" line is a JSON-RPC response chunk
+    raw_text = ""
+    for line in resp.text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("data: "):
             try:
-                data = _json.loads(line[6:])
-                content = data.get("result", {}).get("content", [])
+                chunk = _json.loads(stripped[6:])
+                content = chunk.get("result", {}).get("content", [])
                 if content:
                     raw_text = content[0].get("text", "")
-                    results = _parse_exa_results(raw_text)
-                    return {
-                        "results": results[:limit],
-                        "provider": "exa",
-                    }
-            except (_json.JSONDecodeError, KeyError, IndexError):
+            except (_json.JSONDecodeError, KeyError, IndexError, TypeError):
                 continue
 
-    return {"results": [], "provider": "exa", "query": query}
+    if not raw_text:
+        return {"results": [], "provider": "exa", "query": query}
+
+    results = _parse_exa_results(raw_text)
+    return {
+        "results": results[:num_results],
+        "provider": "exa",
+        "query": query,
+    }
 
 
 def _parse_exa_results(raw: str) -> list[dict[str, str]]:
-    """解析 Exa 返回的文本结果，提取标题/URL/摘要。"""
+    """Parse Exa's plain-text result format into structured records.
+
+    Expected format (one blank line between results)::
+
+        Title: Example Article
+        URL: https://example.com/article
+        Published Date: 2025-06-01
+        Text: A snippet of the article content...
+
+        Title: Another Result
+        URL: https://example.org/another
+        Text: Another snippet...
+
+    The parser is section-based: a blank line separates results; Title
+    always starts a new result block.  Extra / unrecognised lines are
+    appended to the current result's snippet.
+    """
     results: list[dict[str, str]] = []
-    for line in raw.split("\n"):
-        line = line.strip()
-        if not line:
+    current: dict[str, str] | None = None
+
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if current is not None:
+                results.append(current)
+                current = None
             continue
-        item: dict[str, str] = {}
-        if line.startswith("Title: "):
-            item["title"] = line[7:]
-        elif line.startswith("URL: "):
-            item["url"] = line[5:]
-        elif line.startswith("Published Date: "):
-            item["published"] = line[16:]
-        elif line.startswith("Text: "):
-            item["snippet"] = line[6:][:500]
-        if item:
-            # 累积到最近一条
-            if results and "title" in item:
-                results.append(item)
-            elif results:
-                results[-1].update(item)
-            elif "title" in item:
-                results.append(item)
+
+        # Key: value pairs
+        for prefix, key in [
+            ("Title: ", "title"),
+            ("URL: ", "url"),
+            ("Published Date: ", "published"),
+            ("Text: ", "snippet"),
+            ("Score: ", "score"),
+        ]:
+            if stripped.startswith(prefix):
+                value = stripped[len(prefix):].strip()
+                if key == "title":
+                    # Title always opens a new block
+                    if current is not None:
+                        results.append(current)
+                    current = {"title": value}
+                elif current is not None:
+                    current[key] = value
+                break
+        else:
+            # Unrecognised line — append to current snippet
+            if current is not None:
+                existing = current.get("snippet", "")
+                current["snippet"] = f"{existing} {stripped}".strip() if existing else stripped
+
+    if current is not None:
+        results.append(current)
+
     return results
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# HTML processing (lxml + html2text)
+# ═══════════════════════════════════════════════════════════════════════════
 
-# ------------------------------------------------------------------
-# HTML-to-text (lightweight, no extra dependency)
-# ------------------------------------------------------------------
+def _html_to_text(content: bytes) -> str:
+    """HTML → plain text via lxml DOM (akashic-agent style).
 
-def _html_to_text(html_text: str) -> str:
-    # Remove script and style
-    cleaned = re.sub(r"<(script|style)[^>]*>[\s\S]*?</\1>", " ", html_text, flags=re.IGNORECASE)
-    # Remove tags
-    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
-    # Decode entities
-    cleaned = html.unescape(cleaned)
-    # Collapse whitespace
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned.strip()
+    Removes script / style / noscript / iframe / object / embed tags,
+    then extracts text_content and normalises whitespace.
+    """
+    try:
+        doc = lxml_html.fromstring(content)
+    except ParserError:
+        return content.decode("utf-8", errors="replace")
+
+    for tag_name in ("script", "style", "noscript", "iframe", "object", "embed"):
+        for el in doc.xpath(f"//{tag_name}"):
+            parent = el.getparent()
+            if parent is not None:
+                parent.remove(el)
+
+    return " ".join(doc.text_content().split())
 
 
-def _extract_title(text: str) -> str:
-    match = re.search(r"<title[^>]*>(?P<title>.*?)</title>", text, re.IGNORECASE | re.DOTALL)
-    if match:
-        return html.unescape(re.sub(r"\s+", " ", match.group("title")).strip())
-    return ""
+def _html_to_markdown(raw_html: str) -> str:
+    """HTML → Markdown via html2text (akashic-agent style)."""
+    h = _html2text.HTML2Text()
+    h.ignore_links = False
+    h.ignore_images = False
+    h.body_width = 0          # disable line wrapping
+    h.unicode_snob = True     # preserve Unicode
+    h.protect_links = True    # don't escape links
+    return h.handle(raw_html).strip()

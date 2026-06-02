@@ -9,7 +9,12 @@ import pytest
 
 from app.core.exceptions import DomainValidationError
 from app.services.tools.web_tools import (
+    _exa_search,
     _host_is_dangerous,
+    _html_to_markdown,
+    _html_to_text,
+    _parse_exa_results,
+    _validate_url_target,
     create_web_tools,
     web_fetch_handler,
     web_search_handler,
@@ -81,34 +86,42 @@ class TestWebFetchHandler:
                 arguments={"url": "http://127.0.0.1:8080/secret"},
             )
 
-    def _try_fetch_httpbin(self, max_chars: int) -> dict:
+    def _try_fetch_httpbin(self, **extra_args) -> dict:
         """Call web_fetch_handler against httpbin; skip test if external service is down."""
         import socket
         try:
             socket.getaddrinfo("httpbin.org", 443)
         except socket.gaierror:
             pytest.skip("Network not available for fetch test")
+        arguments: dict[str, object] = {
+            "url": "https://httpbin.org/status/200",
+            "format": "text",
+            **extra_args,
+        }
         try:
             with mock.patch("app.services.tools.web_tools._host_is_dangerous", return_value=False):
                 return web_fetch_handler(
                     team_id="t1", user_id="u1",
-                    arguments={"url": "https://httpbin.org/status/200", "max_chars": max_chars},
+                    arguments=arguments,
                 )
         except DomainValidationError as exc:
             msg = str(exc)
             pytest.skip(f"httpbin.org unreachable: {msg[:80]}")
 
     def test_fetches_public_url(self):
-        result = self._try_fetch_httpbin(max_chars=5000)
-        if result.get("status_code") != 200:
-            pytest.skip(f"httpbin.org returned {result.get('status_code')} (external service issue)")
+        result = self._try_fetch_httpbin()
+        if result.get("status") != 200:
+            pytest.skip(f"httpbin.org returned {result.get('status')} (external service issue)")
         assert "final_url" in result
+        assert "text" in result
 
     def test_truncates_long_content(self):
-        result = self._try_fetch_httpbin(max_chars=100)
-        if result.get("status_code") != 200:
-            pytest.skip(f"httpbin.org returned {result.get('status_code')} (external service issue)")
-        assert result["truncated"] is True or len(result["content"]) <= 100
+        # _MAX_TEXT_CHARS = 50_000 by default; override it for this test
+        with mock.patch("app.services.tools.web_tools._MAX_TEXT_CHARS", 100):
+            result = self._try_fetch_httpbin()
+        if result.get("status") != 200:
+            pytest.skip(f"httpbin.org returned {result.get('status')} (external service issue)")
+        assert result.get("truncated") is True or len(str(result.get("text", ""))) <= 100
 
 
 class TestWebSearchHandler:
@@ -482,3 +495,118 @@ class TestToolServiceDryRun:
 
         assert result["dry_run"] is True
         assert not handler_called
+
+
+# ------------------------------------------------------------------
+# Exa result parser
+# ------------------------------------------------------------------
+
+class TestParseExaResults:
+    SAMPLE = """Title: First Result
+URL: https://example.com/1
+Published Date: 2025-06-01
+Text: This is the first snippet.
+
+Title: Second Result
+URL: https://example.com/2
+Text: This is the second snippet.
+
+Title: Third with extra field
+URL: https://example.com/3
+Score: 0.95
+Text: Third snippet here."""
+
+    def test_parses_correct_number_of_results(self):
+        results = _parse_exa_results(self.SAMPLE)
+        assert len(results) == 3
+
+    def test_extracts_title_url_snippet(self):
+        results = _parse_exa_results(self.SAMPLE)
+        assert results[0]["title"] == "First Result"
+        assert results[0]["url"] == "https://example.com/1"
+        assert results[0]["published"] == "2025-06-01"
+        assert results[0]["snippet"] == "This is the first snippet."
+
+    def test_missing_optional_fields(self):
+        results = _parse_exa_results(self.SAMPLE)
+        assert "published" not in results[1]
+        assert results[1]["snippet"] == "This is the second snippet."
+
+    def test_extra_fields_stored(self):
+        results = _parse_exa_results(self.SAMPLE)
+        assert results[2].get("score") == "0.95"
+
+    def test_empty_input(self):
+        assert _parse_exa_results("") == []
+        assert _parse_exa_results("\n\n\n") == []
+
+    def test_single_result(self):
+        results = _parse_exa_results("Title: Only One\nURL: https://x.com\nText: Hi.")
+        assert len(results) == 1
+        assert results[0]["title"] == "Only One"
+
+
+# ------------------------------------------------------------------
+# HTML processing
+# ------------------------------------------------------------------
+
+class TestHtmlToText:
+    def test_removes_script_tags(self):
+        html = b"<html><head><script>alert(1)</script></head><body><p>Hello</p></body></html>"
+        text = _html_to_text(html)
+        assert "Hello" in text
+        assert "alert" not in text
+
+    def test_removes_style_tags(self):
+        html = b"<html><head><style>.x { color: red; }</style></head><body>Visible</body></html>"
+        text = _html_to_text(html)
+        assert "Visible" in text
+        assert "color" not in text
+
+    def test_handles_nested_tags(self):
+        html = b"<div>a <span>b <em>c</em></span> d</div>"
+        text = _html_to_text(html)
+        assert "a b c d" == text
+
+    def test_handles_invalid_html(self):
+        text = _html_to_text(b"not html at all")
+        assert "not html at all" == text
+
+
+class TestHtmlToMarkdown:
+    def test_converts_basic_html(self):
+        md = _html_to_markdown("<h1>Title</h1><p>Some <strong>bold</strong> text.</p>")
+        assert "Title" in md
+        assert "bold" in md
+
+    def test_preserves_links(self):
+        md = _html_to_markdown('<a href="https://example.com">click</a>')
+        assert "click" in md
+        assert "example.com" in md
+
+
+# ------------------------------------------------------------------
+# URL validation
+# ------------------------------------------------------------------
+
+class TestValidateUrlTarget:
+    def test_allows_public_host(self):
+        assert _validate_url_target("https://example.com/page") is None
+
+    def test_blocks_loopback(self):
+        err = _validate_url_target("http://127.0.0.1/admin")
+        assert err is not None
+        assert "private" in err.lower()
+
+    def test_blocks_localhost_name(self):
+        err = _validate_url_target("http://localhost:8080/secret")
+        assert err is not None
+
+    def test_blocks_link_local(self):
+        from ipaddress import IPv6Address
+        err = _validate_url_target("http://[fe80::1]/")
+        assert err is not None
+
+    def test_rejects_missing_hostname(self):
+        err = _validate_url_target("http:///path")
+        assert err is not None

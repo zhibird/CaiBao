@@ -14,3 +14,5 @@ PyJWT==2.10.1
 passlib[bcrypt]==1.7.4
 bcrypt==4.3.0
 jsonschema==4.25.1
+html2text>=2025.4.0
+lxml>=6.0.0
