@@ -375,7 +375,7 @@ class QQBotChannel(BaseChannel):
         chat_type: str | None = None,
         reply_to: str | None = None,
     ) -> dict[str, Any]:
-        """发送文本消息（HTTP POST）。"""
+        """发送文本消息（HTTP POST，markdown 格式）。"""
         await self._ensure_token()
         assert self._http is not None
 
@@ -384,18 +384,18 @@ class QQBotChannel(BaseChannel):
             "Content-Type": "application/json",
         }
         if chat_id.startswith("g"):
-            # 群聊
             group_openid = chat_id[1:]
-            body = {
-                "content": content,
-                "msg_type": 0,
+            body: dict[str, object] = {
+                "markdown": {"content": content},
+                "msg_type": 2,
+                "msg_seq": self._next_msg_seq(),
             }
             url = f"{_QQ_API_BASE}/v2/groups/{group_openid}/messages"
         else:
-            # 私聊
             body = {
-                "content": content,
-                "msg_type": 0,
+                "markdown": {"content": content},
+                "msg_type": 2,
+                "msg_seq": self._next_msg_seq(),
             }
             url = f"{_QQ_API_BASE}/v2/users/{chat_id}/messages"
 

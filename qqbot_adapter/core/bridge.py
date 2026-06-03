@@ -311,8 +311,7 @@ class AgentBridge:
             status = str(result.get("status", ""))
 
             if answer:
-                formatted = markdown_to_qq(answer)
-                await self._send_long_message(inbound, formatted, is_final=True)
+                await self._send_long_message(inbound, answer, is_final=True)
             elif status == "failed":
                 await self._send_throttled(
                     inbound, "❌ 确认执行失败，请检查任务内容。",

@@ -59,7 +59,8 @@ async def test_send_message_omits_msg_id_when_not_replying() -> None:
     await channel.send_message(chat_id="openid-a", content="active")
 
     assert "msg_id" not in http.posts[0]["json"]
-    assert "msg_seq" not in http.posts[0]["json"]
+    # markdown messages always include msg_seq (QQ API requirement)
+    assert "msg_seq" in http.posts[0]["json"]
 
 
 @pytest.mark.asyncio
