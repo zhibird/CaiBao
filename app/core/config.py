@@ -159,7 +159,7 @@ def _load_config_toml_settings() -> dict[str, Any]:
 
 class Settings(BaseSettings):
     app_name: str = "CaiBao"
-    app_version: str = "0.24.3"
+    app_version: str = "0.24.4"
     app_env: str = "dev"
     api_prefix: str = "/api/v1"
     database_url: str

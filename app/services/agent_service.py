@@ -39,6 +39,7 @@ from app.services.llm_router import LLMRouter
 from app.services.llm_service import LLMCompletionResult, LLMService, LLMStreamChunk
 from app.services.memory_markdown_store import MemoryMarkdownStore
 from app.services.persona_prompt import PersonaPromptBuilder
+from app.services.time_envelope import build_current_message_time_envelope
 from app.services.rag_chat_service import RagChatService
 
 from app.services.tool_service import ToolService
@@ -1314,9 +1315,10 @@ class AgentService:
             include_memory=include_memory,
         )
 
+        time_envelope = build_current_message_time_envelope()
         messages: list[dict[str, object]] = [
             {"role": "system", "content": persona.system_prompt},
-            {"role": "user", "content": task},
+            {"role": "user", "content": f"{time_envelope}\n{task}"},
         ]
         if rag_answer.strip():
             messages.insert(1, {
