@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import httpx
 
 from app.core.config import Settings
@@ -72,6 +73,69 @@ def test_llm_service_default_uses_env_runtime_when_credentials_exist(monkeypatch
         "temperature": settings.llm_temperature,
         "max_tokens": settings.llm_max_tokens,
     }
+
+
+def test_complete_chat_serializes_tool_call_arguments_for_followup(monkeypatch) -> None:
+    captured_payload: dict[str, object] = {}
+
+    def _fake_post(url, headers, json, timeout):  # noqa: ANN001
+        captured_payload["json"] = json
+        return _FakeResponse(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "final answer",
+                        }
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr("app.services.llm_service.httpx.post", _fake_post)
+
+    settings = Settings(
+        llm_provider="mock",
+        llm_base_url="https://api.openai.com/v1",
+        llm_api_key="sk-test",
+        llm_model="gpt-4.1-mini",
+    )
+    service = LLMService(settings=settings)
+
+    result = service.complete_chat(
+        messages=[
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Search the web."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "web_search",
+                            "arguments": {"query": "千早爱音 声优 生日", "limit": 5},
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": json.dumps(
+                    {"tool_name": "web_search", "result": {"results": []}},
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+    )
+
+    assert result.assistant_text == "final answer"
+    messages = captured_payload["json"]["messages"]  # type: ignore[index]
+    arguments = messages[2]["tool_calls"][0]["function"]["arguments"]  # type: ignore[index]
+    assert isinstance(arguments, str)
+    assert json.loads(arguments) == {"query": "千早爱音 声优 生日", "limit": 5}
 
 
 def test_llm_service_includes_conversation_history_before_current_user(monkeypatch) -> None:

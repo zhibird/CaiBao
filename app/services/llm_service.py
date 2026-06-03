@@ -721,6 +721,72 @@ class LLMService:
             cleaned.append(m)
         return cleaned
 
+    @staticmethod
+    def _ensure_content_is_string(messages: list[dict[str, object]]) -> list[dict[str, object]]:
+        """Last-resort guard: log & auto-fix provider-incompatible message fields.
+
+        Called immediately before sending the payload to the LLM provider.
+        This catches edge cases that _normalize_messages might miss (e.g.
+        Pydantic BaseModel instances, stale cached messages from DB, etc.).
+
+        Preserves typed multimodal content-parts lists (each item has "type").
+        Also converts assistant tool_call function arguments back to JSON
+        strings, as OpenAI-compatible providers reject argument maps.
+        """
+        import json as _json
+        import logging
+
+        _log = logging.getLogger(__name__)
+        safe: list[dict[str, object]] = []
+        for i, msg in enumerate(messages):
+            m = dict(msg)
+            content = m.get("content")
+            if content is not None and not isinstance(content, str):
+                # Preserve typed content-parts (multimodal): [{type: "text", ...}, {type: "image_url", ...}]
+                if isinstance(content, list) and all(
+                    isinstance(it, dict) and "type" in it for it in content
+                ):
+                    safe.append(m)
+                    continue
+                _log.warning(
+                    "_ensure_content_is_string: fixing messages[%d] content type=%s role=%s",
+                    i, type(content).__name__, m.get("role", "?"),
+                )
+                try:
+                    m["content"] = _json.dumps(content, ensure_ascii=False, default=str)
+                except Exception:
+                    m["content"] = str(content)
+            tool_calls = m.get("tool_calls")
+            if isinstance(tool_calls, list):
+                normalized_tool_calls: list[object] = []
+                for tool_call in tool_calls:
+                    if not isinstance(tool_call, dict):
+                        normalized_tool_calls.append(tool_call)
+                        continue
+                    normalized_tool_call = dict(tool_call)
+                    function = normalized_tool_call.get("function")
+                    if isinstance(function, dict):
+                        normalized_function = dict(function)
+                        arguments = normalized_function.get("arguments")
+                        if arguments is None:
+                            normalized_function["arguments"] = "{}"
+                        elif not isinstance(arguments, str):
+                            _log.warning(
+                                "_ensure_content_is_string: fixing tool_call arguments type=%s role=%s",
+                                type(arguments).__name__, m.get("role", "?"),
+                            )
+                            try:
+                                normalized_function["arguments"] = _json.dumps(
+                                    arguments, ensure_ascii=False, default=str,
+                                )
+                            except Exception:
+                                normalized_function["arguments"] = str(arguments)
+                        normalized_tool_call["function"] = normalized_function
+                    normalized_tool_calls.append(normalized_tool_call)
+                m["tool_calls"] = normalized_tool_calls
+            safe.append(m)
+        return safe
+
     def _build_payload(
         self,
         model: str | None,
@@ -731,9 +797,14 @@ class LLMService:
         stream: bool = False,
     ) -> dict[str, object]:
         selected_model = model.strip() if model else self.settings.llm_model
+        normalized_messages = self._normalize_messages(messages)
+        # Belt-and-suspenders: ensure every content value is JSON-safe before
+        # sending to the LLM provider.  Some providers (DeepSeek etc.) reject
+        # dict content with a cryptic "invalid type: map" error.
+        normalized_messages = self._ensure_content_is_string(normalized_messages)
         payload: dict[str, object] = {
             "model": selected_model,
-            "messages": self._normalize_messages(messages),
+            "messages": normalized_messages,
             "temperature": self.settings.llm_temperature,
             "max_tokens": self.settings.llm_max_tokens,
         }
