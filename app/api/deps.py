@@ -260,7 +260,11 @@ def get_tool_service(
 
 
 def _register_generic_handlers(svc: ToolService) -> None:
-    from app.services.tools.web_tools import web_fetch_handler, web_search_handler
+    from app.services.tools.web_tools import (
+        bilibili_latest_videos_handler,
+        web_fetch_handler,
+        web_search_handler,
+    )
     from app.services.tools.file_tools import (
         edit_file_handler,
         list_dir_handler,
@@ -270,6 +274,7 @@ def _register_generic_handlers(svc: ToolService) -> None:
 
     svc.register_generic_handler("web_fetch", web_fetch_handler)
     svc.register_generic_handler("web_search", web_search_handler)
+    svc.register_generic_handler("bilibili_latest_videos", bilibili_latest_videos_handler)
     svc.register_generic_handler("list_dir", list_dir_handler)
     svc.register_generic_handler("read_file", read_file_handler)
     svc.register_generic_handler("write_file", write_file_handler)

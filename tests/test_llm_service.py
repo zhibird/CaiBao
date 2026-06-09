@@ -138,6 +138,48 @@ def test_complete_chat_serializes_tool_call_arguments_for_followup(monkeypatch) 
     assert json.loads(arguments) == {"query": "千早爱音 声优 生日", "limit": 5}
 
 
+def test_complete_chat_preserves_reasoning_content_for_tool_call_followup(monkeypatch) -> None:
+    def _fake_post(url, headers, json, timeout):  # noqa: ANN001
+        return _FakeResponse(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "reasoning_content": "thinking trace",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "web_search",
+                                        "arguments": "{\"query\":\"latest\"}",
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr("app.services.llm_service.httpx.post", _fake_post)
+
+    settings = Settings(
+        llm_provider="mock",
+        llm_base_url="https://api.openai.com/v1",
+        llm_api_key="sk-test",
+        llm_model="gpt-4.1-mini",
+    )
+    service = LLMService(settings=settings)
+
+    result = service.complete_chat(messages=[{"role": "user", "content": "Search."}])
+
+    assert result.tool_calls[0]["_assistant_reasoning_content"] == "thinking trace"
+    assert json.loads(result.tool_calls[0]["function"]["arguments"]) == {"query": "latest"}  # type: ignore[arg-type]
+
+
 def test_llm_service_includes_conversation_history_before_current_user(monkeypatch) -> None:
     captured_payload: dict[str, object] = {}
 

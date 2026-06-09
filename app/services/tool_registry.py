@@ -262,8 +262,9 @@ AGENT_TOOL_DEFINITIONS = {
         display_name="搜索网页",
         description=(
             "Search the web and return results (title, URL, snippet). "
-            "Supports Brave and Tavily search providers. "
-            "Requires WEB_SEARCH_PROVIDER and WEB_SEARCH_API_KEY configured in .env."
+            "Supports Exa, Brave, and Tavily providers. "
+            "For Bilibili/B站 UP latest/recent video posts, use "
+            "bilibili_latest_videos first instead of generic search."
         ),
         dangerous=False,
         handler_key="generic.web_search",
@@ -274,7 +275,15 @@ AGENT_TOOL_DEFINITIONS = {
             "required": ["query"],
             "properties": {
                 "query": {"type": "string", "minLength": 1, "maxLength": 500},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 10, "default": 5},
+                "num_results": {"type": "integer", "minimum": 1, "maximum": 20, "default": 8},
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20,
+                    "description": "Compatibility alias for num_results.",
+                },
+                "livecrawl": {"type": "string", "enum": ["fallback", "preferred"]},
+                "type": {"type": "string", "enum": ["auto", "fast", "deep"]},
             },
         },
         output_schema={

@@ -3,18 +3,24 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
 from app.core.exceptions import DomainValidationError
 from app.services.tools.web_tools import (
+    _extract_bilibili_mid_from_text,
+    _extract_bilibili_up_name_from_query,
     _exa_search,
+    _format_bilibili_timestamp,
     _host_is_dangerous,
     _html_to_markdown,
     _html_to_text,
+    _normalize_arc_video,
     _parse_exa_results,
     _validate_url_target,
+    bilibili_latest_videos_handler,
     create_web_tools,
     web_fetch_handler,
     web_search_handler,
@@ -135,12 +141,125 @@ class TestWebSearchHandler:
                     arguments={"query": "test"},
                 )
 
+    def test_accepts_limit_alias_for_num_results(self):
+        captured: dict[str, object] = {}
+
+        def _fake_exa_search(**kwargs):
+            captured.update(kwargs)
+            return {"results": [], "provider": "exa", "query": kwargs["query"]}
+
+        with (
+            mock.patch("app.services.tools.web_tools.get_settings") as m,
+            mock.patch("app.services.tools.web_tools._exa_search", side_effect=_fake_exa_search),
+        ):
+            m.return_value = SimpleNamespace(web_search_provider="exa", web_search_api_key=None)
+            result = web_search_handler(
+                team_id="t1", user_id="u1",
+                arguments={"query": "plain query", "limit": 3},
+            )
+
+        assert result["provider"] == "exa"
+        assert captured["num_results"] == 3
+
+    def test_bilibili_latest_query_uses_specialized_lookup(self):
+        def _fake_bilibili_lookup(**kwargs):
+            assert kwargs["arguments"]["up_name"] == "\u900d\u9065\u6563\u4eba"
+            return {
+                "source": "bilibili_space_wbi_arc",
+                "videos": [
+                    {
+                        "title": "\u3010\u6563\u4eba\u3011\u771f\u63a23",
+                        "url": "https://www.bilibili.com/video/BV1/",
+                        "published": "2026-05-21T17:20:00+08:00",
+                        "description": "\u786c\u6838\u63a8\u7406\u5b8c\u7ed3",
+                        "source": "bilibili_space_wbi_arc",
+                    }
+                ],
+            }
+
+        with (
+            mock.patch("app.services.tools.web_tools.get_settings") as m,
+            mock.patch("app.services.tools.web_tools.bilibili_latest_videos_handler", side_effect=_fake_bilibili_lookup),
+            mock.patch("app.services.tools.web_tools._exa_search") as exa,
+        ):
+            m.return_value = SimpleNamespace(web_search_provider="exa", web_search_api_key=None)
+            result = web_search_handler(
+                team_id="t1", user_id="u1",
+                arguments={"query": "\u900d\u9065\u6563\u4eba B\u7ad9 \u6700\u65b0\u89c6\u9891", "limit": 1},
+            )
+
+        exa.assert_not_called()
+        assert result["provider"] == "bilibili"
+        assert result["results"][0]["title"] == "\u3010\u6563\u4eba\u3011\u771f\u63a23"
+
+    def test_bilibili_latest_query_does_not_use_generic_search_when_unverified(self):
+        def _fake_bilibili_lookup(**kwargs):
+            return {
+                "source": "unresolved",
+                "videos": [],
+                "fallback_candidates": [{"title": "old candidate"}],
+                "errors": ["rate limited"],
+            }
+
+        with (
+            mock.patch("app.services.tools.web_tools.get_settings") as m,
+            mock.patch("app.services.tools.web_tools.bilibili_latest_videos_handler", side_effect=_fake_bilibili_lookup),
+            mock.patch("app.services.tools.web_tools._exa_search") as exa,
+        ):
+            m.return_value = SimpleNamespace(web_search_provider="exa", web_search_api_key=None)
+            result = web_search_handler(
+                team_id="t1", user_id="u1",
+                arguments={"query": "\u900d\u9065\u6563\u4eba B\u7ad9 \u6700\u65b0\u89c6\u9891"},
+            )
+
+        exa.assert_not_called()
+        assert result["provider"] == "bilibili"
+        assert result["results"] == []
+        assert "Do not infer latest order" in result["message"]
+
+
+class TestBilibiliLatestVideos:
+    def test_requires_name_or_mid(self):
+        with pytest.raises(DomainValidationError, match="up_name or mid"):
+            bilibili_latest_videos_handler(
+                team_id="t1", user_id="u1",
+                arguments={},
+            )
+
+    def test_extracts_up_name_from_latest_query(self):
+        query = "\u900d\u9065\u6563\u4eba B\u7ad9 \u6700\u65b0\u89c6\u9891 2026\u5e746\u6708"
+        assert _extract_bilibili_up_name_from_query(query) == "\u900d\u9065\u6563\u4eba"
+
+    def test_extracts_mid_from_space_url_and_uid_text(self):
+        assert _extract_bilibili_mid_from_text("https://space.bilibili.com/168598/") == "168598"
+        assert _extract_bilibili_mid_from_text("UID: 168598 Shanghai") == "168598"
+
+    def test_normalizes_arc_video(self):
+        video = _normalize_arc_video(
+            {
+                "title": "<em>\u3010\u6563\u4eba\u3011\u771f\u63a23</em>",
+                "bvid": "BV1EXL462Egw",
+                "created": 1782033600,
+                "length": "68:27",
+                "description": "\u771f\u63a23\u5b8c\u7ed3",
+                "play": 123,
+            },
+            source="bilibili_space_wbi_arc",
+        )
+        assert video["title"] == "\u3010\u6563\u4eba\u3011\u771f\u63a23"
+        assert video["url"] == "https://www.bilibili.com/video/BV1EXL462Egw/"
+        assert video["published"].endswith("+08:00")
+        assert video["source"] == "bilibili_space_wbi_arc"
+
+    def test_formats_millisecond_timestamp(self):
+        assert _format_bilibili_timestamp(1782033600000).endswith("+08:00")
+
 
 class TestCreateWebTools:
-    def test_returns_two_definitions(self):
+    def test_returns_web_definitions(self):
         defs = create_web_tools()
         names = {d.name for d in defs}
-        assert names == {"web_fetch", "web_search"}
+        assert names == {"web_fetch", "web_search", "bilibili_latest_videos"}
         for d in defs:
             assert d.source == "generic"
             assert d.provider == "web_tools"

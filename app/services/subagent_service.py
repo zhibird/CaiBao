@@ -15,7 +15,7 @@ from app.models.subagent_job import SubAgentJob
 _logger = logging.getLogger(__name__)
 
 _PROFILE_TOOLS = {
-    "research": ["web_search", "web_fetch", "search_knowledge", "read_file"],
+    "research": ["web_search", "web_fetch", "bilibili_latest_videos", "search_knowledge", "read_file"],
     "ops": ["search_knowledge", "list_recent_documents", "generate_incident_report"],
 }
 
@@ -141,10 +141,15 @@ class SubAgentService:
                 tool_svc2 = ToolService(db=db2, catalog=catalog2, safety=safety2)
 
                 # Register generic handlers for the tools
-                from app.services.tools.web_tools import web_fetch_handler, web_search_handler
+                from app.services.tools.web_tools import (
+                    bilibili_latest_videos_handler,
+                    web_fetch_handler,
+                    web_search_handler,
+                )
                 from app.services.tools.file_tools import list_dir_handler, read_file_handler, write_file_handler, edit_file_handler
                 tool_svc2.register_generic_handler("web_fetch", web_fetch_handler)
                 tool_svc2.register_generic_handler("web_search", web_search_handler)
+                tool_svc2.register_generic_handler("bilibili_latest_videos", bilibili_latest_videos_handler)
                 tool_svc2.register_generic_handler("list_dir", list_dir_handler)
                 tool_svc2.register_generic_handler("read_file", read_file_handler)
                 tool_svc2.register_generic_handler("write_file", write_file_handler)

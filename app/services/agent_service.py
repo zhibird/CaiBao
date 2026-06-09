@@ -297,6 +297,7 @@ class AgentService:
             step_index=step_index, started=started,
             enable_tool_execution=True, confirm_dangerous_actions=True, dry_run=False,
             enabled_tools=payload.enabled_tools,
+            max_tool_calls=payload.max_steps,
         )
 
         self._record_step(
@@ -477,6 +478,7 @@ class AgentService:
             task=payload.task, system_prompt=payload.system_prompt,
             rag_answer=rag_answer,
             team_id=team_id, user_id=user_id, space_id=space_id,
+            conversation_id=payload.conversation_id,
             include_memory=payload.include_memory,
             channel=payload.trigger_channel,
         )
@@ -499,6 +501,7 @@ class AgentService:
             confirm_dangerous_actions=payload.confirm_dangerous_actions,
             dry_run=payload.dry_run,
             enabled_tools=payload.enabled_tools,
+            max_tool_calls=payload.max_steps,
         )
 
         if requires_confirmation:
@@ -580,6 +583,7 @@ class AgentService:
             task=payload.task, system_prompt=payload.system_prompt,
             rag_answer=rag_answer,
             team_id=team_id, user_id=user_id, space_id=space_id,
+            conversation_id=payload.conversation_id,
             include_memory=payload.include_memory,
             channel=payload.trigger_channel,
         )
@@ -602,6 +606,7 @@ class AgentService:
             confirm_dangerous_actions=payload.confirm_dangerous_actions,
             dry_run=payload.dry_run,
             enabled_tools=payload.enabled_tools,
+            max_tool_calls=payload.max_steps,
         )
 
     # ------------------------------------------------------------------
@@ -626,6 +631,7 @@ class AgentService:
         confirm_dangerous_actions: bool,
         dry_run: bool,
         enabled_tools: list[str] | None = None,
+        max_tool_calls: int = 5,
     ) -> tuple[str, str, bool]:
         """Run the LLM tool loop synchronously.
 
@@ -635,8 +641,24 @@ class AgentService:
         accumulated_text: list[str] = []
         pending_confirmation = False
         current_step = step_index
+        tool_calls_used = 0
+        tool_budget = max(1, min(int(max_tool_calls or 5), _MAX_TOOL_LOOP_ITERATIONS))
 
-        for iteration in range(_MAX_TOOL_LOOP_ITERATIONS):
+        for iteration in range(min(_MAX_TOOL_LOOP_ITERATIONS, tool_budget + 2)):
+            if tool_calls_used >= tool_budget:
+                messages.append({"role": "user", "content": self._tool_budget_prompt(tool_budget)})
+                final_result = self.llm_service.complete_chat(
+                    messages=messages,
+                    model=model_name,
+                    base_url=base_url,
+                    api_key=api_key,
+                    tools=None,
+                )
+                if final_result.assistant_text:
+                    accumulated_text.append(final_result.assistant_text)
+                final_text = "\n".join(accumulated_text).strip()
+                return final_text or "Agent stopped after reaching the tool-call budget.", "completed", False
+
             result = self.llm_service.complete_chat(
                 messages=messages,
                 model=model_name,
@@ -660,6 +682,8 @@ class AgentService:
 
             # Process tool calls
             for tc in result.tool_calls:
+                if tool_calls_used >= tool_budget:
+                    break
                 fn = tc.get("function", {})
                 tool_name = str(fn.get("name", "")).strip()
                 raw_args = fn.get("arguments", {})
@@ -680,7 +704,8 @@ class AgentService:
                 # Validate tool exists
                 definition = self.tool_service.get_tool_definition(tool_name)
                 if definition is None:
-                    messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
+                    tool_calls_used += 1
+                    messages.append(self._assistant_tool_call_message(tc))
                     messages.append({
                         "role": "tool",
                         "tool_call_id": str(tc.get("id", "unknown")),
@@ -692,7 +717,8 @@ class AgentService:
                 normalized_args = definition.normalize_arguments(args)
                 arg_errors = definition.validate_arguments(normalized_args)
                 if arg_errors:
-                    messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
+                    tool_calls_used += 1
+                    messages.append(self._assistant_tool_call_message(tc))
                     messages.append({
                         "role": "tool",
                         "tool_call_id": str(tc.get("id", "unknown")),
@@ -703,7 +729,8 @@ class AgentService:
                 # Filter by enabled_tools (case-insensitive, like streaming)
                 enabled_tool_names = {t.strip().lower() for t in (enabled_tools or []) if t.strip()} if enabled_tools else None
                 if enabled_tool_names and tool_name.lower() not in enabled_tool_names:
-                    messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
+                    tool_calls_used += 1
+                    messages.append(self._assistant_tool_call_message(tc))
                     messages.append({
                         "role": "tool",
                         "tool_call_id": str(tc.get("id", "unknown")),
@@ -720,7 +747,7 @@ class AgentService:
                     )
                     self._save_pending_tool_call(run, call_obj)
                     # Append assistant tool_calls message so confirm can resume the loop.
-                    messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
+                    messages.append(self._assistant_tool_call_message(tc))
                     self._save_loop_state(run, messages=messages, pending_tool_call_id=str(tc.get("id", "unknown")))
                     final_text = "\n".join(accumulated_text).strip()
                     return final_text, "requires_confirmation", True
@@ -766,13 +793,10 @@ class AgentService:
                     latency_ms=self._elapsed_ms(tool_started),
                 )
                 tool_call_history.append(call_sig)
+                tool_calls_used += 1
 
                 # Append tool result to messages
-                messages.append({
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [tc],
-                })
+                messages.append(self._assistant_tool_call_message(tc))
                 messages.append({
                     "role": "tool",
                     "tool_call_id": str(tc.get("id", "unknown")),
@@ -803,18 +827,40 @@ class AgentService:
         confirm_dangerous_actions: bool,
         dry_run: bool,
         enabled_tools: list[str] | None = None,
+        max_tool_calls: int = 5,
     ) -> Iterator[AgentStreamEvent]:
         """Streaming variant of the LLM tool loop."""
         tool_call_history: list[tuple[str, str]] = []
         accumulated_text: list[str] = []
         seq = start_seq
         current_step = 3
+        tool_calls_used = 0
+        tool_budget = max(1, min(int(max_tool_calls or 5), _MAX_TOOL_LOOP_ITERATIONS))
 
-        for iteration in range(_MAX_TOOL_LOOP_ITERATIONS):
+        for iteration in range(min(_MAX_TOOL_LOOP_ITERATIONS, tool_budget + 2)):
             accumulated_names: dict[str, str] = {}
             accumulated_args: dict[str, str] = {}
+            accumulated_reasoning: list[str] = []
             ordered_indices: dict[str, int] = {}
             current_tool_calls: list[dict[str, object]] = []
+
+            if tool_calls_used >= tool_budget:
+                messages.append({"role": "user", "content": self._tool_budget_prompt(tool_budget)})
+                for chunk in self.llm_service.stream_chat(
+                    messages=messages,
+                    model=model_name,
+                    base_url=base_url,
+                    api_key=api_key,
+                    tools=None,
+                ):
+                    if chunk.delta_text:
+                        accumulated_text.append(chunk.delta_text)
+                        seq += 1
+                        yield AgentStreamEvent(
+                            event="llm.delta", run_id=run.run_id, step_index=current_step, seq=seq,
+                            payload={"text": chunk.delta_text},
+                        )
+                break
 
             try:
                 for chunk in self.llm_service.stream_chat(
@@ -831,6 +877,8 @@ class AgentService:
                             event="llm.delta", run_id=run.run_id, step_index=current_step, seq=seq,
                             payload={"text": chunk.delta_text},
                         )
+                    if chunk.reasoning_delta:
+                        accumulated_reasoning.append(chunk.reasoning_delta)
                     for td in chunk.tool_call_deltas:
                         idx = str(td.get("index", ""))
                         if idx not in ordered_indices:
@@ -860,12 +908,15 @@ class AgentService:
                 accumulated_names=accumulated_names,
                 accumulated_args=accumulated_args,
                 ordered_indices=ordered_indices,
+                reasoning_content="".join(accumulated_reasoning) or None,
             )
 
             if not current_tool_calls:
                 break
 
             for tc in current_tool_calls:
+                if tool_calls_used >= tool_budget:
+                    break
                 fn = tc.get("function", {})
                 tool_name = str(fn.get("name", "")).strip()
                 args = fn.get("arguments", {})
@@ -890,7 +941,8 @@ class AgentService:
 
                 definition = self.tool_service.get_tool_definition(tool_name)
                 if definition is None:
-                    messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
+                    tool_calls_used += 1
+                    messages.append(self._assistant_tool_call_message(tc))
                     messages.append({
                         "role": "tool",
                         "tool_call_id": str(tc.get("id", "unknown")),
@@ -900,7 +952,8 @@ class AgentService:
 
                 normalized_args = definition.normalize_arguments(args)
                 if definition.validate_arguments(normalized_args):
-                    messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
+                    tool_calls_used += 1
+                    messages.append(self._assistant_tool_call_message(tc))
                     messages.append({
                         "role": "tool",
                         "tool_call_id": str(tc.get("id", "unknown")),
@@ -909,7 +962,8 @@ class AgentService:
                     continue
                 enabled_tool_names = {t.strip().lower() for t in (enabled_tools or []) if t.strip()} if enabled_tools else None
                 if enabled_tool_names and tool_name.lower() not in enabled_tool_names:
-                    messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
+                    tool_calls_used += 1
+                    messages.append(self._assistant_tool_call_message(tc))
                     messages.append({
                         "role": "tool",
                         "tool_call_id": str(tc.get("id", "unknown")),
@@ -924,7 +978,7 @@ class AgentService:
                     )
                     self._save_pending_tool_call(run, pending)
                     # Append assistant tool_calls so confirm can resume the loop properly.
-                    messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
+                    messages.append(self._assistant_tool_call_message(tc))
                     self._save_loop_state(run, messages=messages, pending_tool_call_id=str(tc.get("id", "unknown")))
                     # Persist the requires_confirmation status so confirm_run can find it.
                     self._finish_run(
@@ -986,6 +1040,7 @@ class AgentService:
                     latency_ms=self._elapsed_ms(tool_started),
                 )
                 tool_call_history.append(call_sig)
+                tool_calls_used += 1
 
                 seq += 1
                 yield AgentStreamEvent(
@@ -993,11 +1048,7 @@ class AgentService:
                     payload={"tool_name": tool_name, "result": tool_result},
                 )
 
-                messages.append({
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [tc],
-                })
+                messages.append(self._assistant_tool_call_message(tc))
                 messages.append({
                     "role": "tool",
                     "tool_call_id": str(tc.get("id", "unknown")),
@@ -1305,6 +1356,7 @@ class AgentService:
         team_id: str = "",
         user_id: str = "",
         space_id: str | None = None,
+        conversation_id: str | None = None,
         include_memory: bool = True,
         channel: str | None = None,
     ) -> list[dict[str, object]]:
@@ -1316,15 +1368,53 @@ class AgentService:
         )
 
         time_envelope = build_current_message_time_envelope()
+        history_messages = self._build_agent_conversation_messages(
+            team_id=team_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
+        )
         messages: list[dict[str, object]] = [
             {"role": "system", "content": persona.system_prompt},
-            {"role": "user", "content": f"{time_envelope}\n{task}"},
         ]
+        messages.extend(history_messages)
         if rag_answer.strip():
-            messages.insert(1, {
+            messages.append({
                 "role": "assistant",
                 "content": f"Retrieved workspace context: {rag_answer[:2000]}",
             })
+        messages.append({"role": "user", "content": f"{time_envelope}\n{task}"})
+        return messages
+
+    def _build_agent_conversation_messages(
+        self,
+        *,
+        team_id: str,
+        user_id: str,
+        conversation_id: str | None,
+    ) -> list[dict[str, object]]:
+        history_turns = max(0, int(self.llm_service.settings.llm_history_turns))
+        if not team_id or not user_id or conversation_id is None or history_turns < 1:
+            return []
+
+        history_items = self.chat_history_service.list_messages_for_context(
+            team_id=team_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            limit=history_turns,
+        )
+
+        messages: list[dict[str, object]] = []
+        for item in history_items:
+            channel = str(getattr(item, "channel", "")).strip().lower()
+            if channel not in {"ask", "echo", "agent", "app", "qqbot"}:
+                continue
+
+            request_text = str(getattr(item, "request_text", "")).strip()
+            response_text = str(getattr(item, "response_text", "")).strip()
+            if request_text:
+                messages.append({"role": "user", "content": request_text[:4000]})
+            if response_text:
+                messages.append({"role": "assistant", "content": response_text[:6000]})
         return messages
 
     def _build_tools(
@@ -1395,6 +1485,46 @@ class AgentService:
         sorted_args = json.dumps(arguments, sort_keys=True, ensure_ascii=False, default=str)
         return (tool_name.strip().lower(), sorted_args)
 
+    @staticmethod
+    def _tool_budget_prompt(tool_budget: int) -> str:
+        return (
+            f"Tool-call budget reached ({tool_budget}). Do not call any more tools. "
+            "Use the available tool results and answer the user's request now. "
+            "If the evidence is incomplete, say that briefly."
+        )
+
+    @staticmethod
+    def _normalize_tool_call_for_message(tool_call: dict[str, object]) -> dict[str, object]:
+        public_tool_call = {
+            key: value
+            for key, value in tool_call.items()
+            if not str(key).startswith("_assistant_")
+        }
+        normalized = json.loads(json.dumps(public_tool_call, ensure_ascii=False, default=str))
+        if not isinstance(normalized, dict):
+            return {}
+        function = normalized.get("function")
+        if isinstance(function, dict):
+            arguments = function.get("arguments")
+            if arguments is None:
+                function["arguments"] = "{}"
+            elif not isinstance(arguments, str):
+                function["arguments"] = json.dumps(arguments, ensure_ascii=False, default=str)
+            normalized["function"] = function
+        return normalized
+
+    @classmethod
+    def _assistant_tool_call_message(cls, tool_call: dict[str, object]) -> dict[str, object]:
+        message: dict[str, object] = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [cls._normalize_tool_call_for_message(tool_call)],
+        }
+        reasoning_content = tool_call.get("_assistant_reasoning_content")
+        if isinstance(reasoning_content, str) and reasoning_content.strip():
+            message["reasoning_content"] = reasoning_content
+        return message
+
     def _count_consecutive(self, history: list[tuple[str, str]], sig: tuple[str, str]) -> int:
         count = 0
         for item in reversed(history):
@@ -1437,7 +1567,20 @@ class AgentService:
             if not isinstance(content, str) and content is not None:
                 c["content"] = json.dumps(content, ensure_ascii=False, default=str)
             if "tool_calls" in c and c["tool_calls"] is not None:
-                c["tool_calls"] = json.loads(json.dumps(c["tool_calls"], ensure_ascii=False, default=str))
+                tool_calls = c["tool_calls"]
+                if isinstance(tool_calls, str):
+                    tool_calls = json.loads(tool_calls)
+                else:
+                    tool_calls = json.loads(json.dumps(tool_calls, ensure_ascii=False, default=str))
+                if isinstance(tool_calls, list):
+                    c["tool_calls"] = [
+                        self._normalize_tool_call_for_message(tool_call)
+                        if isinstance(tool_call, dict)
+                        else tool_call
+                        for tool_call in tool_calls
+                    ]
+                else:
+                    c["tool_calls"] = tool_calls
             cleaned.append(c)
         return cleaned
 

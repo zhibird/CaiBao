@@ -34,6 +34,7 @@ class ToolService:
         "generate_incident_report": "_generate_incident_report",
         "web_fetch": "_delegate_generic",
         "web_search": "_delegate_generic",
+        "bilibili_latest_videos": "_delegate_generic",
         "list_dir": "_delegate_generic",
         "read_file": "_delegate_generic",
         "write_file": "_delegate_generic",

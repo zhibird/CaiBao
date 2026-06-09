@@ -52,6 +52,7 @@ class LLMCompletionResult:
 @dataclass(frozen=True)
 class LLMStreamChunk:
     delta_text: str | None = None
+    reasoning_delta: str | None = None
     tool_call_deltas: list[dict[str, object]] = field(default_factory=list)
     finish_reason: str | None = None
 
@@ -276,6 +277,7 @@ class LLMService:
         if not isinstance(raw_calls, list):
             return []
 
+        assistant_reasoning_content = message.get("reasoning_content")
         parsed: list[dict[str, object]] = []
         for tc in raw_calls:
             if not isinstance(tc, dict):
@@ -295,14 +297,20 @@ class LLMService:
             else:
                 args = {}
 
-            parsed.append({
+            parsed_call: dict[str, object] = {
                 "id": tc.get("id"),
                 "type": "function",
                 "function": {
                     "name": name,
-                    "arguments": args,
+                    "arguments": (
+                        args if isinstance(args, str)
+                        else __import__("json").dumps(args, ensure_ascii=False)
+                    ),
                 },
-            })
+            }
+            if isinstance(assistant_reasoning_content, str) and assistant_reasoning_content.strip():
+                parsed_call["_assistant_reasoning_content"] = assistant_reasoning_content
+            parsed.append(parsed_call)
         return parsed
 
     def _parse_completion(
@@ -384,10 +392,14 @@ class LLMService:
             finish_reason = str(choice.get("finish_reason", "")).strip() or None if isinstance(choice, dict) else None
 
             delta_text = None
+            reasoning_delta = None
             if isinstance(delta, dict):
                 content = delta.get("content", "")
                 if content:
                     delta_text = str(content)
+                reasoning_content = delta.get("reasoning_content", "")
+                if reasoning_content:
+                    reasoning_delta = str(reasoning_content)
 
             tool_deltas: list[dict[str, object]] = []
             if isinstance(delta, dict) and "tool_calls" in delta:
@@ -414,9 +426,10 @@ class LLMService:
                             "function": {"name": fn_name, "arguments": fn_args},
                         })
 
-            if delta_text or tool_deltas or finish_reason:
+            if delta_text or reasoning_delta or tool_deltas or finish_reason:
                 yield LLMStreamChunk(
                     delta_text=delta_text,
+                    reasoning_delta=reasoning_delta,
                     tool_call_deltas=tool_deltas,
                     finish_reason=finish_reason,
                 )
@@ -426,6 +439,7 @@ class LLMService:
         accumulated_names: dict[str, str],
         accumulated_args: dict[str, str],
         ordered_indices: dict[str, int],
+        reasoning_content: str | None = None,
     ) -> list[dict[str, object]]:
         """After streaming ends, build final tool_calls from accumulated deltas."""
         result: list[dict[str, object]] = []
@@ -440,14 +454,24 @@ class LLMService:
             seen.append((idx, name, args))
         seen.sort(key=lambda x: x[0])
 
-        # Build ids matching index-based convention
+        # Build ids matching index-based convention.
+        # Serialize arguments back to JSON string — the agent tool loop
+        # puts these tool_calls back into messages[], and OpenAI-compatible
+        # providers require function.arguments to be a JSON string.
+        import uuid
+        import json as _json2
         for _, name, args in seen:
-            import uuid
-            result.append({
+            tool_call: dict[str, object] = {
                 "id": f"call_{uuid.uuid4().hex[:12]}",
                 "type": "function",
-                "function": {"name": name, "arguments": args},
-            })
+                "function": {
+                    "name": name,
+                    "arguments": _json2.dumps(args, ensure_ascii=False),
+                },
+            }
+            if reasoning_content:
+                tool_call["_assistant_reasoning_content"] = reasoning_content
+            result.append(tool_call)
         return result
 
     def _mock_complete(self, messages: list[dict[str, object]]) -> LLMCompletionResult:
@@ -763,7 +787,18 @@ class LLMService:
                     if not isinstance(tool_call, dict):
                         normalized_tool_calls.append(tool_call)
                         continue
-                    normalized_tool_call = dict(tool_call)
+                    reasoning_content = tool_call.get("_assistant_reasoning_content")
+                    if (
+                        isinstance(reasoning_content, str)
+                        and reasoning_content.strip()
+                        and not isinstance(m.get("reasoning_content"), str)
+                    ):
+                        m["reasoning_content"] = reasoning_content
+                    normalized_tool_call = {
+                        key: value
+                        for key, value in tool_call.items()
+                        if not str(key).startswith("_assistant_")
+                    }
                     function = normalized_tool_call.get("function")
                     if isinstance(function, dict):
                         normalized_function = dict(function)
@@ -771,7 +806,7 @@ class LLMService:
                         if arguments is None:
                             normalized_function["arguments"] = "{}"
                         elif not isinstance(arguments, str):
-                            _log.warning(
+                            _log.debug(
                                 "_ensure_content_is_string: fixing tool_call arguments type=%s role=%s",
                                 type(arguments).__name__, m.get("role", "?"),
                             )
