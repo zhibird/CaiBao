@@ -226,8 +226,6 @@ docker compose down -v
 2. 发布前建议至少执行一次 `docker compose up --build -d` 与 `docker compose logs --tail=100 caibao-api` 做烟测。
 3. 若只更新前端资源但浏览器仍显示旧页面，先强刷页面，再确认 `app.js` / `styles.css` 的版本串是否已经更新。
 
-## changelogs
-
 ## Agent Eval
 
 ```bash
@@ -268,6 +266,20 @@ App Eval 指标包含 `task_success_rate`、`tool_selection_accuracy`、`paramet
 - 构建 Agent Eval + App Eval 双评测体系，覆盖纯问答、工具调用、混合任务、dry-run 与危险动作阻断，自动输出任务完成率、工具选择准确率和危险动作阻断率。
 - 基于 FastAPI、SQLAlchemy、Alembic 和 Docker 实现可本地复现的企业知识 Agent 平台，支持 API 发布与前端演示闭环。
 
+## changelogs
+
+- **v0.24.7**：从 akashic-agent 移植 HTTP 重试基础设施（指数退避 + jitter + 请求预算），接入 web_fetch/web_search/Exa/Brave/Tavily；ToolDefinition 新增 `search_hint` 字段，提升 LLM 工具发现能力。
+- **v0.24.6**：新增 B站/Bilibili UP 主最新视频查询工具 `bilibili_latest_videos`（多级回退 + 缓存）；Agent 工具调用预算管理（`max_tool_calls`）；流式对话支持 `reasoning_content` 传递（DeepSeek 适配）；Agent 支持 `conversation_id` 对话历史注入。
+- **v0.24.5**：修复 QQ Bot 频道发送消息格式（markdown msg_type 2 替代纯文本）。
+- **v0.24.4**：Agent 用户消息注入当前时间信封（来自 akashic-agent）。
+- **v0.24.3**：修复 tool_calls 的 arguments 序列化，统一转为 JSON 字符串以适配不同 LLM provider。
+- **v0.24.2**：联网搜索模块重写，对齐 akashic-agent（Exa MCP + Brave + Tavily 多提供者 + web_fetch SSRF 防护）。
+- **v0.24.1**：双人格 Persona 系统（专业助手 + 闲聊伙伴）+ 体验调优。
+- **v0.24.0**：Agent 工具扩展 + LLM 消息归一化 + 安全加固。
+- **v0.23.x**：QQ Bot 适配器（v0.23.0-v0.23.4），支持企业 QQ 机器人多轮对话、工具调用与流式输出。
+- **v0.22.0**：插件系统 + 主动推送 + Drift 后台任务 + SubAgent 子代理（#phase4）。
+- **v0.21.0**：多层记忆架构 + 事件总线 + 检索增强（#phase3）。
+- **v0.20.0**：工具生态与 MCP 协议接入 + 多层安全治理（#phase2）。
 - **v0.19.0**：完成 Agent 引擎现代化 Phase 1，升级为 Function Calling 工具循环与 SSE 流式执行，并补齐 LLM Router、危险工具确认、App 工作台与 App Eval。
 - **v0.1.0**：后端 MVP + 前端基础页面
 - **v0.2.0**：会话管理（引入会话 `conversation_id`，实现会话隔离、删除）

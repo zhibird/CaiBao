@@ -6,9 +6,16 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import httpx
 import pytest
 
 from app.core.exceptions import DomainValidationError
+from app.services.net.http import (
+    RETRY_STANDARD,
+    RequestBudget,
+    RetryPolicy,
+    retry_request,
+)
 from app.services.tools.web_tools import (
     _extract_bilibili_mid_from_text,
     _extract_bilibili_up_name_from_query,
@@ -729,3 +736,193 @@ class TestValidateUrlTarget:
     def test_rejects_missing_hostname(self):
         err = _validate_url_target("http:///path")
         assert err is not None
+
+
+# ------------------------------------------------------------------
+# Retry infrastructure
+# ------------------------------------------------------------------
+
+
+class TestRetryRequest:
+    """Tests for ``retry_request`` in app/services/net/http.py."""
+
+    def test_retries_on_5xx_then_succeeds(self):
+        """First call returns 503, second returns 200."""
+        call_count = [0]
+
+        class _FakeTransport:
+            def __init__(self, status_codes, body=b"ok"):
+                self._codes = list(status_codes)
+                self._body = body
+
+            def handle_request(self, request):
+                call_count[0] += 1
+                code = self._codes.pop(0) if len(self._codes) > 1 else self._codes[0]
+                return httpx.Response(
+                    status_code=code,
+                    content=self._body,
+                    request=request,
+                )
+
+        class _FakeClient:
+            def __init__(self, transport):
+                self._transport = transport
+
+            def request(self, method, url, **kwargs):
+                import httpx as _httpx
+                req = _httpx.Request(method, url)
+                return self._transport.handle_request(req)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        import httpx as _httpx
+        transport = _FakeTransport([503, 200])
+        client = _FakeClient(transport)
+
+        resp = retry_request(client, "GET", "https://test.local/", retry_policy=RETRY_STANDARD)
+        assert resp.status_code == 200
+        assert call_count[0] == 2
+
+    def test_retries_on_429_then_succeeds(self):
+        """Rate-limit then success."""
+        call_count = [0]
+
+        class _FakeTransport:
+            def handle_request(self, request):
+                call_count[0] += 1
+                if call_count[0] < 3:
+                    return httpx.Response(
+                        status_code=429,
+                        content=b"rate limited",
+                        request=request,
+                    )
+                return httpx.Response(status_code=200, content=b"ok", request=request)
+
+        class _FakeClient:
+            def request(self, method, url, **kwargs):
+                import httpx as _httpx
+                return self._transport.handle_request(_httpx.Request(method, url))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        import httpx as _httpx
+        client = _FakeClient()
+        client._transport = _FakeTransport()
+        resp = retry_request(client, "GET", "https://test.local/", retry_policy=RETRY_STANDARD)
+        assert resp.status_code == 200
+        assert call_count[0] == 3
+
+    def test_budget_exhausted_raises_timeout(self):
+        """When all attempts are 503 and budget runs out, a TimeoutException is raised."""
+        import httpx as _httpx
+
+        class _FakeTransport:
+            def handle_request(self, request):
+                return httpx.Response(status_code=503, content=b"down", request=request)
+
+        class _FakeClient:
+            def request(self, method, url, **kwargs):
+                return self._transport.handle_request(_httpx.Request(method, url))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        client = _FakeClient()
+        client._transport = _FakeTransport()
+
+        with pytest.raises(httpx.TimeoutException, match="budget"):
+            retry_request(
+                client,
+                "GET",
+                "https://test.local/",
+                retry_policy=RETRY_STANDARD,
+                budget=RequestBudget(total_timeout_s=0.5),
+                default_timeout_s=0.1,
+            )
+
+    def test_backoff_increases_across_attempts(self):
+        """Verify backoff values grow exponentially with attempt number."""
+        from app.services.net.http import _backoff_seconds
+
+        policy = RetryPolicy(base_delay_s=0.3, max_delay_s=1.5, jitter_ratio=0.0)
+        b1 = _backoff_seconds(policy, 1)
+        b2 = _backoff_seconds(policy, 2)
+        b3 = _backoff_seconds(policy, 3)
+        # Without jitter, delays should be: 0.3, 0.6, 1.2 — strictly increasing.
+        assert round(b1, 3) == 0.3
+        assert round(b2, 3) == 0.6
+        assert round(b3, 3) == 1.2
+
+    def test_no_retry_on_4xx_client_error(self):
+        """A 404 should NOT be retried — it returns immediately."""
+        import httpx as _httpx
+
+        class _FakeTransport:
+            def handle_request(self, request):
+                return httpx.Response(status_code=404, content=b"not found", request=request)
+
+        class _FakeClient:
+            def request(self, method, url, **kwargs):
+                return self._transport.handle_request(_httpx.Request(method, url))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        client = _FakeClient()
+        client._transport = _FakeTransport()
+        resp = retry_request(client, "GET", "https://test.local/", retry_policy=RETRY_STANDARD)
+        assert resp.status_code == 404
+
+
+# ------------------------------------------------------------------
+# Tool search_hint
+# ------------------------------------------------------------------
+
+
+class TestSearchHint:
+    """Verify that web tool definitions carry a non-empty search_hint."""
+
+    def test_web_tools_have_search_hint(self):
+        tools = create_web_tools()
+        names = {t.name: t for t in tools}
+        for expected in ("web_fetch", "web_search", "bilibili_latest_videos"):
+            td = names.get(expected)
+            assert td is not None, f"{expected} missing from create_web_tools"
+            assert td.search_hint, f"{expected}.search_hint is empty"
+            assert isinstance(td.search_hint, str)
+
+    def test_agenty_tool_defs_have_search_hint_for_web_tools(self):
+        from app.services.tool_registry import AGENT_TOOL_DEFINITIONS
+        for name in ("web_search", "web_fetch"):
+            td = AGENT_TOOL_DEFINITIONS.get(name)
+            assert td is not None, f"{name} missing from AGENT_TOOL_DEFINITIONS"
+            assert td.search_hint, f"{name}.search_hint is empty"
+
+    def test_search_hint_in_to_dict(self):
+        from app.services.tool_registry import ToolDefinition
+        td = ToolDefinition(
+            name="test",
+            display_name="Test",
+            description="desc",
+            dangerous=False,
+            input_schema={},
+            output_schema={},
+            handler_key="generic.test",
+            search_hint="测试 hint",
+        )
+        d = td.to_dict()
+        assert d.get("search_hint") == "测试 hint"

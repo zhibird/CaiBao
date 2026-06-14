@@ -23,6 +23,7 @@ class ToolDefinition:
     permission_scope: str = "team"
     source: str = "builtin"  # "builtin" | "generic" | "mcp"
     provider: str = ""       # "web_tools" | "file_tools" | "shell_tools" | mcp server name
+    search_hint: str = ""    # natural-language hint so LLM can discover this tool
 
     @property
     def parameters(self) -> dict[str, Any]:
@@ -41,6 +42,7 @@ class ToolDefinition:
             "permission_scope": self.permission_scope,
             "source": self.source,
             "provider": self.provider,
+            "search_hint": self.search_hint,
             "parameters": self.input_schema,
         }
 
@@ -270,6 +272,7 @@ AGENT_TOOL_DEFINITIONS = {
         handler_key="generic.web_search",
         source="generic",
         provider="web_tools",
+        search_hint="搜索 查资料 谷歌 Bing",
         input_schema={
             "type": "object",
             "required": ["query"],
@@ -306,6 +309,7 @@ AGENT_TOOL_DEFINITIONS = {
         handler_key="generic.web_fetch",
         source="generic",
         provider="web_tools",
+        search_hint="读取网址 浏览网页 抓取内容",
         input_schema={
             "type": "object",
             "required": ["url"],

@@ -35,6 +35,11 @@ from lxml.etree import ParserError
 
 from app.core.config import get_settings
 from app.core.exceptions import DomainValidationError
+from app.services.net.http import (
+    RETRY_STANDARD,
+    RequestBudget,
+    retry_request,
+)
 from app.services.tool_registry import ToolDefinition
 
 # ── constants ──────────────────────────────────────────────────────────────
@@ -93,6 +98,7 @@ _WEB_FETCH_DEFINITION = ToolDefinition(
     permission_scope="team",
     source="generic",
     provider="web_tools",
+    search_hint="读取网址 浏览网页 抓取内容",
     input_schema={
         "type": "object",
         "required": ["url"],
@@ -138,6 +144,7 @@ _WEB_SEARCH_DEFINITION = ToolDefinition(
     permission_scope="team",
     source="generic",
     provider="web_tools",
+    search_hint="搜索 查资料 谷歌 Bing",
     input_schema={
         "type": "object",
         "required": ["query"],
@@ -184,6 +191,7 @@ _BILIBILI_LATEST_VIDEOS_DEFINITION = ToolDefinition(
     permission_scope="team",
     source="generic",
     provider="web_tools",
+    search_hint="B站 bilibili UP主 最新视频 投稿",
     input_schema={
         "type": "object",
         "properties": {
@@ -300,19 +308,23 @@ def web_fetch_handler(
         raise DomainValidationError(err)
 
     # ── fetch ──
-    client_kwargs = {
-        "follow_redirects": True,
-        "timeout": timeout,
-        "headers": {
-            "User-Agent": _USER_AGENT,
-            "Accept": _ACCEPT.get(fmt, "*/*"),
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        },
+    headers = {
+        "User-Agent": _USER_AGENT,
+        "Accept": _ACCEPT.get(fmt, "*/*"),
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     }
 
     try:
-        with httpx.Client(**client_kwargs) as client:
-            resp = client.get(url)
+        with httpx.Client(follow_redirects=True) as client:
+            resp = retry_request(
+                client,
+                "GET",
+                url,
+                retry_policy=RETRY_STANDARD,
+                budget=RequestBudget(total_timeout_s=float(timeout + 15)),
+                default_timeout_s=float(timeout),
+                headers=headers,
+            )
     except httpx.TimeoutException:
         raise DomainValidationError(f"web_fetch timed out after {timeout}s.")
     except httpx.ConnectError:
@@ -1186,16 +1198,20 @@ def _strip_html(text: str) -> str:
 
 def _brave_search(*, query: str, limit: int, api_key: str) -> dict[str, object]:
     try:
-        resp = httpx.get(
-            "https://api.search.brave.com/res/v1/web/search",
-            params={"q": query, "count": min(limit, 10)},
-            headers={
-                "Accept": "application/json",
-                "Accept-Encoding": "gzip",
-                "X-Subscription-Token": api_key,
-            },
-            timeout=15,
-        )
+        with httpx.Client() as client:
+            resp = retry_request(
+                client,
+                "GET",
+                "https://api.search.brave.com/res/v1/web/search",
+                retry_policy=RETRY_STANDARD,
+                default_timeout_s=15.0,
+                params={"q": query, "count": min(limit, 10)},
+                headers={
+                    "Accept": "application/json",
+                    "Accept-Encoding": "gzip",
+                    "X-Subscription-Token": api_key,
+                },
+            )
         resp.raise_for_status()
         data = resp.json()
     except httpx.HTTPError as exc:
@@ -1214,11 +1230,15 @@ def _brave_search(*, query: str, limit: int, api_key: str) -> dict[str, object]:
 
 def _tavily_search(*, query: str, limit: int, api_key: str) -> dict[str, object]:
     try:
-        resp = httpx.post(
-            "https://api.tavily.com/search",
-            json={"query": query, "max_results": min(limit, 10), "api_key": api_key},
-            timeout=15,
-        )
+        with httpx.Client() as client:
+            resp = retry_request(
+                client,
+                "POST",
+                "https://api.tavily.com/search",
+                retry_policy=RETRY_STANDARD,
+                default_timeout_s=15.0,
+                json={"query": query, "max_results": min(limit, 10), "api_key": api_key},
+            )
         resp.raise_for_status()
         data = resp.json()
     except httpx.HTTPError as exc:
@@ -1263,15 +1283,19 @@ def _exa_search(
     }
 
     try:
-        resp = httpx.post(
-            _MCP_URL,
-            json=payload,
-            headers={
-                "accept": "application/json, text/event-stream",
-                "content-type": "application/json",
-            },
-            timeout=25.0,
-        )
+        with httpx.Client() as client:
+            resp = retry_request(
+                client,
+                "POST",
+                _MCP_URL,
+                retry_policy=RETRY_STANDARD,
+                default_timeout_s=25.0,
+                json=payload,
+                headers={
+                    "accept": "application/json, text/event-stream",
+                    "content-type": "application/json",
+                },
+            )
         resp.raise_for_status()
     except httpx.HTTPError as exc:
         raise DomainValidationError(f"Exa search failed: {exc}") from exc
