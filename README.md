@@ -2,7 +2,7 @@
   <img src="./caibao_pic.png" alt="CaiBao 主界面" width="800">
 </p>
 
-<h1 align="center">🐟 CaiBao <sup>小豆包</sup></h1>
+<h1 align="center">🐟 CaiBao <sup>彩宝</sup></h1>
 
 <p align="center">
   <strong>轻量级 AI Agent 工作台</strong><br>
@@ -89,7 +89,6 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 | 🐧 **QQ Bot** | NapCat + QQ 官方双通道，群聊/私聊多轮对话，SSE 流式 |
 | 🔗 **MCP 协议** | JSON-RPC 2.0 stdio 客户端，自动发现、命名空间隔离、断线重连 |
 | 🌐 **Web 搜索** | Exa / Brave / Tavily + web_fetch（SSRF 防护） |
-| 📹 **Bilibili** | UP 主最新视频查询 |
 | 📁 **文件 / Shell** | 沙箱文件读写 + 命令执行（Shell 默认关闭） |
 
 <p align="center">
