@@ -15,13 +15,15 @@ from app.schemas.agent import AgentRunRequest, AgentRunResponse
 from app.schemas.agent_app import AgentAppCreate, AgentAppInvokeRequest, AgentAppUpdate
 from app.schemas.agent_app import _sanitize_llm_routing as _sanitize_llm_routing_output
 from app.services.agent_service import AgentService
+from app.services.cli_agent_service import CLI_AGENT_MODES
 from app.services.document_service import DocumentService
 
 from app.services.user_service import UserService
 
 
 class AgentAppService:
-    _ALLOWED_MODES = {"agent_auto", "workflow", "claude_code", "codex", "pi"}
+    # 与 CLI 后端集合联动，避免多处手抄漂移。
+    _ALLOWED_MODES = {"agent_auto", "workflow"} | CLI_AGENT_MODES
     _ALLOWED_STATUSES = {"draft", "published", "archived"}
 
     def __init__(

@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/framework-FastAPI-009688?logo=fastapi">
   <img src="https://img.shields.io/badge/db-PostgreSQL%20|%20SQLite-336791">
   <img src="https://img.shields.io/badge/deploy-Docker-2496ED?logo=docker">
-  <img src="https://img.shields.io/badge/version-0.26.0-success">
+  <img src="https://img.shields.io/badge/version-0.27.0-success">
 </p>
 
 ---
@@ -146,6 +146,7 @@ python scripts/agent_eval.py --base-url http://127.0.0.1:8000 \
 
 ## 近期更新
 
+- **v0.27.0** — 发布整理：未知 `run_mode` 改为显式 400、模式白名单单一事实来源、Compose 透传 `CLI_AGENT_*`、仓库卫生清理
 - **v0.26.0** — CLI 编码代理后端：Claude Code / Codex / Pi 以 `run_mode` 接入 Agent 引擎，多轮会话续接 + SSE 流式 + 执行轨迹持久化
 - **v0.25.0** — MCP 链路打通：官方 SDK 服务器（mcp-servers/utils）+ clientInfo 协议修复 + UTF-8/超时/路径健壮性修复
 - **v0.24.7** — HTTP 重试基础设施（指数退避 + jitter），接入 Exa / Brave / Tavily

@@ -20,3 +20,5 @@ data/cli_agent_workspaces/
 tmp/
 *.db.bak_*
 qqbot_adapter/config.toml
+*.log
+output/

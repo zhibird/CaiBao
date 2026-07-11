@@ -23,7 +23,6 @@ import re
 import signal
 import subprocess
 import threading
-import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path

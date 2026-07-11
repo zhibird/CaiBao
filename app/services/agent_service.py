@@ -97,6 +97,7 @@ class AgentService:
         """Create a queued run, returning run_id and stream_url."""
         team_id, user_id = self._require_identity(payload.team_id, payload.user_id)
         self.user_service.ensure_user_in_team(user_id=user_id, team_id=team_id)
+        self._validate_run_mode(payload.run_mode)
 
         run = self._create_queued_run(payload=payload, team_id=team_id, user_id=user_id)
         return AgentRunStartResponse(
@@ -105,10 +106,21 @@ class AgentService:
             status="queued",
         )
 
+    @staticmethod
+    def _validate_run_mode(run_mode: str) -> None:
+        """未知 run_mode 直接 400，而不是静默降级到内置 agent_auto 循环。"""
+        normalized = run_mode.strip().lower()
+        allowed = {"agent_auto", "workflow"} | CLI_AGENT_MODES
+        if normalized not in allowed:
+            raise DomainValidationError(
+                f"Unknown run_mode '{run_mode}'. Allowed: {', '.join(sorted(allowed))}."
+            )
+
     def run(self, payload: AgentRunRequest) -> AgentRunResponse:
         """Synchronous run (backward-compatible)."""
         team_id, user_id = self._require_identity(payload.team_id, payload.user_id)
         self.user_service.ensure_user_in_team(user_id=user_id, team_id=team_id)
+        self._validate_run_mode(payload.run_mode)
         effective_space_id = self.document_service.resolve_space_id(
             team_id=team_id,
             conversation_id=payload.conversation_id,

@@ -6,7 +6,6 @@
 """
 
 import json
-import os
 import stat
 import sys
 
@@ -579,6 +578,20 @@ class TestPiRunModeViaApi:
         assert stream_response.status_code == 200
         assert "event: run.failed" in stream_response.text
         assert "CLI agent" in stream_response.text
+
+    def test_unknown_run_mode_rejected_with_400(self, client, monkeypatch):
+        """拼错的 run_mode（如 claude-code）应 400，而非静默降级到内置循环。"""
+        monkeypatch.setenv("CLI_AGENT_ENABLED", "false")
+        reload_settings()
+
+        register_workspace_user(client, prefix="piuser4", display_name="Pi User 4")
+
+        response = client.post(
+            "/api/v1/agent/runs",
+            json={"task": "帮我整理目录", "run_mode": "claude-code"},
+        )
+        assert response.status_code == 400
+        assert "Unknown run_mode" in response.json()["detail"]
 
 
 # ---------------------------------------------------------------------------
