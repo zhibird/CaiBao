@@ -159,7 +159,7 @@ def _load_config_toml_settings() -> dict[str, Any]:
 
 class Settings(BaseSettings):
     app_name: str = "CaiBao"
-    app_version: str = "0.25.0"
+    app_version: str = "0.26.0"
     app_env: str = "dev"
     api_prefix: str = "/api/v1"
     database_url: str
@@ -285,6 +285,24 @@ class Settings(BaseSettings):
     subagent_async_max_steps: int = 15
     peer_agent_enabled: bool = False
     peer_agent_launch_enabled: bool = False
+
+    # CLI agent backends (Claude Code / Codex / Pi)
+    cli_agent_enabled: bool = False
+    cli_agent_workspace_root: str = "data/cli_agent_workspaces"
+    cli_agent_timeout_seconds: int = 600
+    cli_agent_max_step_output_chars: int = 4000
+    cli_agent_extra_env_json: str = ""
+    cli_agent_claude_path: str = "claude"
+    cli_agent_claude_model: str = ""
+    cli_agent_claude_permission_mode: str = "acceptEdits"
+    cli_agent_claude_allowed_tools: str = ""
+    cli_agent_codex_path: str = "codex"
+    cli_agent_codex_model: str = ""
+    cli_agent_codex_sandbox: str = "workspace-write"
+    cli_agent_pi_path: str = "pi"
+    cli_agent_pi_provider: str = ""
+    cli_agent_pi_model: str = ""
+    cli_agent_pi_thinking: str = ""
 
     model_config = SettingsConfigDict(
         env_file=str(ROOT_ENV_FILE),

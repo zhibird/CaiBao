@@ -21,7 +21,7 @@ from app.services.user_service import UserService
 
 
 class AgentAppService:
-    _ALLOWED_MODES = {"agent_auto", "workflow"}
+    _ALLOWED_MODES = {"agent_auto", "workflow", "claude_code", "codex", "pi"}
     _ALLOWED_STATUSES = {"draft", "published", "archived"}
 
     def __init__(
@@ -259,7 +259,9 @@ class AgentAppService:
     def _normalize_mode(self, raw_mode: str) -> str:
         mode = raw_mode.strip().lower()
         if mode not in self._ALLOWED_MODES:
-            raise DomainValidationError("mode must be one of: agent_auto, workflow.")
+            raise DomainValidationError(
+                "mode must be one of: agent_auto, workflow, claude_code, codex, pi."
+            )
         return mode
 
     def _normalize_status(self, raw_status: str) -> str:

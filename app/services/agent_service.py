@@ -33,6 +33,13 @@ from app.events.lifecycle import (
     TurnStarted,
 )
 from app.services.chat_history_service import ChatHistoryService
+from app.services.cli_agent_service import (
+    CLI_AGENT_MODES,
+    create_cli_agent_runner,
+    load_cli_session_id,
+    resolve_cli_workspace,
+    save_cli_session_id,
+)
 from app.services.document_service import DocumentService
 from app.services.llm_model_service import LLMModelService
 from app.services.llm_router import LLMRouter
@@ -123,7 +130,13 @@ class AgentService:
         self._run_plugin_phase("BeforeTurn", run.run_id, team_id, user_id, effective_space_id,
                                run=run, payload=payload, routes=routes)
 
-        if payload.run_mode.strip().lower() == "workflow" and self._workflow_nodes(payload.workflow_config):
+        run_mode = payload.run_mode.strip().lower()
+        if run_mode in CLI_AGENT_MODES:
+            response = self._run_cli_agent(
+                run=run, payload=payload, team_id=team_id, user_id=user_id,
+                space_id=effective_space_id, started=started,
+            )
+        elif run_mode == "workflow" and self._workflow_nodes(payload.workflow_config):
             response = self._run_workflow(
                 run=run, payload=payload, team_id=team_id, user_id=user_id,
                 space_id=effective_space_id, started=started,
@@ -176,7 +189,19 @@ class AgentService:
 
         started = time.perf_counter()
         try:
-            if payload.run_mode.strip().lower() == "workflow" and self._workflow_nodes(payload.workflow_config):
+            run_mode = payload.run_mode.strip().lower()
+            if run_mode in CLI_AGENT_MODES:
+                gen = self._run_cli_agent_stream(
+                    run=run, payload=payload, team_id=team_id, user_id=user_id,
+                    space_id=effective_space_id, started=started,
+                )
+                seq = None
+                for event in gen:
+                    seq = event.seq
+                    yield event
+                response = self.get_run(run_id=run.run_id, team_id=team_id, user_id=user_id)
+                self._record_agent_history(payload=payload, response=response)
+            elif run_mode == "workflow" and self._workflow_nodes(payload.workflow_config):
                 response = self._run_workflow(
                     run=run, payload=payload, team_id=team_id, user_id=user_id,
                     space_id=effective_space_id, started=started, stream_sink=True,
@@ -195,7 +220,7 @@ class AgentService:
         except Exception as exc:
             self._finish_run(run=run, status="failed", final_answer=f"Agent execution failed: {exc}",
                              required_confirmations=[], started=started)
-            seq += 1
+            seq = (seq or 0) + 1
             yield AgentStreamEvent(
                 event="run.failed", run_id=run.run_id, seq=seq,
                 payload={"error": str(exc)},
@@ -1196,6 +1221,224 @@ class AgentService:
         self._finish_run(run=run, status=status, final_answer=final_answer,
                          required_confirmations=skipped_calls, started=started)
         return final_answer
+
+    # ------------------------------------------------------------------
+    # CLI agent mode (Claude Code / Codex)
+    # ------------------------------------------------------------------
+
+    def _run_cli_agent(
+        self,
+        *,
+        run: AgentRun,
+        payload: AgentRunRequest,
+        team_id: str,
+        user_id: str,
+        space_id: str | None,
+        started: float,
+    ) -> AgentRunResponse:
+        try:
+            for _event in self._run_cli_agent_stream(
+                run=run, payload=payload, team_id=team_id, user_id=user_id,
+                space_id=space_id, started=started,
+            ):
+                pass
+        except Exception as exc:
+            # 启动/配置类错误可能在完成前抛出；保证 run 不会停留在 running。
+            if run.status in ("queued", "running"):
+                self._finish_run(run=run, status="failed",
+                                 final_answer=f"CLI agent 执行失败：{exc}",
+                                 required_confirmations=[], started=started)
+            raise
+        return self.get_run(run_id=run.run_id, team_id=team_id, user_id=user_id)
+
+    def _run_cli_agent_stream(
+        self,
+        *,
+        run: AgentRun,
+        payload: AgentRunRequest,
+        team_id: str,
+        user_id: str,
+        space_id: str | None,
+        started: float,
+    ) -> Iterator[AgentStreamEvent]:
+        settings = get_settings()
+        if not settings.cli_agent_enabled:
+            raise DomainValidationError(
+                "CLI agent 后端未启用，请在服务端设置 CLI_AGENT_ENABLED=true 后重启。"
+            )
+
+        mode = payload.run_mode.strip().lower()
+        runner = create_cli_agent_runner(mode, settings)
+        workdir = resolve_cli_workspace(
+            settings, team_id=team_id,
+            conversation_id=payload.conversation_id, run_id=run.run_id,
+        )
+        resume_session_id = (
+            load_cli_session_id(workdir, runner.name) if payload.conversation_id else None
+        )
+        max_output = max(200, int(settings.cli_agent_max_step_output_chars))
+
+        seq = 0
+
+        def _event(name: str, step_index: int | None, data: dict[str, object]) -> AgentStreamEvent:
+            nonlocal seq
+            seq += 1
+            return AgentStreamEvent(
+                event=name, run_id=run.run_id, step_index=step_index, seq=seq, payload=data,
+            )
+
+        yield _event("step.started", 1, {
+            "step_type": "plan",
+            "title": f"委派 {runner.display_name} 执行",
+        })
+        self._record_step(
+            run=run, step_index=1, step_type="plan",
+            title=f"委派 {runner.display_name} 执行", status="completed",
+            input_payload={
+                "task": payload.task, "run_mode": mode,
+                "workdir": str(workdir), "resume_session": bool(resume_session_id),
+            },
+            output_payload={"strategy": "cli_agent", "runner": runner.name},
+        )
+
+        answer_parts: list[str] = []
+        session_id = resume_session_id or ""
+        step_index = 2  # 工具步骤从 3 开始，与内置循环保持一致
+        open_tools: dict[str, tuple[str, dict[str, object], int, float]] = {}
+        tool_order: list[str] = []
+        result_ok: bool | None = None
+        result_text = ""
+        error_text = ""
+
+        for cli_event in runner.run(
+            task=payload.task,
+            system_prompt=payload.system_prompt or "",
+            workdir=workdir,
+            resume_session_id=resume_session_id,
+            dry_run=payload.dry_run,
+        ):
+            if cli_event.kind == "session":
+                session_id = cli_event.session_id or session_id
+                # 立即落盘：客户端中途断开（GeneratorExit）时循环后的保存不会执行，
+                # 不即时保存会静默丢失多轮续接。
+                if session_id and payload.conversation_id:
+                    save_cli_session_id(workdir, runner.name, session_id)
+            elif cli_event.kind == "text":
+                if cli_event.text:
+                    answer_parts.append(cli_event.text)
+                    yield _event("llm.delta", None, {"text": cli_event.text})
+            elif cli_event.kind == "tool_use":
+                step_index += 1
+                key = cli_event.tool_id or f"auto-{step_index}"
+                open_tools[key] = (
+                    cli_event.tool_name, cli_event.tool_input, step_index, time.perf_counter(),
+                )
+                tool_order.append(key)
+                yield _event("tool.started", step_index, {"tool_name": cli_event.tool_name})
+            elif cli_event.kind == "tool_result":
+                key = cli_event.tool_id if cli_event.tool_id in open_tools else (
+                    tool_order[0] if tool_order else ""
+                )
+                tool_name, tool_input, tool_step, tool_started = open_tools.pop(
+                    key, ("tool", {}, step_index, time.perf_counter()),
+                )
+                if key in tool_order:
+                    tool_order.remove(key)
+                output_text = self._truncate_cli_text(cli_event.tool_output, max_output)
+                self._record_step(
+                    run=run, step_index=tool_step, step_type="tool_call",
+                    title=f"{runner.display_name}: {tool_name}",
+                    status="completed" if cli_event.ok else "failed",
+                    tool_name=tool_name[:64],
+                    input_payload={"arguments": self._truncate_cli_payload(tool_input, max_output)},
+                    output_payload={"result": output_text},
+                    latency_ms=self._elapsed_ms(tool_started),
+                )
+                yield _event("tool.result", tool_step, {
+                    "tool_name": tool_name, "result": output_text,
+                })
+            elif cli_event.kind == "warning":
+                if cli_event.text:
+                    self._record_step(
+                        run=run, step_index=step_index + 1, step_type="observation",
+                        title=f"{runner.display_name} 提示", status="completed",
+                        input_payload={},
+                        output_payload={"message": self._truncate_cli_text(cli_event.text, max_output)},
+                    )
+                    step_index += 1
+            elif cli_event.kind == "result":
+                result_ok = cli_event.ok
+                result_text = cli_event.text
+                session_id = cli_event.session_id or session_id
+            elif cli_event.kind == "error":
+                result_ok = False
+                error_text = cli_event.text
+
+        # 仍未闭合的工具调用（CLI 提前结束 / 超时被杀）补记为 skipped，
+        # 使持久化轨迹与流式事件对齐。
+        for key in list(tool_order):
+            tool_name, tool_input, tool_step, tool_started = open_tools.pop(key)
+            self._record_step(
+                run=run, step_index=tool_step, step_type="tool_call",
+                title=f"{runner.display_name}: {tool_name}", status="skipped",
+                tool_name=tool_name[:64],
+                input_payload={"arguments": self._truncate_cli_payload(tool_input, max_output)},
+                output_payload={"result": "未收到工具结果（CLI 已结束）"},
+                latency_ms=self._elapsed_ms(tool_started),
+            )
+        tool_order.clear()
+
+        if session_id and payload.conversation_id:
+            save_cli_session_id(workdir, runner.name, session_id)
+
+        final_answer = (result_text or "").strip() or "".join(answer_parts).strip()
+        final_index = step_index + 50
+
+        if result_ok is False:
+            detail = (error_text or result_text or f"{runner.display_name} 执行失败").strip()
+            if not final_answer:
+                final_answer = detail
+            self._record_step(
+                run=run, step_index=final_index, step_type="final",
+                title=f"{runner.display_name} 执行失败", status="failed",
+                input_payload={"task": payload.task},
+                output_payload={"error": self._truncate_cli_text(detail, max_output)},
+                error_message=detail[:500],
+            )
+            self._finish_run(run=run, status="failed", final_answer=final_answer,
+                             required_confirmations=[], started=started)
+            yield _event("run.failed", None, {"error": self._truncate_cli_text(detail, max_output)})
+            return
+
+        status = "completed"
+        self._record_step(
+            run=run, step_index=final_index, step_type="final",
+            title="Summarize result", status=status,
+            input_payload={"task": payload.task},
+            output_payload={"answer": final_answer, "status": status, "cli_session_id": session_id},
+        )
+        yield _event("step.completed", final_index, {"answer": final_answer})
+        self._run_plugin_phase("AfterReasoning", run.run_id, team_id, user_id, space_id,
+                               run=run, final_answer=final_answer)
+        self._finish_run(run=run, status=status, final_answer=final_answer,
+                         required_confirmations=[], started=started)
+        self._run_plugin_phase("AfterTurn", run.run_id, team_id, user_id, space_id, run=run)
+
+    @staticmethod
+    def _truncate_cli_text(text: str, max_chars: int) -> str:
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars] + f"\n[... 已截断，共 {len(text)} 字符 ...]"
+
+    @classmethod
+    def _truncate_cli_payload(cls, payload: object, max_chars: int) -> object:
+        try:
+            encoded = json.dumps(payload, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return {"raw": cls._truncate_cli_text(str(payload), max_chars)}
+        if len(encoded) <= max_chars:
+            return payload
+        return {"raw": cls._truncate_cli_text(encoded, max_chars)}
 
     # ------------------------------------------------------------------
     # Workflow mode (unchanged from original, but accepts optional stream_sink)

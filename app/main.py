@@ -78,7 +78,9 @@ def create_app() -> FastAPI:
 
     @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     def serve_frontend() -> FileResponse:
-        return FileResponse(web_dir / "index.html")
+        # index.html 不缓存：静态资源靠 URL 里的 cache-buster 参数换新，
+        # 但入口页本身被缓存会让旧表单（如运行模式选项）静默丢数据。
+        return FileResponse(web_dir / "index.html", headers={"Cache-Control": "no-cache"})
 
     @app.get("/favicon.ico", include_in_schema=False)
     def serve_favicon() -> Response:

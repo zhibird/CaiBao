@@ -1587,7 +1587,16 @@ function renderAgentAppForm() {
     els.agentAppNameInput.value = app?.name || "";
   }
   if (els.agentAppModeSelect) {
-    els.agentAppModeSelect.value = app?.mode || "agent_auto";
+    const mode = app?.mode || "agent_auto";
+    // 原生 select 对未知值会静默回落到第一项，保存时把应用改回 agent_auto；
+    // 表单落后于服务端模式列表时动态补一个选项兜底。
+    if (!Array.from(els.agentAppModeSelect.options).some((opt) => opt.value === mode)) {
+      const option = document.createElement("option");
+      option.value = mode;
+      option.textContent = mode;
+      els.agentAppModeSelect.appendChild(option);
+    }
+    els.agentAppModeSelect.value = mode;
   }
   if (els.agentAppPromptInput) {
     els.agentAppPromptInput.value = app?.system_prompt || "";
@@ -3893,10 +3902,12 @@ async function consumeAgentStream(streamUrl, question) {
     let requiredConfirmations = [];
 
     const updatePendingLabel = (text) => {
-      const pendingEl = document.querySelector(".message.assistant.pending .message-content .message-text");
-      if (pendingEl) {
-        pendingEl.textContent = text || "Agent is thinking...";
-      }
+      const pendingEl = document.querySelector(".message.assistant.pending .pending-text");
+      if (!pendingEl) return;
+      // pending 气泡是状态行不是正文：CLI 后端可能一次性给出整段答案，
+      // 只显示尾部预览，完整内容由 run.completed 的正式气泡渲染。
+      const label = text || "Agent is thinking...";
+      pendingEl.textContent = label.length > 300 ? `…${label.slice(-300)}` : label;
     };
 
     source.addEventListener("llm.delta", (e) => {

@@ -16,6 +16,7 @@ data/uploads/
 data/memory/
 data/agent_files/
 data/agent_shell/
+data/cli_agent_workspaces/
 tmp/
 *.db.bak_*
 qqbot_adapter/config.toml
