@@ -9,6 +9,8 @@ __pycache__/
 !.env.example
 config.toml
 !config.example.toml
+config/mcp_servers.json
+!config/mcp_servers.example.json
 .pytest_cache/
 data/uploads/
 data/memory/

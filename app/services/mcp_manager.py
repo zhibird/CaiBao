@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 from typing import Any
 
-from app.core.config import get_settings
+from app.core.config import PROJECT_ROOT, get_settings
 from app.core.exceptions import DomainValidationError
 from app.schemas.mcp import MCPServerConfig, MCPServersFile
 from app.services.mcp_client import MCPServerError, MCPStdioClient
 from app.services.tool_registry import ToolDefinition
+
+logger = logging.getLogger(__name__)
 
 
 class MCPManager:
@@ -26,9 +29,16 @@ class MCPManager:
     # ------------------------------------------------------------------
 
     def load_config(self) -> list[MCPServerConfig]:
-        """Load MCP server configs from the configured JSON file."""
+        """Load MCP server configs from the configured JSON file.
+
+        Relative paths resolve against the project root, not the process cwd,
+        so the app behaves the same under systemd/IDE/non-root launch dirs.
+        """
         config_path = Path(self.settings.mcp_config_path)
+        if not config_path.is_absolute():
+            config_path = PROJECT_ROOT / config_path
         if not config_path.exists():
+            logger.warning("MCP is enabled but config file %s does not exist; no servers loaded.", config_path)
             return []
 
         raw = config_path.read_text("utf-8")
@@ -72,20 +82,31 @@ class MCPManager:
         if not config.enabled:
             return {"name": config.name, "enabled": False, "status": "disabled", "tool_count": 0, "last_error": None}
 
+        # Resolve relative cwd against the project root so relative commands
+        # (e.g. ".venv/bin/python") work regardless of the launch directory.
+        cwd = Path(config.cwd or ".")
+        if not cwd.is_absolute():
+            cwd = PROJECT_ROOT / cwd
+
         client = MCPStdioClient(
             command=config.command,
             args=config.args,
-            cwd=config.cwd or ".",
+            cwd=str(cwd),
             env=config.env or {},
             timeout_seconds=config.timeout_seconds,
         )
         try:
             client.connect()
         except (MCPServerError, DomainValidationError, OSError) as exc:
+            # Reap the child if it was spawned but the handshake failed —
+            # otherwise each reload against a broken server leaks a process.
+            client.disconnect()
+            logger.warning("MCP server '%s' failed to connect: %s", config.name, exc)
             return {"name": config.name, "enabled": True, "status": "error", "tool_count": 0, "last_error": str(exc)}
 
         self._servers[config.name] = client
         tools = client.tools
+        logger.info("MCP server '%s' connected with %d tool(s).", config.name, len(tools))
         return {
             "name": config.name,
             "enabled": True,

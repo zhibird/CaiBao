@@ -57,23 +57,33 @@ class MCPStdioClient:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                # MCP stdio transport mandates UTF-8; without this the pipe
+                # codec follows the host locale and non-ASCII tool metadata
+                # (e.g. Chinese descriptions) breaks under legacy locales.
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
             )
         except (OSError, FileNotFoundError) as exc:
             raise MCPServerError(f"Failed to start MCP server '{self.command}': {exc}") from exc
 
-        # 1. initialize
+        # 1. initialize — clientInfo is required by the MCP spec; official-SDK
+        # servers reject the request without it.
         init_result = self._request("initialize", {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
-        }, timeout=settings.mcp_init_timeout_seconds)
+            "clientInfo": {
+                "name": settings.app_name or "caibao",
+                "version": settings.app_version or "0.0.0",
+            },
+        }, timeout=max(self.timeout_seconds, settings.mcp_init_timeout_seconds))
         self._server_info = init_result
 
         # 2. notifications/initialized
         self._send_notification("notifications/initialized", {})
 
         # 3. tools/list
-        tools_result = self._request("tools/list", {}, timeout=settings.mcp_init_timeout_seconds)
+        tools_result = self._request("tools/list", {}, timeout=max(self.timeout_seconds, settings.mcp_init_timeout_seconds))
         self._tools = tools_result.get("tools", []) if isinstance(tools_result, dict) else []
 
     def disconnect(self) -> None:
@@ -111,10 +121,12 @@ class MCPStdioClient:
     def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Call a tool via tools/call and return the content."""
         settings = get_settings()
+        # Per-server timeout_seconds may extend (never shorten) the global cap,
+        # so a slow third-party server can be accommodated per entry.
         result = self._request("tools/call", {
             "name": tool_name,
             "arguments": arguments,
-        }, timeout=settings.mcp_call_timeout_seconds)
+        }, timeout=max(self.timeout_seconds, settings.mcp_call_timeout_seconds))
         return result
 
     # ------------------------------------------------------------------

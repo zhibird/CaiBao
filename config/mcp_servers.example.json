@@ -1,6 +1,14 @@
 {
   "servers": [
     {
+      "name": "utils",
+      "enabled": true,
+      "command": ".venv/bin/python",
+      "args": ["mcp-servers/utils/server.py"],
+      "cwd": ".",
+      "timeout_seconds": 20
+    },
+    {
       "name": "filesystem_demo",
       "enabled": false,
       "command": "node",

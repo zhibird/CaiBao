@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/framework-FastAPI-009688?logo=fastapi">
   <img src="https://img.shields.io/badge/db-PostgreSQL%20|%20SQLite-336791">
   <img src="https://img.shields.io/badge/deploy-Docker-2496ED?logo=docker">
-  <img src="https://img.shields.io/badge/version-0.24.7-success">
+  <img src="https://img.shields.io/badge/version-0.25.0-success">
 </p>
 
 ---
@@ -87,9 +87,34 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 | 集成 | 说明 |
 |------|------|
 | 🐧 **QQ Bot** | NapCat + QQ 官方双通道，群聊/私聊多轮对话，SSE 流式 |
-| 🔗 **MCP 协议** | JSON-RPC 2.0 stdio 客户端，自动发现、命名空间隔离、断线重连 |
+| 🔗 **MCP 协议** | JSON-RPC 2.0 stdio 客户端，自动发现、命名空间隔离、工具白名单、手动重载 |
 | 🌐 **Web 搜索** | Exa / Brave / Tavily + web_fetch（SSRF 防护） |
 | 📁 **文件 / Shell** | 沙箱文件读写 + 命令执行（Shell 默认关闭） |
+| 🖥️ **CLI 编码代理** | Claude Code / Codex / Pi 三后端，run_mode 一键委派，JSONL 事件流映射 SSE（默认关闭） |
+
+<details>
+<summary><b>启用 MCP</b></summary>
+
+```bash
+# 1. MCP 服务器依赖（官方 MCP SDK，仅 mcp-servers/ 下的服务器需要）
+pip install -r mcp-servers/requirements.txt
+
+# 2. 配置服务器列表（内置 utils 示例开箱即用）
+cp config/mcp_servers.example.json config/mcp_servers.json
+
+# 3. .env 中开启总开关
+echo 'MCP_ENABLED=true' >> .env
+```
+
+启动后调用 `POST /api/v1/mcp/servers/reload`（dev-admin）或任意 Agent 对话即可完成连接；
+`GET /api/v1/mcp/servers` 查看状态，`GET /api/v1/mcp/tools` 查看以 `mcp__{server}__{tool}` 命名的工具。
+添加第三方服务器只需在 `config/mcp_servers.json` 的 `servers` 数组中追加 stdio 命令条目。
+
+> 适用于本地 Python 运行。配置中的相对路径（`command`、`cwd`、`MCP_CONFIG_PATH`）以仓库根目录为基准解析；
+> Windows 下 `command` 请改为 `.venv/Scripts/python.exe`。
+> Docker 镜像暂未打包 `mcp-servers/` 与 MCP 依赖，容器内启用 MCP 需自行扩展镜像。
+
+</details>
 
 <p align="center">
   <img src="./qqbot_demo.jpg" alt="QQ Bot 效果" width="360">
@@ -121,6 +146,7 @@ python scripts/agent_eval.py --base-url http://127.0.0.1:8000 \
 
 ## 近期更新
 
+- **v0.25.0** — MCP 链路打通：官方 SDK 服务器（mcp-servers/utils）+ clientInfo 协议修复 + UTF-8/超时/路径健壮性修复
 - **v0.24.7** — HTTP 重试基础设施（指数退避 + jitter），接入 Exa / Brave / Tavily
 - **v0.24.6** — B站工具 + `max_tool_calls` 预算 + DeepSeek reasoning_content 流式适配
 - **v0.24.5** — QQ Bot 频道消息格式修复
