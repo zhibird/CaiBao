@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import httpx
 
 from app.core.config import Settings
@@ -40,8 +42,8 @@ def test_embedding_service_real_provider_calls_api(monkeypatch) -> None:
         return _FakeResponse(
             {
                 "data": [
-                    {"index": 0, "embedding": [0.1, 0.2, 0.3]},
-                    {"index": 1, "embedding": [0.3, 0.2, 0.1]},
+                    {"index": 0, "embedding": [0.6, 0.8, 0.0]},
+                    {"index": 1, "embedding": [0.0, 0.8, 0.6]},
                 ]
             }
         )
@@ -58,7 +60,7 @@ def test_embedding_service_real_provider_calls_api(monkeypatch) -> None:
     service = EmbeddingService(settings=settings)
 
     vectors = service.embed_texts(["alpha", "beta"])
-    assert vectors == [[0.1, 0.2, 0.3], [0.3, 0.2, 0.1]]
+    assert vectors == [[0.6, 0.8, 0.0], [0.0, 0.8, 0.6]]
     assert captured_payload["url"] == "https://api.openai.com/v1/embeddings"
     assert captured_payload["json"] == {
         "model": "text-embedding-3-small",
@@ -66,6 +68,42 @@ def test_embedding_service_real_provider_calls_api(monkeypatch) -> None:
     }
     assert service.model_name == "text-embedding-3-small"
     assert service.dim == 3
+
+
+def test_embedding_service_normalizes_real_provider_vectors(monkeypatch) -> None:
+    def _fake_post(url, headers, json, timeout):  # noqa: ANN001
+        return _FakeResponse(
+            {
+                "data": [
+                    {"index": 0, "embedding": [3.0, 4.0]},
+                ]
+            }
+        )
+
+    monkeypatch.setattr("app.services.embedding_service.httpx.post", _fake_post)
+
+    settings = Settings(
+        embedding_provider="openai",
+        embedding_base_url="https://api.openai.com/v1",
+        embedding_api_key="sk-test",
+        embedding_model="text-embedding-3-small",
+    )
+    service = EmbeddingService(settings=settings)
+
+    vectors = service.embed_texts(["needs normalization"])
+    assert vectors == [[0.6, 0.8]]
+    # Dot product on unit vectors equals cosine similarity.
+    assert service.cosine_similarity(vectors[0], vectors[0]) == 1.0
+
+
+def test_embedding_service_mock_vectors_are_unit_normalized() -> None:
+    settings = Settings(embedding_provider="mock", embedding_mock_dim=32)
+    service = EmbeddingService(settings=settings)
+
+    vector = service.embed_text("hello world")
+    norm = math.sqrt(sum(value * value for value in vector))
+    assert abs(norm - 1.0) < 1e-9
+    assert abs(service.cosine_similarity(vector, vector) - 1.0) < 1e-9
 
 
 def test_embedding_service_real_provider_requires_api_key() -> None:
@@ -95,7 +133,7 @@ def test_embedding_service_default_uses_env_runtime_when_credentials_exist(monke
         return _FakeResponse(
             {
                 "data": [
-                    {"index": 0, "embedding": [0.9, 0.1]},
+                    {"index": 0, "embedding": [0.6, 0.8]},
                 ]
             }
         )
@@ -111,7 +149,7 @@ def test_embedding_service_default_uses_env_runtime_when_credentials_exist(monke
     service = EmbeddingService(settings=settings)
 
     vectors = service.embed_texts(["compat path"])
-    assert vectors == [[0.9, 0.1]]
+    assert vectors == [[0.6, 0.8]]
     assert captured_payload["url"] == "https://api.openai.com/v1/embeddings"
     assert captured_payload["json"] == {
         "model": "text-embedding-3-small",
@@ -128,7 +166,7 @@ def test_embedding_service_timeout_splits_batches(monkeypatch) -> None:
         calls.append(size)
         if size > 1:
             raise httpx.ReadTimeout("timed out", request=httpx.Request("POST", url))
-        return _FakeResponse({"data": [{"index": 0, "embedding": [0.4, 0.6]}]})
+        return _FakeResponse({"data": [{"index": 0, "embedding": [0.8, 0.6]}]})
 
     monkeypatch.setattr("app.services.embedding_service.httpx.post", _fake_post)
 
@@ -142,6 +180,6 @@ def test_embedding_service_timeout_splits_batches(monkeypatch) -> None:
     service = EmbeddingService(settings=settings)
 
     vectors = service.embed_texts(["a", "b", "c", "d"])
-    assert vectors == [[0.4, 0.6], [0.4, 0.6], [0.4, 0.6], [0.4, 0.6]]
+    assert vectors == [[0.8, 0.6], [0.8, 0.6], [0.8, 0.6], [0.8, 0.6]]
     assert calls[0] == 4
     assert any(size == 1 for size in calls)

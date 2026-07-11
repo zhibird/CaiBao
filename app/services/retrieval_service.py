@@ -1,4 +1,5 @@
 import json
+import logging
 from uuid import uuid4
 
 from sqlalchemy import delete, or_, select
@@ -12,6 +13,8 @@ from app.models.document_chunk import DocumentChunk
 from app.models.team import Team
 from app.services.embedding_model_service import EmbeddingModelService
 from app.services.embedding_service import EmbeddingRuntimeConfig, EmbeddingService
+
+_logger = logging.getLogger(__name__)
 
 
 class RetrievalService:
@@ -164,6 +167,9 @@ class RetrievalService:
             .join(DocumentChunk, ChunkEmbedding.chunk_id == DocumentChunk.chunk_id)
             .join(Document, Document.document_id == ChunkEmbedding.document_id)
             .where(ChunkEmbedding.team_id == team_id)
+            # Only compare vectors produced by the same embedding model as the query;
+            # mixing models (even with equal dimensions) yields meaningless scores.
+            .where(ChunkEmbedding.embedding_model == self.embedding_service.model_name)
         )
         if user_id is not None:
             stmt = stmt.outerjoin(Conversation, Conversation.conversation_id == Document.conversation_id).where(
@@ -185,6 +191,7 @@ class RetrievalService:
             raise EntityNotFoundError("No indexed chunks found. Run retrieval indexing first.")
 
         scored_hits: list[dict[str, object]] = []
+        skipped_dim_mismatch = 0
         query_dim = len(query_vec)
         for embedding, chunk, document in rows:
             vector = json.loads(embedding.vector_json)
@@ -193,9 +200,9 @@ class RetrievalService:
                     "Indexed vector payload is invalid. Rebuild retrieval index with current embedding model."
                 )
             if len(vector) != query_dim:
-                raise DomainValidationError(
-                    "Embedding dimension mismatch detected. Rebuild retrieval index with current embedding model."
-                )
+                # Skip stale vectors instead of failing the whole search.
+                skipped_dim_mismatch += 1
+                continue
             score = self.embedding_service.cosine_similarity(query_vec, vector)
             scored_hits.append(
                 {
@@ -209,6 +216,19 @@ class RetrievalService:
                     "content": chunk.content,
                     "score": round(score, 6),
                 }
+            )
+
+        if skipped_dim_mismatch:
+            _logger.warning(
+                "Skipped %d indexed vector(s) with mismatched dimensions (query_dim=%d, model=%s); "
+                "rebuild retrieval index to include them.",
+                skipped_dim_mismatch,
+                query_dim,
+                self.embedding_service.model_name,
+            )
+        if not scored_hits:
+            raise EntityNotFoundError(
+                "No compatible indexed chunks found. Rebuild retrieval index with current embedding model."
             )
 
         scored_hits.sort(key=lambda item: item["score"], reverse=True)

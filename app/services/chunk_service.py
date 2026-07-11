@@ -20,6 +20,9 @@ class ChunkSection:
 
 
 class ChunkService:
+    # CJK sentence punctuation used as split boundaries for text without newlines/spaces.
+    _CJK_BOUNDARY_CHARS = "。！？；，"
+
     def __init__(self, db: Session) -> None:
         self.db = db
 
@@ -190,6 +193,14 @@ class ChunkService:
                 split_pos = normalized.rfind("\n\n", start, end)
                 if split_pos == -1:
                     split_pos = normalized.rfind("\n", start, end)
+                if split_pos == -1:
+                    # Chinese text often has no newlines/spaces; break right after
+                    # the nearest CJK sentence punctuation instead of hard-cutting.
+                    boundary = max(
+                        normalized.rfind(char, start, end) for char in self._CJK_BOUNDARY_CHARS
+                    )
+                    if boundary != -1:
+                        split_pos = boundary + 1
                 if split_pos == -1:
                     split_pos = normalized.rfind(" ", start, end)
 

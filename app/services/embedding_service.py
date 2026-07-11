@@ -89,6 +89,9 @@ class EmbeddingService:
             headers=headers,
             request_batch_size=request_batch_size,
         )
+        # Normalize once at the source so both index and query sides store/compare
+        # unit vectors, making dot product equivalent to cosine similarity.
+        vectors = [self._l2_normalize(vector) for vector in vectors]
 
         if vectors:
             self.dim = len(vectors[0])
@@ -96,10 +99,19 @@ class EmbeddingService:
         return vectors
 
     def cosine_similarity(self, a: list[float], b: list[float]) -> float:
+        # Vectors produced by this service are L2-normalized, so the plain dot
+        # product below is equivalent to cosine similarity.
         if not a or not b or len(a) != len(b):
             return 0.0
 
         return float(sum(x * y for x, y in zip(a, b)))
+
+    @staticmethod
+    def _l2_normalize(vector: list[float]) -> list[float]:
+        norm = math.sqrt(sum(value * value for value in vector))
+        if norm == 0:
+            return vector
+        return [value / norm for value in vector]
 
     def _mock_embed_text(self, text: str) -> list[float]:
         tokens = self._tokenize(text)

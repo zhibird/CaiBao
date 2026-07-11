@@ -165,7 +165,7 @@ def test_retrieval_index_supports_rebuild(client) -> None:
     assert rebuilt_index.json()["indexed_chunks"] >= 1
 
 
-def test_retrieval_search_rejects_dimension_mismatch(client) -> None:
+def test_retrieval_search_skips_dimension_mismatched_vectors(client) -> None:
     team_id, _ = register_workspace_user(
         client,
         prefix="retrieval_dim",
@@ -177,7 +177,109 @@ def test_retrieval_search_rejects_dimension_mismatch(client) -> None:
         json={
             "source_name": "dim.md",
             "content_type": "md",
-            "content": "dimension mismatch check content",
+            "content": (
+                "Always check alerts first when investigating incidents.\n\n"
+                "Escalate production incidents quickly and keep the channel updated.\n\n"
+                "Record timeline details for postmortem review afterwards."
+            ),
+        },
+    )
+    assert import_response.status_code == 201
+    document_id = import_response.json()["document_id"]
+
+    chunk_response = client.post(
+        f"/api/v1/documents/{document_id}/chunk",
+        json={
+            "max_chars": 100,
+            "overlap": 5,
+        },
+    )
+    assert chunk_response.status_code == 200
+    chunks = chunk_response.json()["chunks"]
+    assert len(chunks) >= 2
+
+    index_response = client.post(
+        "/api/v1/retrieval/index",
+        json={
+            "document_id": document_id,
+        },
+    )
+    assert index_response.status_code == 200
+
+    stale_chunk_id = chunks[0]["chunk_id"]
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                UPDATE chunk_embeddings
+                SET vector_json = :vector_json, vector_dim = :vector_dim
+                WHERE team_id = :team_id AND chunk_id = :chunk_id
+                """
+            ),
+            {
+                "vector_json": "[0.1,0.2]",
+                "vector_dim": 2,
+                "team_id": team_id,
+                "chunk_id": stale_chunk_id,
+            },
+        )
+
+    # A single stale vector must not fail the whole search; it is skipped.
+    search_response = client.post(
+        "/api/v1/retrieval/search",
+        json={
+            "query": "alerts",
+            "top_k": 5,
+            "document_id": document_id,
+        },
+    )
+    assert search_response.status_code == 200
+    hits = search_response.json()["hits"]
+    assert len(hits) >= 1
+    assert all(hit["chunk_id"] != stale_chunk_id for hit in hits)
+
+    # When every vector is stale, surface a rebuild hint instead of empty hits.
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                UPDATE chunk_embeddings
+                SET vector_json = :vector_json, vector_dim = :vector_dim
+                WHERE team_id = :team_id
+                """
+            ),
+            {
+                "vector_json": "[0.1,0.2]",
+                "vector_dim": 2,
+                "team_id": team_id,
+            },
+        )
+
+    all_stale_response = client.post(
+        "/api/v1/retrieval/search",
+        json={
+            "query": "alerts",
+            "top_k": 5,
+            "document_id": document_id,
+        },
+    )
+    assert all_stale_response.status_code == 404
+    assert "rebuild retrieval index" in all_stale_response.json()["detail"].lower()
+
+
+def test_retrieval_search_filters_other_embedding_models(client) -> None:
+    team_id, _ = register_workspace_user(
+        client,
+        prefix="retrieval_model",
+        display_name="Model Team",
+    )
+
+    import_response = client.post(
+        "/api/v1/documents/import",
+        json={
+            "source_name": "model.md",
+            "content_type": "md",
+            "content": "embedding model isolation check content",
         },
     )
     assert import_response.status_code == 201
@@ -200,18 +302,19 @@ def test_retrieval_search_rejects_dimension_mismatch(client) -> None:
     )
     assert index_response.status_code == 200
 
+    # Vectors written by another embedding model must not be silently mixed in,
+    # even when the dimensions happen to match.
     with engine.begin() as conn:
         conn.execute(
             text(
                 """
                 UPDATE chunk_embeddings
-                SET vector_json = :vector_json, vector_dim = :vector_dim
+                SET embedding_model = :embedding_model
                 WHERE team_id = :team_id
                 """
             ),
             {
-                "vector_json": "[0.1,0.2]",
-                "vector_dim": 2,
+                "embedding_model": "legacy_model_v0",
                 "team_id": team_id,
             },
         )
@@ -219,13 +322,13 @@ def test_retrieval_search_rejects_dimension_mismatch(client) -> None:
     search_response = client.post(
         "/api/v1/retrieval/search",
         json={
-            "query": "dimension",
+            "query": "isolation",
             "top_k": 3,
             "document_id": document_id,
         },
     )
-    assert search_response.status_code == 400
-    assert "dimension mismatch" in search_response.json()["detail"].lower()
+    assert search_response.status_code == 404
+    assert search_response.json()["detail"] == "No indexed chunks found. Run retrieval indexing first."
 
 
 def test_retrieval_routes_hide_foreign_document_scope(client) -> None:

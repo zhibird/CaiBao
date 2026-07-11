@@ -280,6 +280,41 @@ def test_document_chunking_and_list_chunks(client) -> None:
     assert len(list_chunks_response.json()) == body["total_chunks"]
 
 
+def test_document_chunking_breaks_chinese_text_at_sentence_boundary(client) -> None:
+    register_workspace_user(
+        client,
+        prefix="doc_chunk_zh",
+        display_name="Chunk Chinese Team",
+    )
+
+    # Long Chinese text without any newlines or spaces should still split
+    # after sentence punctuation instead of hard-cutting mid sentence.
+    sentence = "财报助手需要正确检索中文内容。"
+    import_response = client.post(
+        "/api/v1/documents/import",
+        json={
+            "source_name": "chinese.txt",
+            "content_type": "txt",
+            "content": sentence * 30,
+        },
+    )
+    assert import_response.status_code == 201
+    document_id = import_response.json()["document_id"]
+
+    chunk_response = client.post(
+        f"/api/v1/documents/{document_id}/chunk",
+        json={
+            "max_chars": 100,
+            "overlap": 10,
+        },
+    )
+    assert chunk_response.status_code == 200
+    body = chunk_response.json()
+    assert body["total_chunks"] >= 3
+    for chunk in body["chunks"]:
+        assert chunk["content"].endswith("。")
+
+
 def test_document_chunking_rejects_invalid_overlap(client) -> None:
     register_workspace_user(
         client,
