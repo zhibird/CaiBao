@@ -7,6 +7,7 @@ Pet interactions are ordinary per-user history records; they never invoke an LLM
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -15,8 +16,10 @@ from sqlalchemy.orm import Session
 
 from app.models.agent_run import AgentRun
 from app.models.chat_history import ChatHistory
+from app.core.exceptions import DomainValidationError
 from app.schemas.agent import AgentRunRequest, AgentRunStartResponse
 from app.schemas.companion import (
+    CompanionBackend,
     CompanionCapability,
     CompanionEmotionDefinition,
     CompanionEventRequest,
@@ -50,6 +53,11 @@ _AGENT_TOOLS = (
     "list_recent_documents", "recall_memory", "message_lookup", "create_memory_card",
 )
 _MEMORY_TOOLS = {"recall_memory", "create_memory_card"}
+_CLI_BACKENDS = (
+    ("codex", "Codex CLI", "cli_agent_codex_path", "cli_agent_codex_model"),
+    ("claude_code", "Claude Code", "cli_agent_claude_path", "cli_agent_claude_model"),
+    ("pi", "Pi CLI", "cli_agent_pi_path", "cli_agent_pi_model"),
+)
 _EMOTION_DURATION = timedelta(minutes=5)
 
 COMPANION_SYSTEM_PROMPT = """你是彩宝（CaiBao），住在用户桌面上的薄荷绿小猫 AI 伙伴。
@@ -75,10 +83,6 @@ class CompanionService:
 
     def profile(self, *, team_id: str, user_id: str) -> CompanionProfile:
         self.agent_service.user_service.ensure_user_in_team(team_id=team_id, user_id=user_id)
-        settings = self.agent_service.llm_service.settings
-        demo = settings.llm_provider.strip().lower() == "mock" and not (
-            settings.llm_base_url.strip() and (settings.llm_api_key or "").strip()
-        )
         return CompanionProfile(
             state=self.state(team_id=team_id, user_id=user_id),
             capabilities=[
@@ -89,10 +93,59 @@ class CompanionService:
                 CompanionCapability(id="voice", label="设备语音", detail="是否可用取决于浏览器和设备"),
             ],
             emotions=list(EMOTIONS),
-            runtime=CompanionRuntime(provider=settings.llm_provider, model=settings.llm_model, demo_mode=demo),
+            runtime=self._api_runtime(),
         )
 
+    def _api_runtime(self) -> CompanionRuntime:
+        settings = self.agent_service.llm_service.settings
+        demo = settings.llm_provider.strip().lower() == "mock" and not (
+            settings.llm_base_url.strip() and (settings.llm_api_key or "").strip()
+        )
+        return CompanionRuntime(provider=settings.llm_provider, model=settings.llm_model, demo_mode=demo)
+
+    def backends(self, *, team_id: str, user_id: str) -> list[CompanionBackend]:
+        """Report configured runtime choices without spawning CLIs or reading credentials.
+
+        Availability means that a backend can be selected. It is deliberately
+        not an authentication or upstream connectivity probe.
+        """
+        self.agent_service.user_service.ensure_user_in_team(team_id=team_id, user_id=user_id)
+        settings = self.agent_service.llm_service.settings
+        runtime = self._api_runtime()
+        api_reason = "API 模式，使用服务端配置；尚未验证模型连通性。"
+        if runtime.demo_mode:
+            api_reason = "演示模式：当前使用 mock，配置模型后才能真实推理。"
+        elif not (settings.llm_api_key or "").strip():
+            api_reason = "API 模式尚未配置密钥；请先完成模型配置。"
+        result = [CompanionBackend(
+            id="api", label="API 模型", kind="api", available=True,
+            reason=api_reason, model=runtime.model, demo_mode=runtime.demo_mode,
+        )]
+        for backend_id, label, path_setting, model_setting in _CLI_BACKENDS:
+            available = False
+            if not settings.cli_agent_enabled:
+                reason = "服务端未启用 CLI 后端。"
+            elif not shutil.which(getattr(settings, path_setting)):
+                reason = f"未找到 {label} 可执行程序；请先安装并配置服务端路径。"
+            else:
+                available = True
+                reason = "已找到可执行程序；登录、额度与工具权限由 CLI 管理，尚未验证。"
+            result.append(CompanionBackend(
+                id=backend_id, label=label, kind="cli", available=available, reason=reason,
+                model=getattr(settings, model_setting).strip() or None,
+            ))
+        return result
+
     def start_run(self, payload: CompanionRunRequest, *, team_id: str, user_id: str) -> AgentRunStartResponse:
+        cli_backend = payload.backend != "api"
+        if cli_backend:
+            if payload.mode != "agent":
+                raise DomainValidationError("CLI 后端仅支持「帮我做事」模式；聊天请选择 API 模型。")
+            if payload.model is not None:
+                raise DomainValidationError("CLI 模型由服务端 CLI 配置决定，不能使用 API 模型覆盖。")
+            backend = next(item for item in self.backends(team_id=team_id, user_id=user_id) if item.id == payload.backend)
+            if not backend.available:
+                raise DomainValidationError(backend.reason)
         allowed_tools = [] if payload.mode == "chat" else list(_AGENT_TOOLS)
         if not payload.include_memory:
             allowed_tools = [name for name in allowed_tools if name not in _MEMORY_TOOLS]
@@ -102,12 +155,15 @@ class CompanionService:
             conversation_id=payload.conversation_id,
             task=payload.task,
             trigger_channel="companion",
+            run_mode=payload.backend if cli_backend else "agent_auto",
             system_prompt=COMPANION_SYSTEM_PROMPT,
-            include_memory=payload.include_memory,
-            include_library=payload.mode == "agent",
+            include_memory=False if cli_backend else payload.include_memory,
+            include_library=False if cli_backend else payload.mode == "agent",
             include_conclusions=False,
             model=payload.model,
-            enabled_tools=allowed_tools,
+            # This controls CaiBao API tools only. CLI backends own their tool
+            # permissions; the empty list must not be presented as a CLI sandbox.
+            enabled_tools=[] if cli_backend else allowed_tools,
             confirm_dangerous_actions=False,
             dry_run=False,
             max_steps=6,

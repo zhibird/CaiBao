@@ -33,3 +33,8 @@ test('TTS removes code and visual markup, bounds playback length',()=>{
   assert.equal(speechText('## 你好 **彩宝** [网页](https://example.com)\n```sh\nrm -rf x\n```'),' 你好 彩宝 网页\n代码在聊天里。');
   assert.equal(speechText('好'.repeat(3000)).length,1800);
 });
+
+test('cancelled task returns to neutral presence rather than success celebration',()=>{
+  const state=reduceEvent({...initialState(),activity:'working',tool:'web_search'}, {event:'run.cancelled'});
+  assert.equal(state.activity,'idle');assert.equal(state.emotion,'idle');assert.equal(state.tool,null);
+});

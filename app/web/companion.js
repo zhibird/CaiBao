@@ -4,7 +4,7 @@ const $ = id => document.getElementById(id);
 const desktop = new URLSearchParams(location.search).get('desktop') === '1';
 const native = (action, extra = {}) => window.webkit?.messageHandlers?.caibao?.postMessage({action, ...extra});
 let state = initialState(), account = null, conversationId = null, currentRun = null;
-let runtimeProfile = null;
+let runtimeProfile = null, backends = [];
 let busy = false, pendingApproval = false, registering = false, recognition = null, toastTimer;
 let speechGeneration = 0;
 const preferences = (() => {try {return JSON.parse(localStorage.getItem('caibao.companion.preferences') || '{}');} catch {return {};}})();
@@ -68,7 +68,15 @@ async function signedIn(user) {
   for (const model of models.items) $('model-select').add(new Option(model.model_name,model.model_name));
   const preferredModel = localStorage.getItem(`caibao.companion.model.${user.user_id}`);
   if (models.items.some(model => model.model_name === preferredModel)) $('model-select').value = preferredModel;
-  if ($('model-select').value) {connection(`已连接 · ${user.display_name}`, true); $('model-label').textContent = $('model-select').value;}
+  backends = await api('/companion/backends');
+  $('backend').replaceChildren();
+  for (const item of backends) {
+    const option = new Option(item.label + (item.available ? '' : ' · 未就绪'),item.id);
+    option.disabled = !item.available; $('backend').add(option);
+  }
+  const preferredBackend = localStorage.getItem(`caibao.companion.backend.${user.user_id}`);
+  if (backends.some(item => item.id === preferredBackend && item.available)) $('backend').value = preferredBackend;
+  updateBackend();
 
   renderModelStatus();
   setState({...profile.state, label: profile.state.activity === 'sleeping' ? '眯一会儿，叫我就好' : '嗯，我在。今天想做点什么？'});
@@ -99,9 +107,12 @@ async function ensureConversation() {
   }
 }
 function setBusy(value) {
-  busy = value; $('send').disabled = value || pendingApproval; $('new-chat').disabled = value;
+  busy = value; $('send').disabled = value || pendingApproval; $('new-chat').disabled = value || pendingApproval;
   $('account-button').disabled = value || pendingApproval;
-  $('mode').disabled = value; $('memory').disabled = value; $('model-select').disabled = value;
+  $('backend').disabled = value;
+  const cli = $('backend').value !== 'api';
+  $('mode').disabled = value || cli; $('memory').disabled = value || cli; $('model-select').disabled = value || cli;
+  $('stop-task').hidden = !value || cli;
 }
 function logTask(text) {
   const line = document.createElement('div'); line.textContent = text; $('task-log').append(line);
@@ -110,9 +121,9 @@ function logTask(text) {
 function showApproval(run) {
   currentRun = run.run_id; pendingApproval = true; $('approval').hidden = false; $('send').disabled = true;
   $('approval-detail').textContent = (run.required_confirmations || []).map(call => `${call.tool_name}\n${JSON.stringify(call.arguments, null, 2)}`).join('\n\n') || '请到工作台查看操作详情后确认。';
-  $('approve').disabled = !run.required_confirmations?.length;
+  $('approve').disabled = !run.required_confirmations?.length; $('new-chat').disabled = true;
 }
-function clearApproval() { pendingApproval = false; $('approval').hidden = true; $('send').disabled = busy; }
+function clearApproval() { pendingApproval = false; $('approval').hidden = true; $('send').disabled = busy; $('new-chat').disabled = busy; }
 async function consumeRun(start, content) {
   currentRun = start.run_id;
   // Never retry GET: opening a queued SSE endpoint starts real work.
@@ -130,7 +141,16 @@ async function consumeRun(start, content) {
       showApproval({run_id:currentRun, required_confirmations:[payload]});
       $('task-status').textContent = '等待你的确认，尚未执行。';
     }
+    if (event.event === 'run.cancelled') {
+      completed = true; finalAnswer = '';
+      content.textContent ||= '任务已停止。已经开始的操作可能仍会结束，详情见任务记录。';
+      clearApproval(); $('task-status').textContent = '已停止后续步骤。已经开始的操作可能仍会结束。';
+    }
+    if (event.event === 'run.in_progress') {completed = true; streamError = '这个任务已在另一个连接执行，请到工作台查看状态。';}
     if (event.event === 'run.failed') {completed = true; streamError = payload.error || '任务执行失败';}
+    if (event.event === 'run.completed' && payload.status === 'cancelled') {
+      completed = true; clearApproval(); $('task-status').textContent = '已停止后续步骤。'; return;
+    }
     if (event.event === 'run.completed') {
       completed = true; finalAnswer = payload.answer || content.textContent;
       content.textContent = finalAnswer || '这次没有生成回复。'; scrollMessages();
@@ -155,7 +175,7 @@ async function send(task) {
   message('user', task); const content = message('assistant', '');
   try {
     await ensureConversation();
-    const start = await api('/companion/runs', {method:'POST', body:JSON.stringify({task,conversation_id:conversationId,mode:$('mode').value,include_memory:$('memory').checked,model:$('model-select').value || null})});
+    const start = await api('/companion/runs', {method:'POST', body:JSON.stringify({task,conversation_id:conversationId,mode:$('mode').value,include_memory:$('memory').checked,model:$('backend').value === 'api' ? $('model-select').value || null : null,backend:$('backend').value})});
     await consumeRun(start, content);
   } catch (error) {
     content.parentElement.classList.add('error'); content.textContent = error.message;
@@ -191,11 +211,28 @@ $('messages').addEventListener('click', event => {const prompt = event.target.cl
 $('settings-toggle').onclick = () => { $('settings').hidden = !$('settings').hidden; };
 for (const id of ['voice','memory','mode']) $(id).onchange = () => {savePreferences(); if (id === 'voice' && !$('voice').checked) stopSpeech();};
 function renderModelStatus() {
+  if ($('backend').value !== 'api') {
+    const backend = backends.find(item => item.id === $('backend').value);
+    connection(`${backend?.label || 'CLI'} · 使用 CLI 自身登录与工具`,true);
+    $('model-label').textContent = backend?.model || backend?.label || 'CLI'; return;
+  }
   const selected = $('model-select').value;
   const demo = !selected && runtimeProfile?.runtime.demo_mode;
   connection(demo ? '演示模式 · 配置模型后即可真实对话' : `已连接 · ${account?.display_name || '彩宝'}`, true);
   $('model-label').textContent = selected || (demo ? 'DEMO · MOCK MODEL' : runtimeProfile?.runtime.model || 'LOCAL COMPANION');
 }
+function updateBackend() {
+  const selected = backends.find(item => item.id === $('backend').value);
+  const cli = selected?.kind === 'cli';
+  $('backend-note').textContent = selected?.reason || 'DeepSeek 等 API 模型在工作台中配置。';
+  if (cli) $('mode').value = 'agent';
+  $('mode').disabled = cli; $('memory').disabled = cli; $('model-select').disabled = cli;
+  renderModelStatus();
+}
+$('backend').onchange = () => {
+  if (account) localStorage.setItem(`caibao.companion.backend.${account.user_id}`, $('backend').value);
+  updateBackend();
+};
 $('model-select').onchange = () => {
   if (account) localStorage.setItem(`caibao.companion.model.${account.user_id}`, $('model-select').value);
   renderModelStatus();
@@ -212,6 +249,8 @@ $('pet').addEventListener('pointermove', event => {
 $('pet').addEventListener('pointerup', () => {pointerStart = null;});
 $('pet').addEventListener('click', () => {if (!dragged) interact('pet');});
 function compact(value) {document.body.classList.toggle('compact', value); native('mode',{compact:value});}
+$('native-hide').onclick = () => {stopSpeech(); native('hide');};
+$('native-quit').onclick = () => {stopSpeech(); native('quit');};
 $('compact-open').onclick = () => compact(false); $('collapse').onclick = () => compact(true);
 window.addEventListener('caibao-native-mode', event => document.body.classList.toggle('compact', Boolean(event.detail.compact)));
 window.addEventListener('caibao-native-ready', event => {document.body.classList.add('desktop'); document.body.classList.toggle('compact', Boolean(event.detail.compact));});
@@ -235,7 +274,20 @@ $('approve').onclick = async () => {
     $('task-status').textContent = run.status === 'failed' ? '执行遇到问题，详情见回复。' : '确认后的操作已返回。';
   } catch (error) {toast(error.message);} finally {setBusy(false); $('approve').disabled = false; $('decline').disabled = false;}
 };
-$('decline').onclick = () => {clearApproval(); currentRun = null; setState({activity:'idle',emotion:'idle',label:'好，这次先不做'}); $('task-status').textContent = '已保留待确认记录；没有执行操作。';};
+async function cancelTask() {
+  if (!currentRun) return;
+  $('stop-task').disabled = true; $('decline').disabled = true;
+  try {
+    const result = await api(`/agent/runs/${encodeURIComponent(currentRun)}/cancel`,{method:'POST'});
+    if (result.status === 'cancelled') {
+      clearApproval(); stopSpeech();
+      setState({activity:'idle',emotion:'idle',label:'好，这次先停在这里'});
+      $('task-status').textContent = '已停止后续步骤。已开始的工具操作可能仍会结束。';
+    } else toast('任务已经结束，结果已保留。');
+  } catch (error) {toast(error.message);} finally {$('stop-task').disabled = false; $('decline').disabled = false;}
+}
+$('stop-task').onclick = cancelTask;
+$('decline').onclick = cancelTask;
 $('auth-switch').onclick = () => {
   registering = !registering; $('display-name-label').hidden = !registering;
   $('auth-title').textContent = registering ? '很高兴认识你' : '和彩宝认识一下';

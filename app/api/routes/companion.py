@@ -9,6 +9,7 @@ from app.db.session import get_db_session
 from app.models.user import User
 from app.schemas.agent import AgentRunStartResponse
 from app.schemas.companion import (
+    CompanionBackend,
     CompanionEventRequest,
     CompanionEventResponse,
     CompanionProfile,
@@ -33,6 +34,14 @@ def get_profile(
     service: CompanionService = Depends(get_companion_service),
 ) -> CompanionProfile:
     return service.profile(team_id=current_user.team_id, user_id=current_user.user_id)
+
+
+@router.get("/backends", response_model=list[CompanionBackend])
+def list_backends(
+    current_user: User = Depends(require_current_active_user),
+    service: CompanionService = Depends(get_companion_service),
+) -> list[CompanionBackend]:
+    return service.backends(team_id=current_user.team_id, user_id=current_user.user_id)
 
 
 @router.post("/runs", response_model=AgentRunStartResponse, status_code=status.HTTP_201_CREATED)
