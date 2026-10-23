@@ -22,3 +22,6 @@ tmp/
 qqbot_adapter/config.toml
 *.log
 output/
+build/
+.swift-module-cache/
+data/local/
