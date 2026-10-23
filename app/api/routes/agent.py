@@ -106,6 +106,23 @@ def stream_agent_run(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
+@router.post("/runs/{run_id}/cancel", response_model=AgentRunResponse)
+def cancel_agent_run(
+    run_id: str,
+    current_user: User = Depends(require_current_active_user),
+    agent_service: AgentService = Depends(get_agent_service),
+) -> AgentRunResponse:
+    """Stop at the next model/tool boundary; active external work may finish."""
+    try:
+        return agent_service.cancel_run(
+            run_id=run_id, team_id=current_user.team_id, user_id=current_user.user_id,
+        )
+    except EntityNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except DomainValidationError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
 @router.post("/runs/{run_id}/confirm", response_model=AgentRunResponse)
 def confirm_agent_run(
     run_id: str,

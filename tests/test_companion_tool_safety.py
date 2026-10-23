@@ -181,6 +181,7 @@ def test_companion_history_survives_reload_and_enters_next_turn(client):
 
 def test_streaming_keyword_fallback_uses_next_step_for_tool_events():
     service = object.__new__(AgentService)
+    service.db = SimpleNamespace(scalar=lambda query: None)
     service.tool_service = _Tools()
     events = []
     service.event_bus = SimpleNamespace(emit=events.append)

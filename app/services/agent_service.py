@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterator
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import DomainValidationError, EntityNotFoundError
@@ -54,6 +54,7 @@ from app.services.user_service import UserService
 
 _MAX_TOOL_LOOP_ITERATIONS = 15
 _MAX_CONSECUTIVE_DUPLICATE_CALLS = 2
+_CANCELLED_ANSWER = "任务已停止。已经开始的工具可能仍会完成，后续操作不会继续。"
 
 
 class AgentService:
@@ -171,6 +172,18 @@ class AgentService:
             yield from self._replay_existing_run(run)
             return
 
+        # Claim once: opening a second stream must not start the same work twice,
+        # or revive a run cancelled after the initial read.
+        claimed = self.db.execute(
+            update(AgentRun).where(AgentRun.run_id == run_id, AgentRun.status == "queued")
+            .values(status="running").execution_options(synchronize_session=False)
+        ).rowcount
+        self.db.commit()
+        self.db.refresh(run)
+        if not claimed:
+            yield from self._replay_existing_run(run)
+            return
+
         payload = self._load_request_payload(run)
         team_id = run.team_id
         user_id = run.user_id
@@ -230,6 +243,13 @@ class AgentService:
                 response = self.get_run(run_id=run.run_id, team_id=team_id, user_id=user_id)
                 self._record_agent_history(payload=payload, response=response)
         except Exception as exc:
+            if self._is_run_cancelled(run):
+                response = self.get_run(run_id=run.run_id, team_id=team_id, user_id=user_id)
+                yield AgentStreamEvent(
+                    event="run.cancelled", run_id=run.run_id, seq=(seq or 0) + 1,
+                    payload=self._run_response_dict(response),
+                )
+                return
             self._finish_run(run=run, status="failed", final_answer=f"Agent execution failed: {exc}",
                              required_confirmations=[], started=started)
             seq = (seq or 0) + 1
@@ -241,9 +261,40 @@ class AgentService:
 
         seq = (seq or 0) + 1
         yield AgentStreamEvent(
-            event="run.completed", run_id=run.run_id, seq=seq,
+            event="run.cancelled" if response.status == "cancelled" else "run.completed", run_id=run.run_id, seq=seq,
             payload=self._run_response_dict(response),
         )
+
+    def cancel_run(self, *, run_id: str, team_id: str, user_id: str) -> AgentRunResponse:
+        """Request cooperative stop; an in-flight network/tool call may finish."""
+        run = self._ensure_run_access(run_id=run_id, team_id=team_id, user_id=user_id)
+        if run.status not in {"queued", "running", "requires_confirmation"}:
+            return self.get_run(run_id=run_id, team_id=team_id, user_id=user_id)
+        payload = self._load_request_payload(run)
+        supported = payload.run_mode.strip().lower() == "agent_auto"
+        allowed_statuses = {"queued", "requires_confirmation"} | ({"running"} if supported else set())
+        if run.status not in allowed_statuses:
+            raise DomainValidationError("Running CLI and workflow tasks do not support cooperative cancellation.")
+        changed = self.db.execute(
+            update(AgentRun).where(AgentRun.run_id == run_id, AgentRun.status.in_(allowed_statuses))
+            .values(status="cancelled", final_answer=_CANCELLED_ANSWER,
+                    required_confirmations_json="[]", loop_state_json=None,
+                    completed_at=datetime.now(timezone.utc))
+            .execution_options(synchronize_session=False)
+        ).rowcount
+        self.db.commit()
+        self.db.refresh(run)
+        if not changed and run.status == "running" and not supported:
+            raise DomainValidationError("Running CLI and workflow tasks do not support cooperative cancellation.")
+        return self.get_run(run_id=run_id, team_id=team_id, user_id=user_id)
+
+    def _is_run_cancelled(self, run: AgentRun) -> bool:
+        if not isinstance(run, AgentRun):
+            return getattr(run, "status", None) == "cancelled"
+        # Read a scalar column so an ORM identity cached by the executing request
+        # cannot hide a stop committed by a separate HTTP request/session.
+        with self.db.no_autoflush:
+            return self.db.scalar(select(AgentRun.status).where(AgentRun.run_id == run.run_id)) == "cancelled"
 
     def confirm_run(self, *, run_id: str, team_id: str, user_id: str) -> AgentRunResponse:
         run = self._ensure_run_access(run_id=run_id, team_id=team_id, user_id=user_id)
@@ -255,6 +306,16 @@ class AgentService:
             raise DomainValidationError("This run has no pending tool calls.")
 
         loop_state = self._load_loop_state(run)
+        claimed = self.db.execute(
+            update(AgentRun).where(AgentRun.run_id == run_id, AgentRun.status == "requires_confirmation")
+            .values(status="running").execution_options(synchronize_session=False)
+        ).rowcount
+        self.db.commit()
+        self.db.refresh(run)
+        if not claimed:
+            if run.status == "cancelled":
+                return self.get_run(run_id=run_id, team_id=team_id, user_id=user_id)
+            raise DomainValidationError("This confirmation is already being processed.")
         if loop_state is None:
             # Keyword-fallback path: no LLM loop to resume, just execute and finish.
             return self._confirm_fallback(run=run, pending_calls=pending_calls,
@@ -283,6 +344,8 @@ class AgentService:
                 tool_name=call.tool_name, arguments=call.arguments,
             ))
         tool_started = time.perf_counter()
+        if self._is_run_cancelled(run):
+            return self.get_run(run_id=run_id, team_id=team_id, user_id=user_id)
         try:
             result = self.tool_service.execute(
                 team_id=team_id, user_id=user_id,
@@ -369,6 +432,8 @@ class AgentService:
         tool_results: list[dict[str, object]] = []
         tool_errors: list[str] = []
         for call in pending_calls:
+            if self._is_run_cancelled(run):
+                break
             if self.event_bus:
                 self.event_bus.emit(ToolCalled(
                     run_id=run.run_id, step_index=next_index,
@@ -484,6 +549,8 @@ class AgentService:
         started: float,
         routes: dict[str, object],
     ) -> AgentRunResponse:
+        if self._is_run_cancelled(run):
+            return self.get_run(run_id=run.run_id, team_id=team_id, user_id=user_id)
         # Phase 1 plan step (trace)
         step_index = 1
         planner = self._routes_to_planner_dict(routes)
@@ -581,6 +648,8 @@ class AgentService:
         routes: dict[str, object],
     ) -> Iterator[AgentStreamEvent]:
         """Streaming variant of the LLM tool loop."""
+        if self._is_run_cancelled(run):
+            return
         seq = 1
         planner = self._routes_to_planner_dict(routes)
         model_name = planner["model_name"]
@@ -601,6 +670,8 @@ class AgentService:
             event="step.started", run_id=run.run_id, step_index=2, seq=seq,
             payload={"step_type": "retrieval", "title": "Retrieve workspace context"},
         )
+        if self._is_run_cancelled(run):
+            return
         rag_answer, retrieval_failed = self._record_retrieval_step(
             run=run, payload=payload, team_id=team_id, user_id=user_id,
             space_id=space_id, step_index=2, title="Retrieve workspace context",
@@ -691,6 +762,8 @@ class AgentService:
         )
 
         for iteration in range(min(_MAX_TOOL_LOOP_ITERATIONS, tool_budget + 2)):
+            if self._is_run_cancelled(run):
+                return _CANCELLED_ANSWER, "cancelled", False
             if tool_calls_used >= tool_budget:
                 messages.append({"role": "user", "content": self._tool_budget_prompt(tool_budget)})
                 final_result = self.llm_service.complete_chat(
@@ -700,6 +773,8 @@ class AgentService:
                     api_key=api_key,
                     tools=None,
                 )
+                if self._is_run_cancelled(run):
+                    return _CANCELLED_ANSWER, "cancelled", False
                 if final_result.assistant_text:
                     accumulated_text.append(final_result.assistant_text)
                 final_text = "\n".join(accumulated_text).strip()
@@ -712,6 +787,8 @@ class AgentService:
                 api_key=api_key,
                 tools=tools if tools else None,
             )
+            if self._is_run_cancelled(run):
+                return _CANCELLED_ANSWER, "cancelled", False
 
             if result.assistant_text:
                 accumulated_text.append(result.assistant_text)
@@ -728,6 +805,8 @@ class AgentService:
 
             # Process tool calls
             for tc in result.tool_calls:
+                if self._is_run_cancelled(run):
+                    return _CANCELLED_ANSWER, "cancelled", False
                 if tool_calls_used >= tool_budget:
                     break
                 fn = tc.get("function", {})
@@ -809,6 +888,8 @@ class AgentService:
                         tool_name=tool_name, arguments=normalized_args,
                     ))
                 tool_started = time.perf_counter()
+                if self._is_run_cancelled(run):
+                    return _CANCELLED_ANSWER, "cancelled", False
                 if dry_run:
                     tool_result = {"tool_name": tool_name, "arguments": normalized_args, "result": {"dry_run": True}}
                     tool_status = "skipped"
@@ -891,6 +972,8 @@ class AgentService:
         )
 
         for iteration in range(min(_MAX_TOOL_LOOP_ITERATIONS, tool_budget + 2)):
+            if self._is_run_cancelled(run):
+                return
             accumulated_names: dict[str, str] = {}
             accumulated_args: dict[str, str] = {}
             accumulated_reasoning: list[str] = []
@@ -906,6 +989,8 @@ class AgentService:
                     api_key=api_key,
                     tools=None,
                 ):
+                    if self._is_run_cancelled(run):
+                        return
                     if chunk.delta_text:
                         accumulated_text.append(chunk.delta_text)
                         seq += 1
@@ -923,6 +1008,8 @@ class AgentService:
                     api_key=api_key,
                     tools=tools if tools else None,
                 ):
+                    if self._is_run_cancelled(run):
+                        return
                     if chunk.delta_text:
                         accumulated_text.append(chunk.delta_text)
                         seq += 1
@@ -948,6 +1035,8 @@ class AgentService:
                         run=run, team_id=team_id, user_id=user_id,
                         space_id=space_id, started=started,
                     )
+                    if self._is_run_cancelled(run):
+                        return
                     seq += 1
                     yield AgentStreamEvent(
                         event="llm.delta", run_id=run.run_id, seq=seq,
@@ -968,6 +1057,8 @@ class AgentService:
                 break
 
             for tc in current_tool_calls:
+                if self._is_run_cancelled(run):
+                    return
                 if tool_calls_used >= tool_budget:
                     break
                 fn = tc.get("function", {})
@@ -1063,6 +1154,8 @@ class AgentService:
                 )
 
                 tool_started = time.perf_counter()
+                if self._is_run_cancelled(run):
+                    return
                 if dry_run:
                     tool_result = {"tool_name": tool_name, "arguments": normalized_args, "result": {"dry_run": True}}
                     tool_status = "skipped"
@@ -1098,6 +1191,9 @@ class AgentService:
                 tool_call_history.append(call_sig)
                 tool_calls_used += 1
 
+                if self._is_run_cancelled(run):
+                    return
+
                 seq += 1
                 yield AgentStreamEvent(
                     event="tool.result", run_id=run.run_id, step_index=current_step, seq=seq,
@@ -1114,6 +1210,8 @@ class AgentService:
             if not current_tool_calls:
                 break
 
+        if self._is_run_cancelled(run):
+            return
         final_text = "\n".join(accumulated_text).strip()
         if not final_text:
             final_text = "Agent has completed its analysis."
@@ -1814,8 +1912,10 @@ class AgentService:
             "messages": self._strip_non_serializable_messages(messages),
             "pending_tool_call_id": pending_tool_call_id,
         }
-        run.loop_state_json = self._to_json(loop)
-        self.db.add(run)
+        self.db.execute(
+            update(AgentRun).where(AgentRun.run_id == run.run_id, AgentRun.status != "cancelled")
+            .values(loop_state_json=self._to_json(loop)).execution_options(synchronize_session=False)
+        )
         self.db.commit()
         self.db.refresh(run)
 
@@ -1825,8 +1925,11 @@ class AgentService:
         return self._safe_json_dict(run.loop_state_json)
 
     def _save_pending_tool_call(self, run: AgentRun, call: AgentToolCall) -> None:
-        run.required_confirmations_json = self._to_json([call.model_dump()])
-        self.db.add(run)
+        self.db.execute(
+            update(AgentRun).where(AgentRun.run_id == run.run_id, AgentRun.status != "cancelled")
+            .values(required_confirmations_json=self._to_json([call.model_dump()]))
+            .execution_options(synchronize_session=False)
+        )
         self.db.commit()
         self.db.refresh(run)
 
@@ -1932,6 +2035,8 @@ class AgentService:
             return [], [call.model_copy(update={"requires_confirmation": call.dangerous}) for call in calls], [], "skipped"
 
         for call in calls:
+            if run_id and self.db.scalar(select(AgentRun.status).where(AgentRun.run_id == run_id)) == "cancelled":
+                break
             enriched_call = self._enrich_tool_call(call=call, space_id=space_id, task=task)
             if enriched_call.dangerous and not confirm_dangerous_actions:
                 skipped_calls.append(enriched_call.model_copy(update={"requires_confirmation": True}))
@@ -2039,7 +2144,7 @@ class AgentService:
         return AgentRunRequest.model_validate(raw)
 
     def _replay_existing_run(self, run: AgentRun) -> Iterator[AgentStreamEvent]:
-        """Replay steps for an already-completed run."""
+        """Replay persisted state without starting another execution."""
         steps = self._load_steps(run.run_id)
         seq = 0
         yield AgentStreamEvent(
@@ -2054,8 +2159,13 @@ class AgentService:
             )
         seq += 1
         full_response = self.get_run(run_id=run.run_id, team_id=run.team_id, user_id=run.user_id)
+        event_name = (
+            "run.cancelled" if full_response.status == "cancelled"
+            else "run.in_progress" if full_response.status in {"queued", "running"}
+            else "run.completed"
+        )
         yield AgentStreamEvent(
-            event="run.completed", run_id=run.run_id, seq=seq,
+            event=event_name, run_id=run.run_id, seq=seq,
             payload=full_response.model_dump(mode="json"),
         )
 
@@ -2115,16 +2225,22 @@ class AgentService:
         required_confirmations: list[AgentToolCall],
         started: float,
     ) -> None:
-        run.status = status
-        run.final_answer = final_answer
-        run.required_confirmations_json = self._to_json([item.model_dump() for item in required_confirmations])
-        run.latency_ms = self._elapsed_ms(started)
-        run.completed_at = datetime.now(timezone.utc)
+        values: dict[str, Any] = {
+            "status": status, "final_answer": final_answer,
+            "required_confirmations_json": self._to_json([item.model_dump() for item in required_confirmations]),
+            "latency_ms": self._elapsed_ms(started), "completed_at": datetime.now(timezone.utc),
+        }
         if status != "requires_confirmation":
-            run.loop_state_json = None
-        self.db.add(run)
+            values["loop_state_json"] = None
+        # A result arriving after Stop must not revive the run or its approvals.
+        changed = self.db.execute(
+            update(AgentRun).where(AgentRun.run_id == run.run_id, AgentRun.status != "cancelled")
+            .values(**values).execution_options(synchronize_session=False)
+        ).rowcount
         self.db.commit()
         self.db.refresh(run)
+        if not changed:
+            return
 
         if self.event_bus and status in ("completed", "partial_success"):
             self.event_bus.enqueue(TurnCommitted(
@@ -2403,7 +2519,10 @@ class AgentService:
 
     def _ensure_run_access(self, *, run_id: str, team_id: str, user_id: str) -> AgentRun:
         self.user_service.ensure_user_in_team(user_id=user_id, team_id=team_id)
-        run = self.db.get(AgentRun, run_id)
+        run = self.db.scalar(
+            select(AgentRun).where(AgentRun.run_id == run_id)
+            .execution_options(populate_existing=True)
+        )
         if run is None or run.team_id != team_id or run.user_id != user_id:
             raise EntityNotFoundError(f"Agent run '{run_id}' not found.")
         return run
