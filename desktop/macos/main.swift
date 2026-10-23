@@ -33,6 +33,7 @@ final class CaiBaoApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
         NSApp.setActivationPolicy(.accessory)
         speaker.delegate = self
         makeWindow()
+        makeApplicationMenu()
         makeMenu()
         reconnect()
         showCompanion()
@@ -68,6 +69,34 @@ final class CaiBaoApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
             let bounds = screen.visibleFrame
             panel.setFrameOrigin(NSPoint(x: bounds.maxX - size.width - 28, y: bounds.minY + 32))
         }
+    }
+
+    private func makeApplicationMenu() {
+        // Status-item shortcuts alone are unreliable when the web view owns focus.
+        // Register normal application key equivalents so standard macOS commands work.
+        let mainMenu = NSMenu()
+        let applicationMenuItem = NSMenuItem()
+        let applicationMenu = NSMenu(title: "彩宝")
+        applicationMenu.addItem(item("收起彩宝", action: #selector(hideCompanion), key: "w"))
+        applicationMenu.addItem(item("重新连接本地服务", action: #selector(reconnect), key: "r"))
+        applicationMenu.addItem(item("停止说话", action: #selector(stopSpeaking), key: "."))
+        applicationMenu.addItem(.separator())
+        applicationMenu.addItem(item("退出彩宝", action: #selector(quit), key: "q"))
+        applicationMenuItem.submenu = applicationMenu
+        mainMenu.addItem(applicationMenuItem)
+
+        let editMenuItem = NSMenuItem()
+        let editMenu = NSMenu(title: "编辑")
+        for (title, selector, key) in [
+            ("剪切", "cut:", "x"), ("复制", "copy:", "c"),
+            ("粘贴", "paste:", "v"), ("全选", "selectAll:", "a")
+        ] {
+            // A nil target follows the responder chain to the focused WKWebView input.
+            editMenu.addItem(NSMenuItem(title: title, action: NSSelectorFromString(selector), keyEquivalent: key))
+        }
+        editMenuItem.submenu = editMenu
+        mainMenu.addItem(editMenuItem)
+        NSApp.mainMenu = mainMenu
     }
 
     private func makeMenu() {
@@ -167,6 +196,7 @@ final class CaiBaoApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
                 panel.performDrag(with: event)
             }
         case "hide": hideCompanion()
+        case "quit": quit()
         case "openWorkbench": openWorkbench()
         case "listen": emit("caibao-native-listen", detail: ["available": false, "reason": "browser-fallback"])
         default: break

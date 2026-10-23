@@ -14,7 +14,7 @@ python3 -m venv .venv
 
 启动脚本先构建 `build/CaiBao.app`，复用已有的本地服务，或通过 `scripts/run-local.sh` 启动一个只监听本机的服务，然后打开桌宠。退出桌宠会停止**此次脚本启动的服务**；复用的服务继续运行。服务启动日志位于 `build/service.log`。直接双击 `.app` 时需先自行启动本地服务。
 
-只构建应用：
+只构建应用（不会启动或显示窗口）：
 
 ```sh
 ./scripts/build-macos.sh
@@ -27,6 +27,7 @@ python3 -m venv .venv
 - 桌宠浮在普通窗口上，可通过角色上的拖动手柄移动；聊天输入框可以正常获得键盘焦点。
 - 紧凑窗口为 300 × 340，展开聊天为 440 × 740，超出可用屏幕时自动缩小。
 - 菜单栏爪印可以唤醒、收起、重新连接、停止说话、打开工作台和退出。
+- 应用获得焦点时，`⌘Q` 退出，`⌘W` 收起，`⌘R` 重新连接。
 - 发音使用系统 `AVSpeechSynthesizer`；首次使用对应语言可在 macOS「系统设置 → 辅助功能 → 朗读内容」下载偏好的声音。
 - 此版本不申请麦克风或语音识别权限。原生聊天输入框可使用 macOS 自带听写；浏览器中的语音输入取决于浏览器对 `SpeechRecognition` 的支持。
 
@@ -47,6 +48,7 @@ window.webkit.messageHandlers.caibao.postMessage({ action: "speak", text: "我�
 | `mode` | `compact: boolean` | 改变窗口尺寸，尽量保留右上角位置 |
 | `drag` | — | 从最近一次鼠标按下事件拖动窗口 |
 | `hide` | — | 收起到菜单栏 |
+| `quit` | — | 退出应用；启动脚本会清理自己启动的本地服务 |
 | `openWorkbench` | — | 默认浏览器打开本地工作台 |
 | `listen` | — | 告知网页使用浏览器或系统听写 |
 
