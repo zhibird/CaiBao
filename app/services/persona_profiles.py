@@ -84,7 +84,7 @@ class PersonaProfile:
 
 _CHANNEL_TO_PERSONA: dict[frozenset[str], str] = {
     frozenset({"web", "web-app", "api", "app"}):               "enterprise",
-    frozenset({"qqbot", "qq-group", "qq-channel", "wechat"}):  "companion",
+    frozenset({"qqbot", "qq-group", "qq-channel", "wechat", "companion"}):  "companion",
 }
 
 

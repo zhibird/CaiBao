@@ -680,6 +680,10 @@ class AgentService:
         current_step = step_index
         tool_calls_used = 0
         tool_budget = max(1, min(int(max_tool_calls or 5), _MAX_TOOL_LOOP_ITERATIONS))
+        enabled_tool_names = (
+            {name.strip().lower() for name in enabled_tools if name.strip()}
+            if enabled_tools is not None else None
+        )
 
         for iteration in range(min(_MAX_TOOL_LOOP_ITERATIONS, tool_budget + 2)):
             if tool_calls_used >= tool_budget:
@@ -764,8 +768,7 @@ class AgentService:
                     continue
 
                 # Filter by enabled_tools (case-insensitive, like streaming)
-                enabled_tool_names = {t.strip().lower() for t in (enabled_tools or []) if t.strip()} if enabled_tools else None
-                if enabled_tool_names and tool_name.lower() not in enabled_tool_names:
+                if enabled_tool_names is not None and tool_name.lower() not in enabled_tool_names:
                     tool_calls_used += 1
                     messages.append(self._assistant_tool_call_message(tc))
                     messages.append({
@@ -873,6 +876,10 @@ class AgentService:
         current_step = 3
         tool_calls_used = 0
         tool_budget = max(1, min(int(max_tool_calls or 5), _MAX_TOOL_LOOP_ITERATIONS))
+        enabled_tool_names = (
+            {name.strip().lower() for name in enabled_tools if name.strip()}
+            if enabled_tools is not None else None
+        )
 
         for iteration in range(min(_MAX_TOOL_LOOP_ITERATIONS, tool_budget + 2)):
             accumulated_names: dict[str, str] = {}
@@ -997,8 +1004,7 @@ class AgentService:
                         "content": json.dumps({"error": f"Argument validation failed for {tool_name}."}),
                     })
                     continue
-                enabled_tool_names = {t.strip().lower() for t in (enabled_tools or []) if t.strip()} if enabled_tools else None
-                if enabled_tool_names and tool_name.lower() not in enabled_tool_names:
+                if enabled_tool_names is not None and tool_name.lower() not in enabled_tool_names:
                     tool_calls_used += 1
                     messages.append(self._assistant_tool_call_message(tc))
                     messages.append({
@@ -1209,6 +1215,7 @@ class AgentService:
         planned_calls = self._plan_tool_calls(run.task, enabled_tools=payload.enabled_tools, space_id=space_id)
         tool_results, skipped_calls, tool_errors = [], [], []
         if planned_calls:
+            step_index = self._next_step_index(run.run_id)
             tool_results, skipped_calls, tool_errors, _ = self._execute_tool_calls(
                 calls=planned_calls, team_id=team_id, user_id=user_id,
                 space_id=space_id, task=run.task,
@@ -1661,7 +1668,7 @@ class AgentService:
         messages: list[dict[str, object]] = []
         for item in history_items:
             channel = str(getattr(item, "channel", "")).strip().lower()
-            if channel not in {"ask", "echo", "agent", "app", "qqbot"}:
+            if channel not in {"ask", "echo", "agent", "app", "qqbot", "companion"}:
                 continue
 
             request_text = str(getattr(item, "request_text", "")).strip()
