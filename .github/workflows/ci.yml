@@ -22,8 +22,8 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     env:
-      UPLOAD_ROOT_DIR: ${{ runner.temp }}/caibao-test-uploads
-      MEMORY_ROOT_DIR: ${{ runner.temp }}/caibao-test-memory
+      UPLOAD_ROOT_DIR: ${{ github.workspace }}/.pytest_cache/ci-uploads
+      MEMORY_ROOT_DIR: ${{ github.workspace }}/.pytest_cache/ci-memory
     steps:
       - uses: actions/checkout@v4
         with:
