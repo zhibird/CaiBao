@@ -16,7 +16,7 @@ test('real runtime events drive attention, tools, approvals and completion', () 
   assert.equal(state.activity,'idle'); assert.equal(state.emotion,'happy');
 });
 test('failures are never presented as a successful happy pet',()=>{
-  for(const event of [{event:'run.failed'},{event:'run.completed',payload:{status:'failed'}}]){
+  for(const event of [{event:'run.failed'},{event:'run.completed',payload:{status:'failed'}},{event:'run.completed',payload:{status:'partial_success'}}]){
     const state=reduceEvent(initialState(),event);
     assert.equal(state.activity,'error');assert.equal(state.emotion,'concerned');
   }

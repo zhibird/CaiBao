@@ -5,8 +5,8 @@
 <h1 align="center">🐟 CaiBao <sup>彩宝</sup></h1>
 
 <p align="center">
-  <strong>轻量级 AI Agent 工作台</strong><br>
-  创建 Agent App、配置知识库、接入工具插件，聊聊就把活干了。
+  <strong>住在 macOS 桌面上的 AI 伙伴，也是一颗认真做事的 Agent 芯</strong><br>
+  会说话、有表情、记得住，也能调用工具把事情做好。
 </p>
 
 <p align="center">
@@ -14,14 +14,19 @@
   <img src="https://img.shields.io/badge/framework-FastAPI-009688?logo=fastapi">
   <img src="https://img.shields.io/badge/db-PostgreSQL%20|%20SQLite-336791">
   <img src="https://img.shields.io/badge/deploy-Docker-2496ED?logo=docker">
-  <img src="https://img.shields.io/badge/version-0.27.0-success">
+  <img src="https://img.shields.io/badge/version-0.28.0-success">
 </p>
 
 ---
 
 ## 是什么
 
-CaiBao 是一个 Dify-lite 风格的 Agent 搭建平台。你可以在上面创建 AI Agent 应用，给它配模型、接知识库、装工具插件，然后通过 Web 工作台或 API 来用。
+CaiBao（彩宝）是一只住在桌面上的薄荷绿小猫，也是一个可使用工具、记忆和知识库的 AI Agent。macOS 桌宠提供陪伴、系统朗读和任务表情；完整工作台保留模型、Agent App 与工具管理。两种界面共用同一套真实运行记录和权限边界。
+
+- 🐾 **macOS 桌宠** — 原创动态角色、透明置顶、拖动、摸头、休息、可见的隐藏／退出按钮
+- 🗣️ **设备语音** — 系统声音朗读，嘴型跟随播放，支持停止朗读
+- 🔀 **可切换大脑** — DeepSeek 等兼容 API，或本机 Codex / Claude Code / Pi CLI；不静默替换后端
+- ⏸️ **可控执行** — API 任务可停止后续步骤，记忆写入逐项审批，个人上下文按访问权限隔离
 
 - 🤖 **Agent App Builder** — 创建/配置/发布/调用，含版本快照
 - 🧠 **Function Calling 引擎** — 自实现 OpenAI 兼容 tool_calls 多轮循环
@@ -59,7 +64,19 @@ flowchart LR
 
 ## 快速开始
 
-### Docker（推荐）
+### macOS 桌宠
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+./scripts/run-macos.sh
+```
+
+点击「聊一会儿」登录本地账号。没有模型密钥时明确使用演示模式；接入真实模型可参考 [`config/deepseek.env.example`](config/deepseek.env.example) 与 [桌宠使用说明](docs/companion.md)。隐藏／退出按钮在桌宠左上角，快捷键为 **⌘W／⌘Q**。
+
+只用网页版：`./scripts/run-local.sh`，打开 `http://127.0.0.1:8000/companion`。构建出的 `.app` 需要本地服务，尚未包含独立 Python 运行时。
+
+### Docker 工作台
 
 ```bash
 cp .env.example .env   # 修改 AUTH_JWT_SECRET / POSTGRES_PASSWORD / LLM_API_KEY
@@ -146,6 +163,8 @@ python scripts/agent_eval.py --base-url http://127.0.0.1:8000 \
 
 ## 近期更新
 
+- **v0.28.0** — macOS 桌宠、系统语音、状态表情、伙伴会话与记忆审批、API／CLI 后端选择、协作式停止和访问隔离加固；[使用说明](docs/companion.md) · [更新日志](changelogs/0.28.0.md)
+
 - **v0.27.0** — 发布整理：未知 `run_mode` 改为显式 400、模式白名单单一事实来源、Compose 透传 `CLI_AGENT_*`、仓库卫生清理
 - **v0.26.0** — CLI 编码代理后端：Claude Code / Codex / Pi 以 `run_mode` 接入 Agent 引擎，多轮会话续接 + SSE 流式 + 执行轨迹持久化
 - **v0.25.0** — MCP 链路打通：官方 SDK 服务器（mcp-servers/utils）+ clientInfo 协议修复 + UTF-8/超时/路径健壮性修复
@@ -160,6 +179,8 @@ python scripts/agent_eval.py --base-url http://127.0.0.1:8000 \
 ---
 
 ## 参考
+
+产品与架构参考 [AIRI](https://github.com/moeru-ai/airi)、[goose](https://github.com/aaif-goose/goose)、[Puck](https://github.com/desFernan/puck-mac) 和 [Open-LLM-VTuber](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber)。本轮使用原创角色，没有复制其代码或美术素材；[设计取舍](docs/companion.md#参考与设计取舍)。
 
 [`LOCAL_DEV_RUNBOOK.md`](LOCAL_DEV_RUNBOOK.md) · [`design/`](design/) · [`docs/`](docs/) · [`changelogs/`](changelogs/) · [`qqbot_adapter/`](qqbot_adapter/)
 

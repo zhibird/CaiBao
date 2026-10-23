@@ -156,7 +156,7 @@ async function consumeRun(start, content) {
       content.textContent = finalAnswer || '这次没有生成回复。'; scrollMessages();
       if (payload.status === 'requires_confirmation') showApproval(payload);
       else if (payload.status === 'failed') streamError = payload.answer || '任务执行失败';
-      else {clearApproval(); $('task-status').textContent = '这一件事，完成了。';}
+      else {clearApproval(); $('task-status').textContent = payload.status === 'partial_success' ? '有些步骤没完成，详情见回复。' : '这一件事，完成了。';}
     }
   });
   const reader = response.body.getReader(), decoder = new TextDecoder();

@@ -10,7 +10,7 @@ export function reduceEvent(state, event) {
     case 'confirmation.required': return {...state, activity: 'waiting', emotion: 'curious', label: '这个操作，需要你点头'};
     case 'run.completed': return payload.status === 'requires_confirmation'
       ? {...state, activity: 'waiting', emotion: 'curious', label: '等你确认这个操作'}
-      : {...state, activity: payload.status === 'failed' ? 'error' : 'idle', emotion: payload.status === 'failed' ? 'concerned' : 'happy', label: payload.status === 'failed' ? '遇到一点问题' : '好啦，我说完了', tool: null};
+      : {...state, activity: ['failed','partial_success'].includes(payload.status) ? 'error' : 'idle', emotion: ['failed','partial_success'].includes(payload.status) ? 'concerned' : 'happy', label: ['failed','partial_success'].includes(payload.status) ? '有些步骤没完成，看看回复' : '好啦，我说完了', tool: null};
     case 'run.cancelled': return {...state, activity: 'idle', emotion: 'idle', label: '好，这次先停在这里', tool: null};
     case 'run.failed': return {...state, activity: 'error', emotion: 'concerned', label: '遇到一点问题，我们再试试', tool: null};
     default: return state;

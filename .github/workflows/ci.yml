@@ -1,0 +1,74 @@
+name: CaiBao CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python ${{ matrix.python-version }} · API and adapters
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    env:
+      UPLOAD_ROOT_DIR: ${{ runner.temp }}/caibao-test-uploads
+      MEMORY_ROOT_DIR: ${{ runner.temp }}/caibao-test-memory
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            qqbot_adapter/requirements.txt
+      - name: Install application and adapter test dependencies
+        run: python -m pip install -r requirements.txt -r qqbot_adapter/requirements.txt pytest-asyncio
+      - name: Run all API, agent and QQ adapter tests
+        run: python -m pytest -q
+
+  companion-state:
+    name: Companion state and SSE
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Validate browser module syntax
+        run: node --check app/web/companion.js
+      - name: Test real task state, stream parsing and speech text
+        run: node --test tests/companion-state.test.mjs
+
+  macos:
+    name: macOS native companion build
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate launcher scripts
+        run: bash -n scripts/build-macos.sh scripts/run-local.sh scripts/run-macos.sh
+      - name: Compile and sign native companion
+        run: ./scripts/build-macos.sh
+      - name: Validate app bundle and local signature
+        run: |
+          plutil -lint build/CaiBao.app/Contents/Info.plist
+          codesign --verify --deep --strict --verbose=2 build/CaiBao.app
