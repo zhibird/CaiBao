@@ -10,8 +10,10 @@ export function reduceEvent(state, event) {
     case 'confirmation.required': return {...state, activity: 'waiting', emotion: 'curious', label: '这个操作，需要你点头'};
     case 'run.completed': return payload.status === 'requires_confirmation'
       ? {...state, activity: 'waiting', emotion: 'curious', label: '等你确认这个操作'}
-      : {...state, activity: ['failed','partial_success'].includes(payload.status) ? 'error' : 'idle', emotion: ['failed','partial_success'].includes(payload.status) ? 'concerned' : 'happy', label: ['failed','partial_success'].includes(payload.status) ? '有些步骤没完成，看看回复' : '好啦，我说完了', tool: null};
+      : payload.status === 'cancelled' ? {...state, activity:'idle', emotion:'idle', label:'好，这次先停在这里', tool:null}
+      : {...state, activity: ['failed','partial_success','interrupted'].includes(payload.status) ? 'error' : 'idle', emotion: ['failed','partial_success','interrupted'].includes(payload.status) ? 'concerned' : 'happy', label: ['failed','partial_success','interrupted'].includes(payload.status) ? '有些步骤没完成，看看回复' : '好啦，我说完了', tool: null};
     case 'run.cancelled': return {...state, activity: 'idle', emotion: 'idle', label: '好，这次先停在这里', tool: null};
+    case 'run.interrupted': return {...state, activity: 'error', emotion: 'concerned', label: '任务中断了，先看看留下的记录', tool: null};
     case 'run.failed': return {...state, activity: 'error', emotion: 'concerned', label: '遇到一点问题，我们再试试', tool: null};
     default: return state;
   }
@@ -31,6 +33,10 @@ export function createSSEParser(onEvent) {
         if (!data) continue;
         const parsed = JSON.parse(data);
         if (!parsed.event) parsed.event = lines.find(line => line.startsWith('event:'))?.slice(6).trim();
+        if (!parsed.seq) {
+          const id = Number(lines.find(line => line.startsWith('id:'))?.slice(3).trim());
+          if (Number.isSafeInteger(id) && id > 0) parsed.seq = id;
+        }
         onEvent(parsed);
       }
     },

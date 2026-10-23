@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import re
 import time
 from datetime import datetime, timezone
@@ -9,10 +11,12 @@ from uuid import uuid4
 
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from app.core.exceptions import DomainValidationError, EntityNotFoundError
 from app.models.agent_run import AgentRun
 from app.models.agent_step import AgentStep
+from app.models.chat_history import ChatHistory
 from app.schemas.agent import (
     AgentRunRequest,
     AgentRunResponse,
@@ -100,12 +104,45 @@ class AgentService:
         self.user_service.ensure_user_in_team(user_id=user_id, team_id=team_id)
         self._validate_run_mode(payload.run_mode)
 
-        run = self._create_queued_run(payload=payload, team_id=team_id, user_id=user_id)
+        run = self._find_existing_request(payload, team_id=team_id, user_id=user_id)
+        if run is None:
+            try:
+                run = self._create_queued_run(payload=payload, team_id=team_id, user_id=user_id)
+            except IntegrityError:
+                # The unique request index arbitrates concurrent lost-response retries.
+                self.db.rollback()
+                run = self._find_existing_request(payload, team_id=team_id, user_id=user_id)
+                if run is None:
+                    raise
         return AgentRunStartResponse(
             run_id=run.run_id,
             stream_url=f"/agent/runs/{run.run_id}/stream",
-            status="queued",
+            status=run.status,
         )
+
+    def _find_existing_request(self, payload: AgentRunRequest, *, team_id: str, user_id: str) -> AgentRun | None:
+        if payload.client_request_id is None:
+            return None
+        run = self.db.scalar(select(AgentRun).where(
+            AgentRun.team_id == team_id, AgentRun.user_id == user_id,
+            AgentRun.client_request_id == payload.client_request_id,
+        ))
+        if run is not None:
+            original = self._load_request_payload(run).model_dump()
+            requested = payload.model_dump()
+            original["task"], requested["task"] = original["task"].strip(), requested["task"].strip()
+            if original != requested:
+                raise DomainValidationError("This client_request_id already belongs to a different task or configuration.")
+        return run
+
+    @staticmethod
+    def _approval_token(run: AgentRun) -> str | None:
+        if run.status != "requires_confirmation":
+            return None
+        # Include the saved model turn as well as arguments: two identical writes
+        # proposed in different turns are still two separate approvals.
+        identity = [run.run_id, run.required_confirmations_json, run.loop_state_json]
+        return hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode("utf-8")).hexdigest()
 
     @staticmethod
     def _validate_run_mode(run_mode: str) -> None:
@@ -119,6 +156,8 @@ class AgentService:
 
     def run(self, payload: AgentRunRequest) -> AgentRunResponse:
         """Synchronous run (backward-compatible)."""
+        if payload.client_request_id is not None:
+            raise DomainValidationError("client_request_id requires the queued /agent/runs interface.")
         team_id, user_id = self._require_identity(payload.team_id, payload.user_id)
         self.user_service.ensure_user_in_team(user_id=user_id, team_id=team_id)
         self._validate_run_mode(payload.run_mode)
@@ -221,9 +260,12 @@ class AgentService:
                     space_id=effective_space_id, started=started,
                 )
                 seq = None
-                for event in gen:
-                    seq = event.seq
-                    yield event
+                try:
+                    for event in gen:
+                        seq = event.seq
+                        yield event
+                finally:
+                    gen.close()
                 response = self.get_run(run_id=run.run_id, team_id=team_id, user_id=user_id)
                 self._record_agent_history(payload=payload, response=response)
             elif run_mode == "workflow" and self._workflow_nodes(payload.workflow_config):
@@ -246,7 +288,7 @@ class AgentService:
             if self._is_run_cancelled(run):
                 response = self.get_run(run_id=run.run_id, team_id=team_id, user_id=user_id)
                 yield AgentStreamEvent(
-                    event="run.cancelled", run_id=run.run_id, seq=(seq or 0) + 1,
+                    event="run.interrupted" if response.status == "interrupted" else "run.cancelled", run_id=run.run_id, seq=(seq or 0) + 1,
                     payload=self._run_response_dict(response),
                 )
                 return
@@ -261,7 +303,7 @@ class AgentService:
 
         seq = (seq or 0) + 1
         yield AgentStreamEvent(
-            event="run.cancelled" if response.status == "cancelled" else "run.completed", run_id=run.run_id, seq=seq,
+            event="run.interrupted" if response.status == "interrupted" else "run.cancelled" if response.status == "cancelled" else "run.completed", run_id=run.run_id, seq=seq,
             payload=self._run_response_dict(response),
         )
 
@@ -290,13 +332,14 @@ class AgentService:
 
     def _is_run_cancelled(self, run: AgentRun) -> bool:
         if not isinstance(run, AgentRun):
-            return getattr(run, "status", None) == "cancelled"
+            return getattr(run, "status", None) in {"cancelled", "interrupted"}
         # Read a scalar column so an ORM identity cached by the executing request
         # cannot hide a stop committed by a separate HTTP request/session.
         with self.db.no_autoflush:
-            return self.db.scalar(select(AgentRun.status).where(AgentRun.run_id == run.run_id)) == "cancelled"
+            return self.db.scalar(select(AgentRun.status).where(AgentRun.run_id == run.run_id)) in {"cancelled", "interrupted"}
 
-    def confirm_run(self, *, run_id: str, team_id: str, user_id: str) -> AgentRunResponse:
+    def confirm_run(self, *, run_id: str, team_id: str, user_id: str,
+                    approval_token: str | None = None) -> AgentRunResponse:
         run = self._ensure_run_access(run_id=run_id, team_id=team_id, user_id=user_id)
         if run.status != "requires_confirmation":
             raise DomainValidationError("Only runs waiting for confirmation can be confirmed.")
@@ -305,9 +348,22 @@ class AgentService:
         if not pending_calls:
             raise DomainValidationError("This run has no pending tool calls.")
 
+        expected_token = self._approval_token(run)
+        requires_token = run.trigger_channel.strip().lower() == "companion"
+        if (requires_token or approval_token is not None) and (
+            not approval_token or not hmac.compare_digest(
+                approval_token.encode("utf-8"), (expected_token or "").encode("utf-8")
+            )
+        ):
+            raise DomainValidationError("This approval has changed. Review the current operation before confirming.")
+
         loop_state = self._load_loop_state(run)
         claimed = self.db.execute(
-            update(AgentRun).where(AgentRun.run_id == run_id, AgentRun.status == "requires_confirmation")
+            update(AgentRun).where(
+                AgentRun.run_id == run_id, AgentRun.status == "requires_confirmation",
+                AgentRun.required_confirmations_json == run.required_confirmations_json,
+                AgentRun.loop_state_json == run.loop_state_json,
+            )
             .values(status="running").execution_options(synchronize_session=False)
         ).rowcount
         self.db.commit()
@@ -318,8 +374,10 @@ class AgentService:
             raise DomainValidationError("This confirmation is already being processed.")
         if loop_state is None:
             # Keyword-fallback path: no LLM loop to resume, just execute and finish.
-            return self._confirm_fallback(run=run, pending_calls=pending_calls,
-                                          team_id=team_id, user_id=user_id)
+            response = self._confirm_fallback(run=run, pending_calls=pending_calls,
+                                             team_id=team_id, user_id=user_id)
+            self._record_agent_history(payload=self._load_request_payload(run), response=response)
+            return response
 
         if self.event_bus:
             self.event_bus.emit(TurnStarted(
@@ -415,7 +473,9 @@ class AgentService:
             run=run, status=final_status, final_answer=final_answer,
             required_confirmations=[pending] if pending else [], started=started,
         )
-        return self.get_run(run_id=run_id, team_id=team_id, user_id=user_id)
+        response = self.get_run(run_id=run_id, team_id=team_id, user_id=user_id)
+        self._record_agent_history(payload=payload, response=response)
+        return response
 
     def _confirm_fallback(
         self,
@@ -492,6 +552,7 @@ class AgentService:
         steps = self._load_steps(run.run_id)
         return AgentRunResponse(
             run_id=run.run_id, team_id=run.team_id, user_id=run.user_id,
+            client_request_id=run.client_request_id, approval_token=self._approval_token(run),
             conversation_id=run.conversation_id, space_id=run.space_id,
             app_id=run.app_id, app_version=run.app_version,
             trigger_channel=run.trigger_channel, task=run.task,
@@ -508,6 +569,26 @@ class AgentService:
 
     def list_tools(self) -> list[dict[str, object]]:
         return [item.to_dict() for item in self.tool_service.list_tools()]
+
+    def list_runs(self, *, team_id: str, user_id: str, conversation_id: str | None = None,
+                  trigger_channel: str | None = None, status: str | None = None,
+                  limit: int = 20) -> list[AgentRunResponse]:
+        self.user_service.ensure_user_in_team(user_id=user_id, team_id=team_id)
+        if conversation_id is not None:
+            # Validate ownership even for an empty conversation; do not reveal
+            # another user's conversation via the presence or absence of runs.
+            self.document_service.resolve_space_id(
+                team_id=team_id, user_id=user_id, conversation_id=conversation_id, space_id=None,
+            )
+        query = select(AgentRun).where(AgentRun.team_id == team_id, AgentRun.user_id == user_id)
+        if conversation_id is not None:
+            query = query.where(AgentRun.conversation_id == conversation_id)
+        if trigger_channel is not None:
+            query = query.where(AgentRun.trigger_channel == trigger_channel)
+        if status is not None:
+            query = query.where(AgentRun.status == status)
+        runs = self.db.scalars(query.order_by(AgentRun.created_at.desc(), AgentRun.run_id.desc()).limit(limit))
+        return [self.get_run(run_id=item.run_id, team_id=team_id, user_id=user_id) for item in runs]
 
     # ------------------------------------------------------------------
     # Core LLM tool loop (agent_auto)
@@ -1130,14 +1211,15 @@ class AgentService:
                     # Persist the requires_confirmation status so confirm_run can find it.
                     self._finish_run(
                         run=run, status="requires_confirmation",
-                        final_answer="\n".join(accumulated_text).strip() or "Agent requires confirmation to proceed.",
+                        final_answer="".join(accumulated_text).strip() or "Agent requires confirmation to proceed.",
                         required_confirmations=[pending], started=started,
                     )
 
                     seq += 1
                     yield AgentStreamEvent(
                         event="confirmation.required", run_id=run.run_id, step_index=current_step, seq=seq,
-                        payload={"tool_name": tool_name, "arguments": normalized_args},
+                        payload={"tool_name": tool_name, "arguments": normalized_args,
+                                 "approval_token": self._approval_token(run)},
                     )
                     return
 
@@ -1212,7 +1294,7 @@ class AgentService:
 
         if self._is_run_cancelled(run):
             return
-        final_text = "\n".join(accumulated_text).strip()
+        final_text = "".join(accumulated_text).strip()
         if not final_text:
             final_text = "Agent has completed its analysis."
         self._record_step(
@@ -1440,69 +1522,73 @@ class AgentService:
         result_text = ""
         error_text = ""
 
-        for cli_event in runner.run(
+        cli_events = runner.run(
             task=payload.task,
             system_prompt=payload.system_prompt or "",
             workdir=workdir,
             resume_session_id=resume_session_id,
             dry_run=payload.dry_run,
-        ):
-            if cli_event.kind == "session":
-                session_id = cli_event.session_id or session_id
-                # 立即落盘：客户端中途断开（GeneratorExit）时循环后的保存不会执行，
-                # 不即时保存会静默丢失多轮续接。
-                if session_id and payload.conversation_id:
-                    save_cli_session_id(workdir, runner.name, session_id)
-            elif cli_event.kind == "text":
-                if cli_event.text:
-                    answer_parts.append(cli_event.text)
-                    yield _event("llm.delta", None, {"text": cli_event.text})
-            elif cli_event.kind == "tool_use":
-                step_index += 1
-                key = cli_event.tool_id or f"auto-{step_index}"
-                open_tools[key] = (
-                    cli_event.tool_name, cli_event.tool_input, step_index, time.perf_counter(),
-                )
-                tool_order.append(key)
-                yield _event("tool.started", step_index, {"tool_name": cli_event.tool_name})
-            elif cli_event.kind == "tool_result":
-                key = cli_event.tool_id if cli_event.tool_id in open_tools else (
-                    tool_order[0] if tool_order else ""
-                )
-                tool_name, tool_input, tool_step, tool_started = open_tools.pop(
-                    key, ("tool", {}, step_index, time.perf_counter()),
-                )
-                if key in tool_order:
-                    tool_order.remove(key)
-                output_text = self._truncate_cli_text(cli_event.tool_output, max_output)
-                self._record_step(
-                    run=run, step_index=tool_step, step_type="tool_call",
-                    title=f"{runner.display_name}: {tool_name}",
-                    status="completed" if cli_event.ok else "failed",
-                    tool_name=tool_name[:64],
-                    input_payload={"arguments": self._truncate_cli_payload(tool_input, max_output)},
-                    output_payload={"result": output_text},
-                    latency_ms=self._elapsed_ms(tool_started),
-                )
-                yield _event("tool.result", tool_step, {
-                    "tool_name": tool_name, "result": output_text,
-                })
-            elif cli_event.kind == "warning":
-                if cli_event.text:
-                    self._record_step(
-                        run=run, step_index=step_index + 1, step_type="observation",
-                        title=f"{runner.display_name} 提示", status="completed",
-                        input_payload={},
-                        output_payload={"message": self._truncate_cli_text(cli_event.text, max_output)},
-                    )
+        )
+        try:
+            for cli_event in cli_events:
+                if cli_event.kind == "session":
+                    session_id = cli_event.session_id or session_id
+                    # 立即落盘：客户端中途断开（GeneratorExit）时循环后的保存不会执行，
+                    # 不即时保存会静默丢失多轮续接。
+                    if session_id and payload.conversation_id:
+                        save_cli_session_id(workdir, runner.name, session_id)
+                elif cli_event.kind == "text":
+                    if cli_event.text:
+                        answer_parts.append(cli_event.text)
+                        yield _event("llm.delta", None, {"text": cli_event.text})
+                elif cli_event.kind == "tool_use":
                     step_index += 1
-            elif cli_event.kind == "result":
-                result_ok = cli_event.ok
-                result_text = cli_event.text
-                session_id = cli_event.session_id or session_id
-            elif cli_event.kind == "error":
-                result_ok = False
-                error_text = cli_event.text
+                    key = cli_event.tool_id or f"auto-{step_index}"
+                    open_tools[key] = (
+                        cli_event.tool_name, cli_event.tool_input, step_index, time.perf_counter(),
+                    )
+                    tool_order.append(key)
+                    yield _event("tool.started", step_index, {"tool_name": cli_event.tool_name})
+                elif cli_event.kind == "tool_result":
+                    key = cli_event.tool_id if cli_event.tool_id in open_tools else (
+                        tool_order[0] if tool_order else ""
+                    )
+                    tool_name, tool_input, tool_step, tool_started = open_tools.pop(
+                        key, ("tool", {}, step_index, time.perf_counter()),
+                    )
+                    if key in tool_order:
+                        tool_order.remove(key)
+                    output_text = self._truncate_cli_text(cli_event.tool_output, max_output)
+                    self._record_step(
+                        run=run, step_index=tool_step, step_type="tool_call",
+                        title=f"{runner.display_name}: {tool_name}",
+                        status="completed" if cli_event.ok else "failed",
+                        tool_name=tool_name[:64],
+                        input_payload={"arguments": self._truncate_cli_payload(tool_input, max_output)},
+                        output_payload={"result": output_text},
+                        latency_ms=self._elapsed_ms(tool_started),
+                    )
+                    yield _event("tool.result", tool_step, {
+                        "tool_name": tool_name, "result": output_text,
+                    })
+                elif cli_event.kind == "warning":
+                    if cli_event.text:
+                        self._record_step(
+                            run=run, step_index=step_index + 1, step_type="observation",
+                            title=f"{runner.display_name} 提示", status="completed",
+                            input_payload={},
+                            output_payload={"message": self._truncate_cli_text(cli_event.text, max_output)},
+                        )
+                        step_index += 1
+                elif cli_event.kind == "result":
+                    result_ok = cli_event.ok
+                    result_text = cli_event.text
+                    session_id = cli_event.session_id or session_id
+                elif cli_event.kind == "error":
+                    result_ok = False
+                    error_text = cli_event.text
+        finally:
+            cli_events.close()
 
         # 仍未闭合的工具调用（CLI 提前结束 / 超时被杀）补记为 skipped，
         # 使持久化轨迹与流式事件对齐。
@@ -1913,7 +1999,7 @@ class AgentService:
             "pending_tool_call_id": pending_tool_call_id,
         }
         self.db.execute(
-            update(AgentRun).where(AgentRun.run_id == run.run_id, AgentRun.status != "cancelled")
+            update(AgentRun).where(AgentRun.run_id == run.run_id, AgentRun.status.not_in(("cancelled", "interrupted")))
             .values(loop_state_json=self._to_json(loop)).execution_options(synchronize_session=False)
         )
         self.db.commit()
@@ -1926,7 +2012,7 @@ class AgentService:
 
     def _save_pending_tool_call(self, run: AgentRun, call: AgentToolCall) -> None:
         self.db.execute(
-            update(AgentRun).where(AgentRun.run_id == run.run_id, AgentRun.status != "cancelled")
+            update(AgentRun).where(AgentRun.run_id == run.run_id, AgentRun.status.not_in(("cancelled", "interrupted")))
             .values(required_confirmations_json=self._to_json([call.model_dump()]))
             .execution_options(synchronize_session=False)
         )
@@ -2092,6 +2178,7 @@ class AgentService:
         )
         run = AgentRun(
             run_id=str(uuid4()),
+            client_request_id=payload.client_request_id,
             team_id=team_id,
             user_id=user_id,
             conversation_id=payload.conversation_id,
@@ -2234,7 +2321,7 @@ class AgentService:
             values["loop_state_json"] = None
         # A result arriving after Stop must not revive the run or its approvals.
         changed = self.db.execute(
-            update(AgentRun).where(AgentRun.run_id == run.run_id, AgentRun.status != "cancelled")
+            update(AgentRun).where(AgentRun.run_id == run.run_id, AgentRun.status.not_in(("cancelled", "interrupted")))
             .values(**values).execution_options(synchronize_session=False)
         ).rowcount
         self.db.commit()
@@ -2509,6 +2596,17 @@ class AgentService:
 
     def _record_agent_history(self, *, payload: AgentRunRequest, response: AgentRunResponse) -> None:
         effective_channel = (payload.trigger_channel or "agent").strip().lower() or "agent"
+        candidates = self.db.scalars(select(ChatHistory).where(
+            ChatHistory.team_id == response.team_id, ChatHistory.user_id == response.user_id,
+            ChatHistory.channel == effective_channel,
+            ChatHistory.response_payload_json.contains(response.run_id),
+        ))
+        for item in candidates:
+            if self._safe_json_dict(item.response_payload_json).get("run_id") == response.run_id:
+                item.response_text = response.answer
+                item.response_payload_json = self._to_json(response.model_dump(mode="json"))
+                self.db.commit()
+                return
         self.chat_history_service.record_message(
             team_id=response.team_id, user_id=response.user_id,
             conversation_id=response.conversation_id, channel=effective_channel,

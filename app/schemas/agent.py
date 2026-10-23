@@ -10,6 +10,7 @@ from app.schemas.chat import ChatSource
 
 
 class AgentRunRequest(BaseModel):
+    client_request_id: str | None = Field(default=None, min_length=1, max_length=64)
     user_id: str | None = Field(default=None, min_length=1, max_length=64)
     team_id: str | None = Field(default=None, min_length=1, max_length=64)
     conversation_id: str | None = Field(default=None, min_length=1, max_length=36)
@@ -59,6 +60,7 @@ class AgentRunRequest(BaseModel):
 
 
 class AgentConfirmRequest(BaseModel):
+    approval_token: str | None = Field(default=None, min_length=1, max_length=64)
     user_id: str | None = Field(default=None, min_length=1, max_length=64)
     team_id: str | None = Field(default=None, min_length=1, max_length=64)
 
@@ -122,6 +124,8 @@ class AgentStepResponse(BaseModel):
 
 class AgentRunResponse(BaseModel):
     run_id: str
+    client_request_id: str | None = None
+    approval_token: str | None = None
     team_id: str
     user_id: str
     conversation_id: str | None
@@ -147,6 +151,13 @@ class AgentRunResponse(BaseModel):
 
 class AgentRunListResponse(BaseModel):
     items: list[AgentRunResponse]
+
+
+class AgentRunEventsResponse(BaseModel):
+    items: list["AgentStreamEvent"]
+    next_seq: int = 0
+    status: str
+    has_more: bool = False
 
 
 class AgentRunStartResponse(BaseModel):

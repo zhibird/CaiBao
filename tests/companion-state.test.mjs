@@ -16,7 +16,7 @@ test('real runtime events drive attention, tools, approvals and completion', () 
   assert.equal(state.activity,'idle'); assert.equal(state.emotion,'happy');
 });
 test('failures are never presented as a successful happy pet',()=>{
-  for(const event of [{event:'run.failed'},{event:'run.completed',payload:{status:'failed'}},{event:'run.completed',payload:{status:'partial_success'}}]){
+  for(const event of [{event:'run.failed'},{event:'run.interrupted'},{event:'run.completed',payload:{status:'interrupted'}},{event:'run.completed',payload:{status:'failed'}},{event:'run.completed',payload:{status:'partial_success'}}]){
     const state=reduceEvent(initialState(),event);
     assert.equal(state.activity,'error');assert.equal(state.emotion,'concerned');
   }
@@ -35,6 +35,14 @@ test('TTS removes code and visual markup, bounds playback length',()=>{
 });
 
 test('cancelled task returns to neutral presence rather than success celebration',()=>{
-  const state=reduceEvent({...initialState(),activity:'working',tool:'web_search'}, {event:'run.cancelled'});
-  assert.equal(state.activity,'idle');assert.equal(state.emotion,'idle');assert.equal(state.tool,null);
+  for(const event of [{event:'run.cancelled'},{event:'run.completed',payload:{status:'cancelled'}}]) {
+    const state=reduceEvent({...initialState(),activity:'working',tool:'web_search'},event);
+    assert.equal(state.activity,'idle');assert.equal(state.emotion,'idle');assert.equal(state.tool,null);
+  }
+});
+
+test('SSE frame ID carries the durable cursor when the JSON omits it',()=>{
+  const events=[],parser=createSSEParser(event=>events.push(event));
+  parser.push('id: 42\nevent: llm.delta\ndata: {"run_id":"r","payload":{"text":"接回来"}}\n\n');
+  assert.equal(events[0].seq,42); assert.equal(events[0].event,'llm.delta');
 });

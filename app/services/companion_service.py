@@ -150,6 +150,7 @@ class CompanionService:
         if not payload.include_memory:
             allowed_tools = [name for name in allowed_tools if name not in _MEMORY_TOOLS]
         request = AgentRunRequest(
+            client_request_id=payload.client_request_id,
             team_id=team_id,
             user_id=user_id,
             conversation_id=payload.conversation_id,

@@ -484,6 +484,45 @@ class TestPiRunnerIntegration:
 
 
 class TestPiRunModeViaApi:
+    def test_closing_cli_agent_source_closes_the_live_subprocess(
+        self, client, fake_pi_path, tmp_path, monkeypatch,
+    ):
+        """Losing a worker must synchronously close both nested CLI generators."""
+        import app.services.cli_agent_service as cli_mod
+        from app.api.deps import create_background_agent_service
+        from app.db.session import SessionLocal
+
+        monkeypatch.setenv("CLI_AGENT_ENABLED", "true")
+        monkeypatch.setenv("CLI_AGENT_PI_PATH", fake_pi_path)
+        monkeypatch.setenv("CLI_AGENT_WORKSPACE_ROOT", str(tmp_path / "cli_ws"))
+        reload_settings()
+        register_workspace_user(client, prefix="pi_close", display_name="Pi cleanup")
+        created = client.post("/api/v1/agent/runs", json={
+            "task": "RESULT_THEN_HANG", "run_mode": "pi",
+        })
+        assert created.status_code == 200, created.text
+
+        processes = []
+        real_popen = cli_mod.subprocess.Popen
+
+        def capture_process(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        monkeypatch.setattr(cli_mod.subprocess, "Popen", capture_process)
+        with SessionLocal() as db:
+            source = create_background_agent_service(db).stream_run(created.json()["run_id"])
+            try:
+                for event in source:
+                    if event.event == "llm.delta":
+                        break
+                assert len(processes) == 1
+                assert processes[0].poll() is None
+            finally:
+                source.close()
+            assert processes[0].poll() is not None
+
     def test_agent_run_stream_with_pi_backend(self, client, fake_pi_path, tmp_path, monkeypatch):
         monkeypatch.setenv("CLI_AGENT_ENABLED", "true")
         monkeypatch.setenv("CLI_AGENT_PI_PATH", fake_pi_path)

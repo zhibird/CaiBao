@@ -1,4 +1,5 @@
-import {initialState, reduceEvent, createSSEParser, speechText} from './companion-state.mjs';
+import {initialState, reduceEvent, speechText} from './companion-state.mjs';
+import {CompanionRecovery, runStatusLabel} from './companion-recovery.mjs';
 
 const $ = id => document.getElementById(id);
 const desktop = new URLSearchParams(location.search).get('desktop') === '1';
@@ -6,7 +7,8 @@ const native = (action, extra = {}) => window.webkit?.messageHandlers?.caibao?.p
 let state = initialState(), account = null, conversationId = null, currentRun = null;
 let runtimeProfile = null, backends = [];
 let busy = false, pendingApproval = false, registering = false, recognition = null, toastTimer;
-let speechGeneration = 0;
+let speechGeneration = 0, speaking = false, controller = null, currentContent = null, approvalToken = null, previewGeneration = 0;
+const runContents = new Map();
 const preferences = (() => {try {return JSON.parse(localStorage.getItem('caibao.companion.preferences') || '{}');} catch {return {};}})();
 $('voice').checked = preferences.voice === true;
 $('memory').checked = preferences.memory !== false;
@@ -21,7 +23,7 @@ function toast(message) {
 }
 function setState(next) {
   state = {...state, ...next};
-  $('habitat').dataset.activity = state.activity;
+  $('habitat').dataset.activity = speaking ? 'speaking' : state.activity;
   $('habitat').dataset.emotion = state.emotion;
   const labels = {idle:'悠闲', happy:'开心', curious:'好奇', focused:'认真', sleepy:'困困', concerned:'担心'};
   $('mood-chip').textContent = labels[state.emotion] || '陪伴中';
@@ -57,6 +59,8 @@ async function signedIn(user) {
   const switched = account?.user_id !== user.user_id;
   if (switched) {
     $('messages').replaceChildren(); $('task-log').replaceChildren();
+    controller?.dispose(); controller = null; currentContent = null; runContents.clear(); previewGeneration++;
+    $('history-preview').hidden = true; renderTaskHistory([]); $('run-strip').hidden = true;
     clearApproval(); currentRun = null; stopSpeech();
     $('task-status').textContent = '没有任务的时候，发会儿呆也很好。';
   }
@@ -85,12 +89,9 @@ async function signedIn(user) {
     try {
       const history = await api(`/chat/history?conversation_id=${encodeURIComponent(conversationId)}&limit=40`);
       const items = history.items.filter(item => item.channel === 'companion').reverse();
-      for (const item of items) {message('user', item.request_text); message('assistant', item.response_text);}
-      // Recover a waiting approval after reload without replaying the execution stream.
-      const last = items.at(-1)?.response_payload;
-      if (last?.status === 'requires_confirmation') {
-        const live = await api(`/agent/runs/${encodeURIComponent(last.run_id)}`);
-        if (live.status === 'requires_confirmation') showApproval(live);
+      for (const item of items) {
+        message('user', item.request_text); const content = message('assistant', item.response_text);
+        if (item.response_payload?.run_id) runContents.set(item.response_payload.run_id, content);
       }
       if (!items.length) message('assistant',profile.greeting);
     } catch (error) {
@@ -98,6 +99,7 @@ async function signedIn(user) {
       else throw error;
     }
   }
+  if (conversationId) await createController().restore();
 }
 async function ensureConversation() {
   if (!conversationId) {
@@ -112,60 +114,98 @@ function setBusy(value) {
   $('backend').disabled = value;
   const cli = $('backend').value !== 'api';
   $('mode').disabled = value || cli; $('memory').disabled = value || cli; $('model-select').disabled = value || cli;
-  $('stop-task').hidden = !value || cli;
-}
-function logTask(text) {
-  const line = document.createElement('div'); line.textContent = text; $('task-log').append(line);
-  $('task-log').scrollTop = $('task-log').scrollHeight;
+  $('stop-task').hidden = !value || !currentRun || pendingApproval;
 }
 function showApproval(run) {
-  currentRun = run.run_id; pendingApproval = true; $('approval').hidden = false; $('send').disabled = true;
+  currentRun = run.run_id; approvalToken = run.approval_token || null; pendingApproval = true; $('approval').hidden = false; $('send').disabled = true;
   $('approval-detail').textContent = (run.required_confirmations || []).map(call => `${call.tool_name}\n${JSON.stringify(call.arguments, null, 2)}`).join('\n\n') || '请到工作台查看操作详情后确认。';
-  $('approve').disabled = !run.required_confirmations?.length; $('new-chat').disabled = true;
+  $('approve').disabled = !run.required_confirmations?.length; $('new-chat').disabled = true; $('account-button').disabled = true;
 }
-function clearApproval() { pendingApproval = false; $('approval').hidden = true; $('send').disabled = busy; $('new-chat').disabled = busy; }
-async function consumeRun(start, content) {
-  currentRun = start.run_id;
-  // Never retry GET: opening a queued SSE endpoint starts real work.
-  const response = await fetch(`/api/v1${start.stream_url}`, {credentials:'same-origin', headers:{Accept:'text/event-stream'}});
-  if (!response.ok || !response.body) throw new Error('任务流未连接，请到工作台查看状态后再试。');
-  let completed = false, streamError = null, finalAnswer = '';
-  const parser = createSSEParser(event => {
-    if (event.run_id !== currentRun) return;
-    setState(reduceEvent(state, event));
-    const payload = event.payload || {};
-    if (event.event === 'llm.delta') {content.textContent += payload.text || ''; scrollMessages();}
-    if (event.event === 'tool.started') {logTask(`进行中 · ${payload.tool_name}`); $('task-status').textContent = state.label;}
-    if (event.event === 'tool.result') logTask(`已返回 · ${payload.tool_name}`);
-    if (event.event === 'confirmation.required') {
-      showApproval({run_id:currentRun, required_confirmations:[payload]});
-      $('task-status').textContent = '等待你的确认，尚未执行。';
-    }
-    if (event.event === 'run.cancelled') {
-      completed = true; finalAnswer = '';
-      content.textContent ||= '任务已停止。已经开始的操作可能仍会结束，详情见任务记录。';
-      clearApproval(); $('task-status').textContent = '已停止后续步骤。已经开始的操作可能仍会结束。';
-    }
-    if (event.event === 'run.in_progress') {completed = true; streamError = '这个任务已在另一个连接执行，请到工作台查看状态。';}
-    if (event.event === 'run.failed') {completed = true; streamError = payload.error || '任务执行失败';}
-    if (event.event === 'run.completed' && payload.status === 'cancelled') {
-      completed = true; clearApproval(); $('task-status').textContent = '已停止后续步骤。'; return;
-    }
-    if (event.event === 'run.completed') {
-      completed = true; finalAnswer = payload.answer || content.textContent;
-      content.textContent = finalAnswer || '这次没有生成回复。'; scrollMessages();
-      if (payload.status === 'requires_confirmation') showApproval(payload);
-      else if (payload.status === 'failed') streamError = payload.answer || '任务执行失败';
-      else {clearApproval(); $('task-status').textContent = payload.status === 'partial_success' ? '有些步骤没完成，详情见回复。' : '这一件事，完成了。';}
-    }
+function clearApproval() { pendingApproval = false; approvalToken = null; $('approval').hidden = true; $('send').disabled = busy; $('new-chat').disabled = busy; }
+function createController() {
+  if (controller?.conversationId === conversationId && controller.userId === account?.user_id) return controller;
+  controller?.dispose();
+  controller = new CompanionRecovery({request:api, storage:localStorage, userId:account.user_id, conversationId,
+    onChange:renderRun, onHistory:renderTaskHistory,
+    onTerminal:snapshot => {if (snapshot.text) speak(snapshot.text);},
   });
-  const reader = response.body.getReader(), decoder = new TextDecoder();
-  try { while (true) {const {done,value} = await reader.read(); if (done) break; parser.push(decoder.decode(value,{stream:true}));} parser.push(decoder.decode()); }
-  finally {reader.releaseLock();}
-  if (streamError) throw new Error(streamError);
-  if (!completed) throw new Error('连接中断；任务可能仍在执行，请到工作台查看，避免重复操作。');
-  if (finalAnswer && !pendingApproval) speak(finalAnswer);
+  return controller;
 }
+const taskHint = snapshot => {
+  if (snapshot.phase === 'loading') return '正在核对任务记录…';
+  if (snapshot.phase === 'reconnecting') return '正在接回进度，任务会继续；无需重复发送。';
+  if (snapshot.phase === 'unknown') return '还没核对到最终状态。已保留任务，请恢复连接后再继续。';
+  if (snapshot.phase === 'waiting') return '等待你的确认，操作尚未执行。';
+  if (snapshot.phase === 'running') return '正在处理，离开页面后也会继续。';
+  if (!snapshot.run) return '没有任务的时候，发会儿呆也很好。';
+  return {completed:'这一件事，完成了。', partial_success:'有些步骤没完成，详情见回复。', failed:'执行遇到问题，详情见回复。', cancelled:'已停止后续步骤。已经开始的操作可能仍会结束。', interrupted:'运行中断，已保留结果；检查记录后再决定下一步。'}[snapshot.run.status] || snapshot.error || '任务记录已保留。';
+};
+function renderTimeline(container, timeline, status) {
+  container.replaceChildren();
+  const labels = {running:['cancelled','interrupted','failed'].includes(status) ? '未返回' : '进行中', completed:'已返回', skipped:'已跳过', failed:'失败'};
+  for (const item of timeline) {
+    const line = document.createElement('div'); line.textContent = `${labels[item.status] || item.status} · ${item.tool}`;
+    container.append(line);
+  }
+}
+function renderRun(snapshot) {
+  currentRun = snapshot.run?.run_id || null;
+  if (currentRun) {
+    if (runContents.has(currentRun)) currentContent = runContents.get(currentRun);
+    else {
+      if (!currentContent) {if (snapshot.task) message('user',snapshot.task); currentContent = message('assistant','');}
+      runContents.set(currentRun,currentContent);
+    }
+  }
+  if (currentContent && (snapshot.text || snapshot.phase === 'finished')) {
+    currentContent.textContent = snapshot.text || snapshot.error || (snapshot.run?.status === 'cancelled' ? '任务已停止。' : '这次没有生成回复。');
+    currentContent.parentElement.classList.toggle('error',['failed','partial_success','interrupted'].includes(snapshot.run?.status));
+    scrollMessages();
+  }
+  clearApproval();
+  // Confirmation controls only use the authoritative GET run snapshot after
+  // journal recovery; a replayed old approval event cannot authorize anything.
+  if (snapshot.phase === 'waiting') showApproval(snapshot.run);
+  if (snapshot.phase === 'unknown' && snapshot.errorStatus === 401) {connection('请重新登录，再接回任务',false); showAuth();}
+  setBusy(snapshot.blocked && snapshot.phase !== 'waiting');
+  const hint = taskHint(snapshot);
+  $('task-status').textContent = hint; $('run-connection').textContent = hint;
+  $('run-strip').hidden = snapshot.phase === 'idle';
+  $('run-strip').dataset.phase = snapshot.phase;
+  $('run-reconnect').hidden = !['unknown','reconnecting'].includes(snapshot.phase);
+  renderTimeline($('task-log'),snapshot.timeline,snapshot.run?.status);
+  if (snapshot.phase === 'reconnecting' || snapshot.phase === 'unknown' || snapshot.phase === 'loading')
+    setState({activity:'reconnecting',emotion:'focused',label:snapshot.phase === 'unknown' ? '任务状态还在核对，先不重复操作' : '接回进度，事情还记着呢'});
+  else if (snapshot.phase === 'waiting') setState({activity:'waiting',emotion:'curious',label:'这个操作，需要你点头'});
+  else if (snapshot.phase === 'finished' && snapshot.run) setState(reduceEvent(state,{event:snapshot.run.status === 'interrupted' ? 'run.interrupted' : snapshot.run.status === 'cancelled' ? 'run.cancelled' : 'run.completed',payload:snapshot.run}));
+  else if (snapshot.lastEvent) setState(reduceEvent(state,snapshot.lastEvent));
+  else if (snapshot.phase === 'running') setState({activity:'thinking',emotion:'focused',label:'接着做，进度还在'});
+}
+function renderTaskHistory(items) {
+  $('history-count').textContent = items.length ? ` · ${items.length}` : '';
+  $('history-list').replaceChildren();
+  if (!items.length) {const empty = document.createElement('p'); empty.className = 'history-empty'; empty.textContent = '这里会保留本次对话的任务与执行记录。'; $('history-list').append(empty);}
+  for (const run of items) {
+    const button = document.createElement('button'); button.type = 'button'; button.className = 'history-item';
+    button.dataset.runId = run.run_id;
+    const title = document.createElement('span'); title.textContent = run.task;
+    const status = document.createElement('span'); status.className = 'history-status'; status.dataset.status = run.status; status.textContent = runStatusLabel(run.status);
+    button.append(title,status); button.onclick = () => inspectTask(run.run_id); $('history-list').append(button);
+  }
+}
+async function inspectTask(runId) {
+  const generation = ++previewGeneration; $('history-preview').hidden = false; $('history-answer').textContent = '正在读取记录…';
+  try {
+    const preview = await controller.inspect(runId); if (generation !== previewGeneration) return;
+    $('history-title').textContent = preview.task;
+    $('history-state').textContent = `${runStatusLabel(preview.run.status)} · 只读记录`;
+    $('history-answer').textContent = preview.text || (preview.run.status === 'queued' ? '这个任务尚未启动。查看记录不会执行任务。' : '还没有回复，已保留执行记录。');
+    renderTimeline($('history-timeline'),preview.timeline,preview.run.status);
+  } catch (error) {if (generation === previewGeneration) $('history-answer').textContent = error.message;}
+}
+$('history-close').onclick = () => {previewGeneration++; $('history-preview').hidden = true;};
+$('history-refresh').onclick = async () => {try {await controller?.refreshHistory();} catch (error) {toast(error.message);}};
+$('run-reconnect').onclick = () => controller?.retry();
 async function send(task) {
   if (busy || pendingApproval || !task.trim()) return;
   if (!account) {showAuth(); return;}
@@ -175,25 +215,27 @@ async function send(task) {
   message('user', task); const content = message('assistant', '');
   try {
     await ensureConversation();
-    const start = await api('/companion/runs', {method:'POST', body:JSON.stringify({task,conversation_id:conversationId,mode:$('mode').value,include_memory:$('memory').checked,model:$('backend').value === 'api' ? $('model-select').value || null : null,backend:$('backend').value})});
-    await consumeRun(start, content);
+    currentContent = content;
+    await createController().submit({task,conversation_id:conversationId,mode:$('mode').value,include_memory:$('memory').checked,model:$('backend').value === 'api' ? $('model-select').value || null : null,backend:$('backend').value});
   } catch (error) {
     content.parentElement.classList.add('error'); content.textContent = error.message;
     setState({activity:'error',emotion:'concerned',label:'遇到一点问题，我们慢慢来'});
     $('task-status').textContent = error.message;
     if (error.status === 401) {account = null; connection('请重新登录', false); showAuth();}
-  } finally {setBusy(false);}
+  } finally {setBusy(Boolean(controller?.state.blocked && controller.state.phase !== 'waiting'));}
 }
-function stopSpeech() {speechGeneration++; window.speechSynthesis?.cancel(); native('stopSpeech'); if (state.activity === 'speaking') setState({activity:'idle',label:'嗯，我在听'});}
+function showSpeaking(value) {speaking = value; $('habitat').dataset.activity = value ? 'speaking' : state.activity;}
+function stopSpeech() {speechGeneration++; window.speechSynthesis?.cancel(); native('stopSpeech'); showSpeaking(false);}
 function speak(text) {
   if (!$('voice').checked) return;
   const clean = speechText(text); if (!clean) return;
+  stopSpeech();
   if (desktop && window.webkit?.messageHandlers?.caibao) {native('speak', {text:clean,lang:'zh-CN'}); return;}
   if (!window.speechSynthesis) {toast('这个浏览器暂不支持朗读。'); return;}
-  stopSpeech(); const generation = speechGeneration;
+  const generation = speechGeneration;
   const utterance = new SpeechSynthesisUtterance(clean); utterance.lang = 'zh-CN'; utterance.rate = 1.05;
-  utterance.onstart = () => {if (generation === speechGeneration) setState({activity:'speaking',label:'把话说给你听'});};
-  utterance.onend = utterance.onerror = () => {if (generation === speechGeneration && !busy) setState({activity:'idle',label:'说完啦，轮到你了'});};
+  utterance.onstart = () => {if (generation === speechGeneration) showSpeaking(true);};
+  utterance.onend = utterance.onerror = () => {if (generation === speechGeneration) showSpeaking(false);};
   window.speechSynthesis.speak(utterance);
 }
 async function interact(kind) {
@@ -254,9 +296,11 @@ $('native-quit').onclick = () => {stopSpeech(); native('quit');};
 $('compact-open').onclick = () => compact(false); $('collapse').onclick = () => compact(true);
 window.addEventListener('caibao-native-mode', event => document.body.classList.toggle('compact', Boolean(event.detail.compact)));
 window.addEventListener('caibao-native-ready', event => {document.body.classList.add('desktop'); document.body.classList.toggle('compact', Boolean(event.detail.compact));});
-window.addEventListener('caibao-native-speech', event => {if (event.detail.state === 'start') setState({activity:'speaking',label:'把话说给你听'}); else if (!busy) setState({activity:'idle',label:'嗯，我在听'});});
+window.addEventListener('caibao-native-speech', event => showSpeaking(event.detail.state === 'start'));
 $('new-chat').onclick = () => {
-  if (busy) return;
+  if (busy || pendingApproval) return;
+  controller?.dispose(); controller = null; currentContent = null; runContents.clear(); previewGeneration++;
+  $('history-preview').hidden = true; renderTaskHistory([]); $('run-strip').hidden = true;
   clearApproval(); conversationId = null; currentRun = null; stopSpeech();
   if (account) localStorage.removeItem(`caibao.companion.conversation.${account.user_id}`);
   $('messages').replaceChildren(); message('assistant','新的一页。今天想从哪里聊起？');
@@ -266,25 +310,20 @@ $('approve').onclick = async () => {
   if (!currentRun || busy) return;
   setBusy(true); $('approve').disabled = true; $('decline').disabled = true;
   try {
-    const run = await api(`/agent/runs/${encodeURIComponent(currentRun)}/confirm`,{method:'POST',body:'{}'});
-    clearApproval(); message('assistant',run.answer || '操作已返回。');
-    setState(reduceEvent(state,{event:'run.completed',payload:run}));
-    if (run.status === 'requires_confirmation') showApproval(run);
-    else if (run.status !== 'failed') speak(run.answer);
-    $('task-status').textContent = run.status === 'failed' ? '执行遇到问题，详情见回复。' : '确认后的操作已返回。';
-  } catch (error) {toast(error.message);} finally {setBusy(false); $('approve').disabled = false; $('decline').disabled = false;}
+    const run = await api(`/agent/runs/${encodeURIComponent(currentRun)}/confirm`,{method:'POST',body:JSON.stringify({approval_token:approvalToken})});
+    clearApproval(); await controller.accept(run);
+  } catch (error) {toast(error.message); await controller?.retry();}
+  finally {setBusy(Boolean(controller?.state.blocked && controller.state.phase !== 'waiting')); $('approve').disabled = !pendingApproval; $('decline').disabled = false;}
+
 };
 async function cancelTask() {
   if (!currentRun) return;
   $('stop-task').disabled = true; $('decline').disabled = true;
   try {
     const result = await api(`/agent/runs/${encodeURIComponent(currentRun)}/cancel`,{method:'POST'});
-    if (result.status === 'cancelled') {
-      clearApproval(); stopSpeech();
-      setState({activity:'idle',emotion:'idle',label:'好，这次先停在这里'});
-      $('task-status').textContent = '已停止后续步骤。已开始的工具操作可能仍会结束。';
-    } else toast('任务已经结束，结果已保留。');
-  } catch (error) {toast(error.message);} finally {$('stop-task').disabled = false; $('decline').disabled = false;}
+    stopSpeech(); await controller.accept(result);
+    if (result.status !== 'cancelled') toast('任务已经结束，结果已保留。');
+  } catch (error) {toast(error.message); await controller?.retry();} finally {$('stop-task').disabled = false; $('decline').disabled = false;}
 }
 $('stop-task').onclick = cancelTask;
 $('decline').onclick = cancelTask;
@@ -309,7 +348,7 @@ $('auth-form').onsubmit = async event => {
 };
 $('account-button').onclick = async () => {
   if (busy || pendingApproval) return;
-  try {await api('/auth/logout',{method:'POST'}); account = null; conversationId = null; currentRun = null; stopSpeech(); clearApproval(); $('messages').replaceChildren(); $('account-button').hidden = true; connection('未登录 · 可以先摸摸彩宝',false); showAuth();}
+  try {await api('/auth/logout',{method:'POST'}); controller?.dispose(); controller = null; currentContent = null; runContents.clear(); previewGeneration++; $('history-preview').hidden = true; renderTaskHistory([]); $('run-strip').hidden = true; account = null; conversationId = null; currentRun = null; stopSpeech(); clearApproval(); $('messages').replaceChildren(); $('account-button').hidden = true; connection('未登录 · 可以先摸摸彩宝',false); showAuth();}
   catch (error) {toast(error.message);}
 };
 const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -317,13 +356,15 @@ $('mic').onclick = () => {
   if (desktop || !Recognition) {toast('可以使用 macOS 系统听写（在输入框中按听写快捷键）。'); $('message').focus(); return;}
   if (recognition) {recognition.stop(); return;}
   stopSpeech(); recognition = new Recognition(); recognition.lang = 'zh-CN'; recognition.interimResults = false;
-  recognition.onstart = () => setState({activity:'listening',emotion:'curious',label:'你说，我在听'});
+  recognition.onstart = () => {if (!busy && !pendingApproval) setState({activity:'listening',emotion:'curious',label:'你说，我在听'});};
   recognition.onresult = event => {$('message').value = event.results[0][0].transcript; $('message').focus();};
   recognition.onerror = () => toast('没能听清。检查麦克风权限，或者打字告诉我。');
-  recognition.onend = () => {recognition = null; if (!busy) setState({activity:'idle',label:'听到了，确认文字后再发送'});};
+  recognition.onend = () => {recognition = null; if (!busy && !pendingApproval) setState({activity:'idle',label:'听到了，确认文字后再发送'});};
   try {recognition.start();} catch {recognition = null; toast('语音输入暂不可用。');}
 };
-window.addEventListener('pagehide',stopSpeech);
+window.addEventListener('pagehide',() => {stopSpeech(); controller?.dispose();});
+window.addEventListener('pageshow',event => {if (event.persisted && controller) void controller.restore();});
+window.addEventListener('online',() => {if (['unknown','reconnecting'].includes(controller?.state.phase)) void controller.retry();});
 (async () => {
   try {let user; try {user = await api('/auth/me');} catch (error) {if (error.status !== 401) throw error; await api('/auth/refresh',{method:'POST'}); user = await api('/auth/me');} await signedIn(user);}
   catch (error) {connection(error.status === 401 ? '未登录 · 可以先摸摸彩宝' : '连接失败 · 请检查本地服务',false); if (error.status !== 401) toast(error.message);}

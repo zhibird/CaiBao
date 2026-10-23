@@ -5,6 +5,8 @@ from . import (  # noqa: F401
     agent_app,
     agent_app_version,
     agent_run,
+    agent_run_event,
+    agent_run_worker,
     agent_step,
     answer_favorite,
     auth_refresh_session,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -10,6 +10,7 @@ from app.db.base import Base
 
 class AgentRun(Base):
     __tablename__ = "agent_runs"
+    __table_args__ = (Index("uq_agent_runs_request", "team_id", "user_id", "client_request_id", unique=True),)
 
     run_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     team_id: Mapped[str] = mapped_column(
@@ -40,6 +41,7 @@ class AgentRun(Base):
     app_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     trigger_channel: Mapped[str] = mapped_column(String(32), nullable=False, default="agent")
     task: Mapped[str] = mapped_column(Text, nullable=False)
+    client_request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="running", index=True)
     final_answer: Mapped[str] = mapped_column(Text, nullable=False, default="")
     model: Mapped[str | None] = mapped_column(String(128), nullable=True)

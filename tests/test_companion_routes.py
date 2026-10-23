@@ -15,9 +15,9 @@ def test_companion_entry_and_assets_are_available_without_login(client):
     assert page.status_code == 200
     assert page.headers["cache-control"] == "no-cache"
     assert 'id="pet"' in page.text
-    assert 'src="/web/companion.js?v=0280"' in page.text
+    assert 'src="/web/companion.js?v=' in page.text
     assert client.head("/companion").status_code == 200
-    for asset in ("companion.js", "companion-state.mjs", "companion.css"):
+    for asset in ("companion.js", "companion-state.mjs", "companion-recovery.mjs", "companion.css"):
         response = client.get(f"/web/{asset}")
         assert response.status_code == 200
         assert response.content

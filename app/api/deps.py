@@ -530,6 +530,69 @@ def get_agent_service(
     )
 
 
+def create_background_agent_service(db: Session) -> AgentService:
+    """Build the complete graph with one worker-owned session.
+
+    Calling dependency providers without explicit arguments would pass FastAPI
+    Depends objects into services. Keep every request-scoped dependency explicit
+    so background work never borrows the HTTP request's session.
+    """
+    user_service = UserService(db)
+    document_service = DocumentService(db)
+    space_service = SpaceService(db=db, user_service=user_service)
+    embedding_service = get_embedding_service()
+    embedding_model_service = EmbeddingModelService(db=db, user_service=user_service)
+    memory_service = MemoryService(
+        db=db, user_service=user_service, space_service=space_service,
+        embedding_service=embedding_service, embedding_model_service=embedding_model_service,
+    )
+    retrieval_service = RetrievalService(
+        db=db, embedding_service=embedding_service, embedding_model_service=embedding_model_service,
+    )
+    llm_service = get_llm_service()
+    llm_model_service = LLMModelService(db=db, user_service=user_service)
+    chat_history_service = ChatHistoryService(db)
+    tool_service = get_tool_service(
+        db=db, catalog=get_tool_catalog_service(), safety=get_tool_safety_service(),
+        mcp_manager=get_mcp_manager(),
+    )
+    rag_chat_service = get_rag_chat_service(
+        user_service=user_service, chat_history_service=chat_history_service,
+        document_service=document_service, retrieval_service=retrieval_service,
+        memory_service=memory_service, llm_service=llm_service, llm_model_service=llm_model_service,
+    )
+    return get_agent_service(
+        db=db, user_service=user_service, document_service=document_service,
+        rag_chat_service=rag_chat_service, tool_service=tool_service,
+        chat_history_service=chat_history_service, llm_service=llm_service, llm_model_service=llm_model_service,
+    )
+
+
+_agent_runtime_singleton = None
+_agent_runtime_lock = _threading.Lock()
+
+
+def get_agent_run_runtime():
+    from app.services.agent_run_runtime import AgentRunRuntime
+
+    global _agent_runtime_singleton
+    with _agent_runtime_lock:
+        if _agent_runtime_singleton is None:
+            _agent_runtime_singleton = AgentRunRuntime(
+                session_factory=SessionLocal, service_factory=create_background_agent_service,
+            )
+        return _agent_runtime_singleton
+
+
+def shutdown_agent_run_runtime() -> None:
+    global _agent_runtime_singleton
+    with _agent_runtime_lock:
+        runtime = _agent_runtime_singleton
+        _agent_runtime_singleton = None
+    if runtime is not None:
+        runtime.shutdown()
+
+
 def get_agent_app_service(
     db: Session = Depends(get_db_session),
     user_service: UserService = Depends(get_user_service),

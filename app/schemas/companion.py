@@ -65,6 +65,7 @@ class CompanionRunRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    client_request_id: str | None = Field(default=None, min_length=1, max_length=64)
     task: str = Field(min_length=1, max_length=4000)
     mode: Literal["chat", "agent"] = "agent"
     backend: CompanionBackendId = "api"

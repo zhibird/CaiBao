@@ -57,7 +57,7 @@ def test_each_companion_memory_write_requires_its_own_approval(client, monkeypat
 
     monkeypatch.setattr(LLMService, "complete_chat", propose_another_write)
 
-    first_confirmation = client.post(f"/api/v1/agent/runs/{run_id}/confirm", json={})
+    first_confirmation = client.post(f"/api/v1/agent/runs/{run_id}/confirm", json={"approval_token": client.get(f"/api/v1/agent/runs/{run_id}").json()["approval_token"]})
     assert first_confirmation.status_code == 200
     first_result = first_confirmation.json()
     assert first_result["status"] == "requires_confirmation"
@@ -70,7 +70,7 @@ def test_each_companion_memory_write_requires_its_own_approval(client, monkeypat
         assert pending_run.status == "requires_confirmation"
         assert json.loads(pending_run.loop_state_json)["pending_tool_call_id"] == "second-write"
 
-    second_confirmation = client.post(f"/api/v1/agent/runs/{run_id}/confirm", json={})
+    second_confirmation = client.post(f"/api/v1/agent/runs/{run_id}/confirm", json={"approval_token": client.get(f"/api/v1/agent/runs/{run_id}").json()["approval_token"]})
     assert second_confirmation.status_code == 200
     assert second_confirmation.json()["status"] == "completed"
     assert second_confirmation.json()["required_confirmations"] == []
@@ -80,7 +80,7 @@ def test_each_companion_memory_write_requires_its_own_approval(client, monkeypat
         assert db.get(AgentRun, run_id).loop_state_json is None
 
     # A stale or repeated click cannot perform either write again.
-    assert client.post(f"/api/v1/agent/runs/{run_id}/confirm", json={}).status_code == 400
+    assert client.post(f"/api/v1/agent/runs/{run_id}/confirm", json={"approval_token": client.get(f"/api/v1/agent/runs/{run_id}").json()["approval_token"]}).status_code == 400
     with SessionLocal() as db:
         assert db.query(MemoryCard).filter_by(team_id=team_id, user_id=user_id).count() == 2
 
@@ -137,7 +137,7 @@ def test_memory_write_uses_trusted_space_when_model_only_supplies_content(client
     with SessionLocal() as db:
         assert db.query(MemoryCard).filter_by(team_id=team_id, user_id=user_id).count() == 0
 
-    confirmed = client.post(f"/api/v1/agent/runs/{run_id}/confirm", json={})
+    confirmed = client.post(f"/api/v1/agent/runs/{run_id}/confirm", json={"approval_token": client.get(f"/api/v1/agent/runs/{run_id}").json()["approval_token"]})
     assert confirmed.status_code == 200
     assert confirmed.json()["status"] == "completed"
     with SessionLocal() as db:

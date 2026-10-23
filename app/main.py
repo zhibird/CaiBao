@@ -44,6 +44,8 @@ def _make_proactive_tick():
 async def lifespan(_: FastAPI):
     global _scheduler
     init_db()
+    from app.api.deps import get_agent_run_runtime, shutdown_agent_run_runtime
+    get_agent_run_runtime().start()
 
     settings = get_settings()
     if settings.proactive_scheduler_enabled:
@@ -54,10 +56,12 @@ async def lifespan(_: FastAPI):
         )
         _scheduler.start()
 
-    yield
-
-    if _scheduler is not None:
-        _scheduler.stop()
+    try:
+        yield
+    finally:
+        if _scheduler is not None:
+            _scheduler.stop()
+        shutdown_agent_run_runtime()
 
 
 def create_app() -> FastAPI:
@@ -66,7 +70,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.app_name,
         version=settings.app_version,
-        description="Minimal enterprise IM AI CaiBao service.",
+        description="CaiBao companion and agent runtime with durable task observation.",
         lifespan=lifespan,
         default_response_class=UTF8JSONResponse,
     )

@@ -43,6 +43,7 @@ _AGENT_RUN_CURRENT_COLUMNS = (
     "app_version",
     "trigger_channel",
     "task",
+    "client_request_id",
     "status",
     "final_answer",
     "model",
@@ -220,6 +221,7 @@ def _normalize_legacy_agent_runs_table() -> None:
                 app_version INTEGER,
                 trigger_channel VARCHAR(32) NOT NULL DEFAULT 'agent',
                 task TEXT NOT NULL,
+                client_request_id VARCHAR(64),
                 status VARCHAR(32) NOT NULL DEFAULT 'running',
                 final_answer TEXT NOT NULL DEFAULT '',
                 model VARCHAR(128),
@@ -294,6 +296,10 @@ def _agent_run_coalesce_default(column: str) -> str | None:
 
 
 def _create_agent_run_indexes(conn: Any) -> None:
+    conn.exec_driver_sql(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_runs_request "
+        "ON agent_runs(team_id, user_id, client_request_id)"
+    )
     conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_agent_runs_team_id ON agent_runs(team_id)")
     conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_agent_runs_user_id ON agent_runs(user_id)")
     conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_agent_runs_conversation_id ON agent_runs(conversation_id)")
@@ -356,6 +362,7 @@ def _ensure_phase1_columns() -> None:
 
     if "agent_runs" in table_names:
         agent_run_cols = {item["name"] for item in inspector.get_columns("agent_runs")}
+        _add_col("agent_runs", "client_request_id", "VARCHAR(64)", agent_run_cols)
         if "app_id" not in agent_run_cols:
             with engine.begin() as conn:
                 conn.exec_driver_sql("ALTER TABLE agent_runs ADD COLUMN app_id VARCHAR(36)")
@@ -402,6 +409,8 @@ def _ensure_phase1_columns() -> None:
             with engine.begin() as conn:
                 conn.exec_driver_sql("ALTER TABLE agent_runs ADD COLUMN completed_at DATETIME")
         _normalize_legacy_agent_runs_table()
+        with engine.begin() as conn:
+            _create_agent_run_indexes(conn)
 
     # agent_steps 旧→新 schema 迁移
     if "agent_steps" in table_names:

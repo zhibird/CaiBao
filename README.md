@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/framework-FastAPI-009688?logo=fastapi">
   <img src="https://img.shields.io/badge/db-PostgreSQL%20|%20SQLite-336791">
   <img src="https://img.shields.io/badge/deploy-Docker-2496ED?logo=docker">
-  <img src="https://img.shields.io/badge/version-0.28.0-success">
+  <img src="https://img.shields.io/badge/version-0.29.0-success">
 </p>
 
 ---
@@ -30,7 +30,7 @@ CaiBao（彩宝）是一只住在桌面上的薄荷绿小猫，也是一个可�
 
 - 🤖 **Agent App Builder** — 创建/配置/发布/调用，含版本快照
 - 🧠 **Function Calling 引擎** — 自实现 OpenAI 兼容 tool_calls 多轮循环
-- 📡 **SSE 流式执行** — 实时输出推理过程、工具状态、确认请求
+- 📡 **可恢复任务** — 后台执行与持久 SSE 事件，断线接回文字、工具进度与审批；任务历史只读查看
 - 📚 **RAG 知识库** — 上传 PDF/Word/Excel/图片，Agent 回答带来源追溯
 - 🔧 **工具注册表** — 内置 + MCP 协议 + 插件，统一管理权限和危险等级
 - 🔒 **安全边界** — 危险操作需确认 + dry_run 预览 + max_tool_calls 预算
@@ -163,6 +163,7 @@ python scripts/agent_eval.py --base-url http://127.0.0.1:8000 \
 
 ## 近期更新
 
+- **v0.29.0** — 后台任务与持久事件、断线接回、只读任务历史、幂等提交和精确审批；[运行模块设计](docs/agent-task-lifecycle.md) · [更新日志](changelogs/0.29.0.md)
 - **v0.28.0** — macOS 桌宠、系统语音、状态表情、伙伴会话与记忆审批、API／CLI 后端选择、协作式停止和访问隔离加固；[使用说明](docs/companion.md) · [更新日志](changelogs/0.28.0.md)
 
 - **v0.27.0** — 发布整理：未知 `run_mode` 改为显式 400、模式白名单单一事实来源、Compose 透传 `CLI_AGENT_*`、仓库卫生清理

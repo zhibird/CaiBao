@@ -156,12 +156,14 @@ def test_companion_history_survives_reload_and_enters_next_turn(client):
     )
     with SessionLocal() as db:
         service = object.__new__(AgentService)
+        service.db = db
         service.chat_history_service = ChatHistoryService(db)
         service._record_agent_history(payload=payload, response=response)
 
     # New database session proves the next turn reads persisted conversation data.
     with SessionLocal() as db:
         service = object.__new__(AgentService)
+        service.db = db
         service.chat_history_service = ChatHistoryService(db)
         service.llm_service = SimpleNamespace(settings=SimpleNamespace(llm_history_turns=5))
         stored = service.chat_history_service.list_history(

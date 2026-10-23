@@ -16,7 +16,7 @@ from sqlalchemy.schema import CreateColumn
 from app.db.base import Base
 from app.models import *  # noqa: F401,F403
 
-HEAD_REVISION = "20260530_00"
+HEAD_REVISION = "20260531_00"
 EXPECTED_TABLES = {
     "teams",
     "users",
@@ -26,6 +26,8 @@ EXPECTED_TABLES = {
     "conclusions",
     "auth_refresh_sessions",
     "agent_runs",
+    "agent_run_events",
+    "agent_run_workers",
     "agent_steps",
     "agent_apps",
     "agent_app_versions",
