@@ -1,5 +1,6 @@
 import {initialState, reduceEvent, speechText} from './companion-state.mjs';
 import {CompanionRecovery, runStatusLabel} from './companion-recovery.mjs';
+import {CompanionMemory} from './companion-memory.mjs';
 
 const $ = id => document.getElementById(id);
 const desktop = new URLSearchParams(location.search).get('desktop') === '1';
@@ -8,6 +9,8 @@ let state = initialState(), account = null, conversationId = null, currentRun = 
 let runtimeProfile = null, backends = [];
 let busy = false, pendingApproval = false, registering = false, recognition = null, toastTimer;
 let speechGeneration = 0, speaking = false, controller = null, currentContent = null, approvalToken = null, previewGeneration = 0;
+let identityGeneration = 0, conversationPromise = null, memoryDraft = null, documentDraft = null, pendingMemoryDelete = null;
+const memoryNotebook = new CompanionMemory({request:api,onChange:renderMemory});
 const runContents = new Map();
 const preferences = (() => {try {return JSON.parse(localStorage.getItem('caibao.companion.preferences') || '{}');} catch {return {};}})();
 $('voice').checked = preferences.voice === true;
@@ -43,12 +46,19 @@ async function api(path, options = {}, retry = true) {
   }
   return response.status === 204 ? null : response.json();
 }
-function message(role, text = '') {
+function message(role, text = '', metadata = {}) {
   $('welcome')?.remove();
   const element = document.createElement('div'); element.className = `message ${role}`;
   const label = document.createElement('div'); label.className = 'speaker'; label.textContent = role === 'user' ? '你' : '彩宝';
   const content = document.createElement('div'); content.className = 'content'; content.textContent = text;
-  element.append(label, content); $('messages').append(element); scrollMessages(); return content;
+  element.append(label, content);
+  if (role === 'user') {
+    const owner = account?.user_id;
+    const save = document.createElement('button'); save.type = 'button'; save.className = 'message-save-memory'; save.textContent = '存到记忆';
+    save.onclick = () => {if (owner === account?.user_id) void openMemory({text,sourceId:metadata.message_id});};
+    element.append(save);
+  }
+  $('messages').append(element); scrollMessages(); return content;
 }
 function scrollMessages() { $('messages').scrollTop = $('messages').scrollHeight; }
 function connection(text, online) {
@@ -58,6 +68,7 @@ function showAuth() { if (!$('auth-dialog').open) $('auth-dialog').showModal(); 
 async function signedIn(user) {
   const switched = account?.user_id !== user.user_id;
   if (switched) {
+    identityGeneration++; resetMemoryNotebook();
     $('messages').replaceChildren(); $('task-log').replaceChildren();
     controller?.dispose(); controller = null; currentContent = null; runContents.clear(); previewGeneration++;
     $('history-preview').hidden = true; renderTaskHistory([]); $('run-strip').hidden = true;
@@ -65,47 +76,64 @@ async function signedIn(user) {
     $('task-status').textContent = '没有任务的时候，发会儿呆也很好。';
   }
   account = user; $('account-button').hidden = false;
+  const generation = identityGeneration;
+  const current = () => generation === identityGeneration && account?.user_id === user.user_id;
   conversationId = localStorage.getItem(`caibao.companion.conversation.${user.user_id}`);
-  const profile = await api('/companion/profile'); runtimeProfile = profile;
-  const models = await api('/llm/models');
-  $('model-select').replaceChildren(new Option('默认模型', ''));
-  for (const model of models.items) $('model-select').add(new Option(model.model_name,model.model_name));
-  const preferredModel = localStorage.getItem(`caibao.companion.model.${user.user_id}`);
-  if (models.items.some(model => model.model_name === preferredModel)) $('model-select').value = preferredModel;
-  backends = await api('/companion/backends');
-  $('backend').replaceChildren();
-  for (const item of backends) {
-    const option = new Option(item.label + (item.available ? '' : ' · 未就绪'),item.id);
-    option.disabled = !item.available; $('backend').add(option);
-  }
-  const preferredBackend = localStorage.getItem(`caibao.companion.backend.${user.user_id}`);
-  if (backends.some(item => item.id === preferredBackend && item.available)) $('backend').value = preferredBackend;
-  updateBackend();
-
-  renderModelStatus();
-  setState({...profile.state, label: profile.state.activity === 'sleeping' ? '眯一会儿，叫我就好' : '嗯，我在。今天想做点什么？'});
-  if (!conversationId) message('assistant', profile.greeting);
-  if (conversationId) {
-    try {
-      const history = await api(`/chat/history?conversation_id=${encodeURIComponent(conversationId)}&limit=40`);
-      const items = history.items.filter(item => item.channel === 'companion').reverse();
-      for (const item of items) {
-        message('user', item.request_text); const content = message('assistant', item.response_text);
-        if (item.response_payload?.run_id) runContents.set(item.response_payload.run_id, content);
-      }
-      if (!items.length) message('assistant',profile.greeting);
-    } catch (error) {
-      if (error.status === 404) {conversationId = null; localStorage.removeItem(`caibao.companion.conversation.${user.user_id}`);}
-      else throw error;
+  try {
+    const profile = await api('/companion/profile'); if (!current()) return;
+    runtimeProfile = profile;
+    const models = await api('/llm/models');
+    if (!current()) return;
+    $('model-select').replaceChildren(new Option('默认模型', ''));
+    for (const model of models.items) $('model-select').add(new Option(model.model_name,model.model_name));
+    const preferredModel = localStorage.getItem(`caibao.companion.model.${user.user_id}`);
+    if (models.items.some(model => model.model_name === preferredModel)) $('model-select').value = preferredModel;
+    const availableBackends = await api('/companion/backends'); if (!current()) return;
+    backends = availableBackends;
+    $('backend').replaceChildren();
+    for (const item of backends) {
+      const option = new Option(item.label + (item.available ? '' : ' · 未就绪'),item.id);
+      option.disabled = !item.available; $('backend').add(option);
     }
-  }
-  if (conversationId) await createController().restore();
+    const preferredBackend = localStorage.getItem(`caibao.companion.backend.${user.user_id}`);
+    if (backends.some(item => item.id === preferredBackend && item.available)) $('backend').value = preferredBackend;
+    updateBackend();
+
+    renderModelStatus();
+    setState({...profile.state, label: profile.state.activity === 'sleeping' ? '眯一会儿，叫我就好' : '嗯，我在。今天想做点什么？'});
+    if (!conversationId) message('assistant', profile.greeting);
+    if (conversationId) {
+      try {
+        const history = await api(`/chat/history?conversation_id=${encodeURIComponent(conversationId)}&limit=40`);
+        if (!current()) return;
+        const items = history.items.filter(item => item.channel === 'companion').reverse();
+        for (const item of items) {
+          message('user', item.request_text, {message_id:item.message_id}); const content = message('assistant', item.response_text);
+          if (item.response_payload?.run_id) runContents.set(item.response_payload.run_id, content);
+        }
+        if (!items.length) message('assistant',profile.greeting);
+      } catch (error) {
+        if (!current()) return;
+        if (error.status === 404) {conversationId = null; localStorage.removeItem(`caibao.companion.conversation.${user.user_id}`);}
+        else throw error;
+      }
+    }
+    if (conversationId) {await createController().restore(); if (!current()) return;}
+  } catch (error) {if (current()) throw error;}
 }
 async function ensureConversation() {
-  if (!conversationId) {
-    const item = await api('/conversations', {method:'POST',body:JSON.stringify({title:'与彩宝的小日常'})});
-    conversationId = item.conversation_id;
-    localStorage.setItem(`caibao.companion.conversation.${account.user_id}`, conversationId);
+  if (!conversationId && !conversationPromise) {
+    const generation = identityGeneration, owner = account?.user_id;
+    const pending = (async () => {
+      const item = await api('/conversations', {method:'POST',body:JSON.stringify({title:'与彩宝的小日常'})});
+      if (generation !== identityGeneration || owner !== account?.user_id) throw new Error('对话已经切换，请在当前对话中继续。');
+      conversationId = item.conversation_id;
+      localStorage.setItem(`caibao.companion.conversation.${account.user_id}`, conversationId);
+    })();
+    conversationPromise = pending;
+    try {await pending;} finally {if (conversationPromise === pending) conversationPromise = null;}
+  } else if (conversationPromise) {
+    await conversationPromise;
   }
 }
 function setBusy(value) {
@@ -267,6 +295,7 @@ function updateBackend() {
   const selected = backends.find(item => item.id === $('backend').value);
   const cli = selected?.kind === 'cli';
   $('backend-note').textContent = selected?.reason || 'DeepSeek 等 API 模型在工作台中配置。';
+  $('memory-setting-note').textContent = cli ? 'CLI 使用自己的会话与记忆。彩宝不会把记忆卡或背景文本注入 CLI。' : '包括记忆卡与可用的背景文本。关闭后，当前对话的聊天上下文仍然保留。';
   if (cli) $('mode').value = 'agent';
   $('mode').disabled = cli; $('memory').disabled = cli; $('model-select').disabled = cli;
   renderModelStatus();
@@ -279,6 +308,142 @@ $('model-select').onchange = () => {
   if (account) localStorage.setItem(`caibao.companion.model.${account.user_id}`, $('model-select').value);
   renderModelStatus();
 };
+function resetMemoryNotebook() {
+  conversationPromise = null;
+  memoryDraft = null; documentDraft = null; pendingMemoryDelete = null;
+  memoryNotebook.dispose(); $('memory-notebook').hidden = true;
+  $('memory-editor').hidden = true; $('memory-document-editor').hidden = true;
+  $('memory-card-title').value = ''; $('memory-card-content').value = ''; $('memory-document-content').value = '';
+}
+async function openMemory(seed = {}) {
+  if (!account) {showAuth(); return;}
+  const generation = identityGeneration;
+  try {
+    await ensureConversation(); if (generation !== identityGeneration) return;
+    memoryNotebook.setContext(account.user_id,conversationId);
+    $('memory-notebook').hidden = false;
+    if (seed.text !== undefined) editMemoryCard({content:seed.text,source_message_id:seed.sourceId});
+    await memoryNotebook.load();
+  } catch (error) {if (generation === identityGeneration) toast(error.message);}
+}
+function notebookElement(tag, className, text) {
+  const node = document.createElement(tag); if (className) node.className = className;
+  if (text !== undefined) node.textContent = text; return node;
+}
+function notebookButton(label, action, disabled = false) {
+  const button = notebookElement('button','',label); button.type = 'button'; button.disabled = disabled;
+  button.onclick = action; return button;
+}
+function renderMemory(snapshot) {
+  const blocked = snapshot.saving || snapshot.loading || Boolean(snapshot.uncertain || snapshot.conflict);
+  $('memory-status').textContent = snapshot.loading ? '正在翻开你的小本…' : snapshot.saving ? '正在保存，请稍候…' : snapshot.error ||
+    (snapshot.uncertain ? '结果待核对；不会自动重试。' : snapshot.conflict ? '请先比较最新背景与草稿。' : snapshot.notice || '查看和编辑小本，不需要调用生成模型。');
+  $('memory-status').classList.toggle('has-error',Boolean(snapshot.error || snapshot.uncertain || snapshot.conflict));
+  $('memory-unknown').hidden = !snapshot.uncertain;
+  $('memory-unknown-reviewed').disabled = snapshot.loading || snapshot.saving || !snapshot.uncertain?.checked;
+  $('memory-card-count').textContent = snapshot.items.length ? `· ${snapshot.items.length}${snapshot.hasMore ? '+' : ''}` : '';
+  for (const id of ['memory-save','memory-document-save','memory-document-clear','memory-add']) $(id).disabled = blocked;
+  if (documentDraft && !snapshot.documents.find(doc => doc.kind === documentDraft.kind)?.enabled) $('memory-document-save').disabled = true;
+  $('memory-refresh').disabled = snapshot.loading || snapshot.saving;
+  $('memory-more').hidden = !snapshot.hasMore; $('memory-more').disabled = snapshot.loadingMore || snapshot.loading || snapshot.saving;
+  $('memory-more').textContent = snapshot.loadingMore ? '正在读取…' : '再看一些记忆';
+  $('memory-cards').replaceChildren();
+  if (!snapshot.items.length) $('memory-cards').append(notebookElement('p','notebook-empty',snapshot.loading ? '正在读取记忆…' : '小本还空着。把值得留住的事，亲手存下来吧。'));
+  for (const item of snapshot.items) {
+    const card = notebookElement('article','memory-card'); card.dataset.memoryId = item.memory_id;
+    const heading = notebookElement('div','memory-card-heading');
+    heading.append(notebookElement('h4','',item.title));
+    const effective = item.effective_status || item.status;
+    const stateLabel = {active:'使用中',disabled:'已暂停',expired:'已过期'}[effective] || '待核对';
+    const badge = notebookElement('span','memory-card-badge',stateLabel); badge.dataset.status = effective; heading.append(badge);
+    const scope = item.scope_level === 'global' || item.scope_level === 'personal' || !item.space_id ? '个人全局' : '当前空间';
+    card.append(heading,notebookElement('p','memory-card-meta',`${scope} · ${item.category}`),notebookElement('p','memory-card-body',item.content));
+    if (item.expires_at) {
+      const date = new Date(item.expires_at); card.append(notebookElement('p','memory-card-meta',`有效期至 ${Number.isNaN(date.valueOf()) ? item.expires_at : date.toLocaleString('zh-CN')}`));
+    }
+    if (item.source_message_id || item.source) {
+      const source = notebookElement('details','memory-source'); source.append(notebookElement('summary','',item.source?.available ? '查看来自哪次聊天' : '来源聊天目前不可用'));
+      if (item.source?.available) {
+        source.append(notebookElement('p','','你：' + (item.source.request_preview || '没有可显示的原文')));
+        if (item.source.response_preview) source.append(notebookElement('p','','彩宝：' + item.source.response_preview));
+      } else source.append(notebookElement('p','','记忆正文仍然保留；此处不会猜测或补造原文。'));
+      card.append(source);
+    } else card.append(notebookElement('p','memory-card-meta','手动保存 · 未关联聊天来源'));
+    const actions = notebookElement('div','notebook-actions');
+    actions.append(notebookButton('编辑',() => editMemoryCard(item),blocked));
+    if (effective !== 'expired') actions.append(notebookButton(item.status === 'active' ? '暂停使用' : '重新启用',() => void memoryNotebook.setStatus(item,item.status === 'active' ? 'disabled' : 'active'),blocked));
+    actions.append(notebookButton('删除',() => {pendingMemoryDelete = item.memory_id; renderMemory(memoryNotebook.state);},blocked));
+    card.append(actions);
+    if (pendingMemoryDelete === item.memory_id) {
+      const confirm = notebookElement('div','memory-delete-review'); confirm.setAttribute('role','alert');
+      confirm.append(notebookElement('p','','只删除这条卡片，聊天与其他背景仍然保留。'));
+      confirm.append(notebookButton('确认删除这条记忆',async () => {
+        const result = await memoryNotebook.remove(item);
+        if (result.ok) {pendingMemoryDelete = null; if (memoryDraft?.memory_id === item.memory_id) closeMemoryEditor();}
+      },blocked),notebookButton('保留',() => {pendingMemoryDelete = null; renderMemory(memoryNotebook.state);},snapshot.saving));
+      card.append(confirm);
+    }
+    $('memory-cards').append(card);
+  }
+  $('memory-documents').replaceChildren();
+  for (const doc of snapshot.documents) {
+    const section = notebookElement('section','memory-document');
+    const label = notebookElement('div','memory-document-heading'); label.append(notebookElement('h4','',doc.label),notebookButton('编辑',() => editMemoryDocument(doc),blocked || !doc.enabled));
+    section.append(label,notebookElement('p','memory-card-meta',doc.enabled ? `回答时最多参考 ${doc.prompt_limit} 字符` : '尚未启用背景记忆，可查看内容；记忆卡仍可管理'));
+    const preview = notebookElement('details','memory-document-preview'); preview.append(notebookElement('summary','','查看正文'),notebookElement('pre','',doc.content || '（空白）'));
+    section.append(preview); $('memory-documents').append(section);
+  }
+  const conflict = snapshot.conflict && documentDraft?.kind === snapshot.conflict.kind;
+  $('memory-conflict').hidden = !conflict;
+  if (conflict) $('memory-document-latest').textContent = snapshot.documents.find(doc => doc.kind === documentDraft.kind)?.content ?? '最新正文未读取成功，请刷新后再核对。';
+  $('memory-conflict-reviewed').disabled = snapshot.loading || snapshot.saving || !snapshot.conflict?.reviewReady;
+}
+function editMemoryCard(item = {}) {
+  if (memoryNotebook.state.conflict) {toast('请先核对背景文本的更新，或取消那份草稿。'); return;}
+  memoryDraft = {memory_id:item.memory_id,source_message_id:item.source_message_id};
+  documentDraft = null; $('memory-document-editor').hidden = true;
+  $('memory-editor-title').textContent = item.memory_id ? '重新写清这件事' : '留下一件事';
+  $('memory-card-title').value = item.title || '';
+  $('memory-card-content').value = item.content || '';
+  $('memory-card-category').value = item.category || 'preference';
+  $('memory-editor-source').textContent = item.source_message_id ? '会保留这次聊天的来源关联。请先检查正文，再明确保存。' : '这是一份待保存的草稿，尚未写入记忆。未关联聊天记录时只保存你确认的文字。';
+  $('memory-editor').hidden = false; $('memory-editor').scrollIntoView({block:'nearest'}); $('memory-card-title').focus();
+}
+function closeMemoryEditor() {memoryDraft = null; $('memory-editor').hidden = true; $('memory-card-title').value = ''; $('memory-card-content').value = '';}
+function editMemoryDocument(doc) {
+  documentDraft = {kind:doc.kind,expected_revision:doc.revision}; closeMemoryEditor();
+  $('memory-document-title').textContent = doc.label;
+  $('memory-document-content').value = doc.content;
+  $('memory-document-note').textContent = '可清空正文；点“保存背景文本”后才会写入。旧会话和 CLI 自身的上下文不会因此清空。';
+  $('memory-document-editor').hidden = false; $('memory-document-editor').scrollIntoView({block:'nearest'});
+  renderMemory(memoryNotebook.state); $('memory-document-content').focus();
+}
+$('memory-toggle').onclick = () => void openMemory();
+$('memory-close').onclick = () => {$('memory-notebook').hidden = true; $('memory-toggle').focus();};
+$('memory-add').onclick = () => editMemoryCard();
+$('memory-refresh').onclick = () => void memoryNotebook.load();
+$('memory-more').onclick = () => void memoryNotebook.load({append:true});
+$('memory-edit-cancel').onclick = closeMemoryEditor;
+$('memory-editor').onsubmit = async event => {
+  event.preventDefault(); if (!memoryDraft) return;
+  const generation = identityGeneration;
+  const result = await memoryNotebook.saveCard({...memoryDraft,title:$('memory-card-title').value.trim(),content:$('memory-card-content').value.trim(),category:$('memory-card-category').value.trim()});
+  if (generation === identityGeneration && result.ok) closeMemoryEditor();
+};
+$('memory-document-editor').onsubmit = async event => {
+  event.preventDefault(); if (!documentDraft) return;
+  const generation = identityGeneration;
+  const result = await memoryNotebook.saveDocument({...documentDraft,content:$('memory-document-content').value});
+  if (generation === identityGeneration && result.ok) {documentDraft = null; $('memory-document-editor').hidden = true;}
+};
+$('memory-document-clear').onclick = () => {$('memory-document-content').value = ''; $('memory-document-content').focus();};
+$('memory-document-cancel').onclick = () => {documentDraft = null; $('memory-document-editor').hidden = true; if (memoryNotebook.state.conflict) memoryNotebook.discardConflict();};
+$('memory-unknown-reviewed').onclick = () => memoryNotebook.reviewedUnknown();
+$('memory-conflict-reviewed').onclick = () => {
+  const latest = memoryNotebook.state.documents.find(doc => doc.kind === documentDraft?.kind);
+  if (latest) {documentDraft.expected_revision = latest.revision; memoryNotebook.reviewedConflict();}
+};
+$('memory-notebook').addEventListener('keydown',event => {if (event.key === 'Escape') {$('memory-notebook').hidden = true; $('memory-toggle').focus();}});
 $('mute').onclick = stopSpeech;
 $('pet-action').onclick = () => interact('pet'); $('feed-action').onclick = () => interact('feed');
 $('rest-action').onclick = () => interact(state.activity === 'sleeping' ? 'wake' : 'rest');
@@ -299,6 +464,7 @@ window.addEventListener('caibao-native-ready', event => {document.body.classList
 window.addEventListener('caibao-native-speech', event => showSpeaking(event.detail.state === 'start'));
 $('new-chat').onclick = () => {
   if (busy || pendingApproval) return;
+  identityGeneration++; resetMemoryNotebook();
   controller?.dispose(); controller = null; currentContent = null; runContents.clear(); previewGeneration++;
   $('history-preview').hidden = true; renderTaskHistory([]); $('run-strip').hidden = true;
   clearApproval(); conversationId = null; currentRun = null; stopSpeech();
@@ -348,7 +514,7 @@ $('auth-form').onsubmit = async event => {
 };
 $('account-button').onclick = async () => {
   if (busy || pendingApproval) return;
-  try {await api('/auth/logout',{method:'POST'}); controller?.dispose(); controller = null; currentContent = null; runContents.clear(); previewGeneration++; $('history-preview').hidden = true; renderTaskHistory([]); $('run-strip').hidden = true; account = null; conversationId = null; currentRun = null; stopSpeech(); clearApproval(); $('messages').replaceChildren(); $('account-button').hidden = true; connection('未登录 · 可以先摸摸彩宝',false); showAuth();}
+  try {await api('/auth/logout',{method:'POST'}); identityGeneration++; resetMemoryNotebook(); controller?.dispose(); controller = null; currentContent = null; runContents.clear(); previewGeneration++; $('history-preview').hidden = true; renderTaskHistory([]); $('run-strip').hidden = true; account = null; conversationId = null; currentRun = null; stopSpeech(); clearApproval(); $('messages').replaceChildren(); $('account-button').hidden = true; connection('未登录 · 可以先摸摸彩宝',false); showAuth();}
   catch (error) {toast(error.message);}
 };
 const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;

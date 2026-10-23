@@ -1,16 +1,25 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import os
 import re
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from app.core.config import get_settings
+from app.core.exceptions import DomainValidationError
 
 # Idempotency marker: <!-- caibao:source_ref:{hash}:kind:{kind} -->
 _SOURCE_REF_RE = re.compile(r"<!--\s*caibao:source_ref:([a-f0-9]+):kind:(\w+)\s*-->")
+_RECENT_TURNS_RE = re.compile(r"<!-- BEGIN Recent Turns -->.*?<!-- END Recent Turns -->", re.DOTALL)
+_DOCUMENT_FILES = {"self_model": "SELF.md", "long_term": "MEMORY.md", "recent_context": "RECENT_CONTEXT.md"}
+
+
+class MemoryDocumentConflictError(DomainValidationError):
+    """The editable document changed after the caller read its revision."""
 
 
 def _hash_ref(source_ref: str) -> str:
@@ -94,8 +103,9 @@ class MemoryMarkdownStore:
         }
         for name, default_content in default_contents.items():
             f = d / name
-            if not f.exists():
-                f.write_text(default_content, encoding="utf-8")
+            with self._file_lock(f):
+                if not f.exists():
+                    self._atomic_write(f, default_content)
         return d
 
     # ------------------------------------------------------------------
@@ -111,7 +121,8 @@ class MemoryMarkdownStore:
     def write_self_model(self, team_id: str, user_id: str, space_id: str | None, text: str) -> None:
         d = self._workspace_dir(team_id, user_id, space_id)
         f = d / "SELF.md"
-        self._atomic_write(f, text.strip() + "\n")
+        with self._file_lock(f):
+            self._atomic_write(f, text.strip() + "\n")
 
     # ------------------------------------------------------------------
     # MEMORY.md — long-term facts / preferences
@@ -126,7 +137,8 @@ class MemoryMarkdownStore:
     def write_long_term(self, team_id: str, user_id: str, space_id: str | None, text: str) -> None:
         d = self._workspace_dir(team_id, user_id, space_id)
         f = d / "MEMORY.md"
-        self._atomic_write(f, text.strip() + "\n")
+        with self._file_lock(f):
+            self._atomic_write(f, text.strip() + "\n")
 
     # ------------------------------------------------------------------
     # HISTORY.md — event timeline, append-only
@@ -166,10 +178,7 @@ class MemoryMarkdownStore:
         text = f.read_text("utf-8")
         if not include_recent_turns:
             # Strip the Recent Turns block delimited by HTML comment markers
-            text = re.sub(
-                r"\n?<!-- BEGIN Recent Turns -->.*<!-- END Recent Turns -->",
-                "", text, flags=re.DOTALL,
-            ).strip()
+            text = _RECENT_TURNS_RE.sub("", text).strip()
         return text.strip()
 
     def write_recent_context(
@@ -177,7 +186,79 @@ class MemoryMarkdownStore:
     ) -> None:
         d = self._workspace_dir(team_id, user_id, space_id)
         f = d / "RECENT_CONTEXT.md"
-        self._atomic_write(f, text.strip() + "\n")
+        with self._file_lock(f):
+            self._atomic_write(f, text.strip() + "\n")
+
+    def _document_raw(self, target: Path, kind: str) -> tuple[str, str]:
+        try:
+            raw = target.read_text("utf-8")
+            marker = "present\n"
+        except FileNotFoundError:
+            raw = self.DEFAULT_SELF_MD if kind == "self_model" else ""
+            marker = "missing\n"
+        revision = hashlib.sha256((marker + raw).encode("utf-8")).hexdigest()
+        return raw, revision
+
+    def snapshot_document(
+        self, team_id: str, user_id: str, space_id: str | None, kind: str,
+    ) -> dict[str, str]:
+        """Read an editable prompt section without initializing any files.
+
+        A missing SELF.md previews the exact default that the next task creates.
+        The revision covers the full stored file, including hidden recent turns.
+        Atomic replacement makes each read consistent without creating a lockfile.
+        """
+        if kind not in _DOCUMENT_FILES:
+            raise DomainValidationError("Unknown memory document kind.")
+        target = self._workspace_dir(team_id, user_id, space_id) / _DOCUMENT_FILES[kind]
+        raw, revision = self._document_raw(target, kind)
+        content = _RECENT_TURNS_RE.sub("", raw) if kind == "recent_context" else raw
+        return {"content": content.strip(), "revision": revision}
+
+    def update_document(
+        self, team_id: str, user_id: str, space_id: str | None, kind: str,
+        *, content: str, expected_revision: str,
+    ) -> dict[str, str]:
+        """Compare and replace one editable section under a process-safe lock.
+
+        Legacy unconditional writers share the lock but intentionally remain
+        unconditional. Their larger read/model/write transactions are not CAS.
+        """
+        if kind not in _DOCUMENT_FILES:
+            raise DomainValidationError("Unknown memory document kind.")
+        if kind == "recent_context" and (
+            "<!-- BEGIN Recent Turns -->" in content or "<!-- END Recent Turns -->" in content
+        ):
+            raise DomainValidationError("Recent Turns 是内部记录，不能从记忆编辑器修改。")
+        target = self._workspace_dir(team_id, user_id, space_id) / _DOCUMENT_FILES[kind]
+        with self._file_lock(target):
+            raw, revision = self._document_raw(target, kind)
+            if revision != expected_revision:
+                raise MemoryDocumentConflictError("这份记忆已在别处更新，请刷新后再保存。")
+            edited = content.strip()
+            if kind == "recent_context":
+                turns = "\n\n".join(_RECENT_TURNS_RE.findall(raw))
+                edited = "\n\n".join(part for part in (edited, turns) if part)
+            self._atomic_write(target, edited + "\n" if edited else "")
+            # Snapshot while retaining the lock: return this write's revision.
+            return self.snapshot_document(team_id, user_id, space_id, kind)
+
+    def transform_document(
+        self, team_id: str, user_id: str, space_id: str | None, kind: str,
+        transform: Callable[[str], str],
+    ) -> None:
+        """Apply a pure background merge to the latest complete file atomically.
+
+        The callback must not perform I/O, model calls, or another store write.
+        Recent-context callbacks see the internal Recent Turns block as well.
+        """
+        if kind not in _DOCUMENT_FILES:
+            raise DomainValidationError("Unknown memory document kind.")
+        target = self._workspace_dir(team_id, user_id, space_id) / _DOCUMENT_FILES[kind]
+        with self._file_lock(target):
+            raw, _ = self._document_raw(target, kind)
+            text = transform(raw).strip()
+            self._atomic_write(target, text + "\n" if text else "")
 
     # ------------------------------------------------------------------
     # PENDING.md — items awaiting archiving
@@ -210,8 +291,9 @@ class MemoryMarkdownStore:
         snap_dir = d / ".snapshots"
         snap_dir.mkdir(exist_ok=True)
         src = d / "PENDING.md"
-        if src.exists():
-            (snap_dir / f"{sid}.md").write_text(src.read_text("utf-8"), encoding="utf-8")
+        with self._file_lock(src):
+            if src.exists():
+                (snap_dir / f"{sid}.md").write_text(src.read_text("utf-8"), encoding="utf-8")
         return sid
 
     def commit_pending_snapshot(
@@ -228,13 +310,30 @@ class MemoryMarkdownStore:
         """Restore PENDING.md from snapshot."""
         d = self._workspace_dir(team_id, user_id, space_id)
         snap = d / ".snapshots" / f"{snapshot_id}.md"
-        if snap.exists():
-            (d / "PENDING.md").write_text(snap.read_text("utf-8"), encoding="utf-8")
-            snap.unlink()
+        target = d / "PENDING.md"
+        with self._file_lock(target):
+            if snap.exists():
+                self._atomic_write(target, snap.read_text("utf-8"))
+                snap.unlink()
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @contextmanager
+    def _file_lock(self, target: Path):
+        """Lock a stable sidecar, since replacing the document changes its inode.
+
+        Do not call another locking writer inside this context: separate flock
+        descriptors are not reentrant, even within the same process.
+        """
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with (target.parent / ("." + target.name + ".lock")).open("a", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     def _atomic_write(self, target: Path, content: str) -> None:
         fd, tmp = tempfile.mkstemp(dir=target.parent, prefix="." + target.name + ".", suffix=".tmp")
@@ -259,15 +358,16 @@ class MemoryMarkdownStore:
         ref_hash = _hash_ref(source_ref)
         marker = _source_ref_marker(ref_hash, kind)
 
-        existing = f.read_text("utf-8") if f.exists() else ""
-        if marker in existing:
-            return False  # already written
+        with self._file_lock(f):
+            existing = f.read_text("utf-8") if f.exists() else ""
+            if marker in existing:
+                return False  # already written
 
-        new_lines = [formatter(item) for item in items]
-        new_lines.append(marker)
-        new_block = "\n".join(new_lines) + "\n"
+            new_lines = [formatter(item) for item in items]
+            new_lines.append(marker)
+            new_block = "\n".join(new_lines) + "\n"
 
-        if existing and not existing.endswith("\n"):
-            existing += "\n"
-        self._atomic_write(f, existing + new_block)
-        return True
+            if existing and not existing.endswith("\n"):
+                existing += "\n"
+            self._atomic_write(f, existing + new_block)
+            return True

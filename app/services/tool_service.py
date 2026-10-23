@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import Select, or_, select
+from sqlalchemy import Select, and_, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import DomainValidationError, EntityNotFoundError
@@ -14,6 +14,7 @@ from app.models.document import Document
 from app.models.incident import Incident
 from app.models.memory_card import MemoryCard
 from app.models.project_space import ProjectSpace
+from app.schemas.memory import MemoryCardCreate
 from app.schemas.tooling import ToolCallContext
 from app.services.tool_catalog_service import ToolCatalogService
 from app.services.tool_registry import ToolDefinition, get_tool_definition, list_tool_definitions
@@ -51,11 +52,13 @@ class ToolService:
         catalog: ToolCatalogService,
         safety: ToolSafetyService,
         plugin_manager=None,
+        memory_service=None,
     ) -> None:
         self.db = db
         self.catalog = catalog
         self.safety = safety
         self.plugin_manager = plugin_manager
+        self._memory_service = memory_service
         self._generic_handlers: dict[str, object] = {}
 
     def register_generic_handler(self, name: str, handler: object) -> None:
@@ -297,28 +300,22 @@ class ToolService:
         if len(content) > 4000:
             raise DomainValidationError("content must be at most 4000 characters.")
 
-        now = datetime.now(timezone.utc)
-        memory = MemoryCard(
-            memory_id=str(uuid4()),
+        # Use the same writer as the notebook: an approved fact must receive
+        # its retrieval index too, so later chat can recall it without tools.
+        memory = self._memory_writer().create(MemoryCardCreate(
             team_id=team_id,
             space_id=space_id,
             user_id=user_id,
-            scope_level="space",
             category=category[:32],
             title=title,
             content=content,
-            summary=str(arguments.get("summary", "")).strip() or None,
+            summary=str(arguments.get("summary", "")).strip()[:2000] or None,
             weight=0.8,
             confidence=0.9,
             status="active",
             source_message_id=None,
             expires_at=None,
-            created_at=now,
-            updated_at=now,
-        )
-        self.db.add(memory)
-        self.db.commit()
-        self.db.refresh(memory)
+        ))
         return {
             "tool_name": "create_memory_card",
             "message": "Memory card created successfully.",
@@ -330,6 +327,26 @@ class ToolService:
                 "status": memory.status,
             },
         }
+
+    def _memory_writer(self):
+        if self._memory_service is None:
+            # Keep standalone ToolService users on the same write path as the
+            # dependency-injected server, using this service's own DB session.
+            from app.core.config import get_settings
+            from app.services.embedding_model_service import EmbeddingModelService
+            from app.services.embedding_service import EmbeddingService
+            from app.services.memory_service import MemoryService
+            from app.services.space_service import SpaceService
+            from app.services.user_service import UserService
+
+            users = UserService(self.db)
+            self._memory_service = MemoryService(
+                db=self.db, user_service=users,
+                space_service=SpaceService(db=self.db, user_service=users),
+                embedding_service=EmbeddingService(settings=get_settings()),
+                embedding_model_service=EmbeddingModelService(db=self.db, user_service=users),
+            )
+        return self._memory_service
 
     def _forget_memory(
         self,
@@ -343,15 +360,10 @@ class ToolService:
         if not memory_id:
             raise DomainValidationError("forget_memory requires a non-empty 'memory_id'.")
 
-        memory = self.db.get(MemoryCard, memory_id)
-        if memory is None:
-            raise EntityNotFoundError(f"Memory card '{memory_id}' not found.")
-        if memory.team_id != team_id:
-            raise EntityNotFoundError(f"Memory card '{memory_id}' not found.")
-
+        writer = self._memory_writer()
+        memory = writer.ensure_access(memory_id=memory_id, team_id=team_id, user_id=user_id)
         title = memory.title or memory_id
-        self.db.delete(memory)
-        self.db.commit()
+        writer.delete(memory_id=memory_id, team_id=team_id, user_id=user_id)
         return {
             "tool_name": "forget_memory",
             "message": f"Memory card '{title}' deleted.",
@@ -379,17 +391,21 @@ class ToolService:
             MemoryCard.team_id == team_id,
             MemoryCard.user_id == user_id,
             or_(
-                MemoryCard.space_id.is_(None),
+                and_(MemoryCard.scope_level == "global", MemoryCard.space_id.is_(None)),
                 MemoryCard.space_id.in_(self._user_space_ids(team_id=team_id, user_id=user_id)),
             ),
             MemoryCard.status == "active",
+            or_(MemoryCard.expires_at.is_(None), MemoryCard.expires_at > datetime.now(timezone.utc)),
             or_(
                 MemoryCard.title.ilike(like_query, escape="\\"),
                 MemoryCard.content.ilike(like_query, escape="\\"),
             ),
         )
         if space_id is not None:
-            stmt = stmt.where(MemoryCard.space_id == space_id)
+            stmt = stmt.where(or_(
+                MemoryCard.space_id == space_id,
+                and_(MemoryCard.scope_level == "global", MemoryCard.space_id.is_(None)),
+            ))
         stmt = stmt.order_by(
             MemoryCard.updated_at.desc(), MemoryCard.weight.desc(),
         ).limit(limit)

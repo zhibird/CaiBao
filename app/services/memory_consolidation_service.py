@@ -63,6 +63,12 @@ class MemoryConsolidationService:
     # ------------------------------------------------------------------
 
     def _on_turn_committed(self, event: TurnCommitted) -> None:
+        # Companion memory is written only by an explicit notebook save or an
+        # approved memory tool. Ordinary conversation remains in chat history,
+        # rather than becoming unreviewed cross-conversation facts or triggering
+        # an extra model call after several turns.
+        if event.channel.strip().lower() == "companion":
+            return
         settings = get_settings()
         store = self._store
         store.ensure_workspace(event.team_id, event.user_id, event.space_id)
@@ -100,36 +106,29 @@ class MemoryConsolidationService:
     def _update_recent_turns(self, event: TurnCommitted, conv_key: str) -> None:
         settings = get_settings()
         store = self._store
-        recent = store.read_recent_context(
-            event.team_id, event.user_id, event.space_id,
-            include_recent_turns=True,
-        )
-
-        # Extract existing turns between markers
-        turns_match = re.search(
-            r"<!-- BEGIN Recent Turns -->\r?\n(.*)<!-- END Recent Turns -->",
-            recent, re.DOTALL,
-        )
-        preamble = re.sub(
-            r"\n?<!-- BEGIN Recent Turns -->.*<!-- END Recent Turns -->",
-            "", recent, flags=re.DOTALL,
-        ).strip()
-
-        old_turns = turns_match.group(1).strip() if turns_match else ""
-
         task_preview = event.input_message[:120].replace("\n", " ")
         tools_str = ", ".join(event.tools_used) if event.tools_used else "none"
         new_line = f"- **{event.timestamp}** | `{event.run_id[:8]}` | {task_preview} | tools: {tools_str}"
 
-        lines = [l for l in old_turns.split("\n") if l.strip().startswith("-")]
-        lines.append(new_line)
-        lines = lines[-settings.memory_recent_turns:]
+        def update(recent: str) -> str:
+            turns_match = re.search(
+                r"<!-- BEGIN Recent Turns -->\r?\n(.*)<!-- END Recent Turns -->",
+                recent, re.DOTALL,
+            )
+            preamble = re.sub(
+                r"\n?<!-- BEGIN Recent Turns -->.*<!-- END Recent Turns -->",
+                "", recent, flags=re.DOTALL,
+            ).strip()
+            old_turns = turns_match.group(1).strip() if turns_match else ""
+            lines = [line for line in old_turns.split("\n") if line.strip().startswith("-")]
+            lines.append(new_line)
+            lines = lines[-settings.memory_recent_turns:]
+            return (
+                (preamble + "\n\n" if preamble else "")
+                + "<!-- BEGIN Recent Turns -->\n" + "\n".join(lines) + "\n<!-- END Recent Turns -->"
+            )
 
-        new_recent = preamble
-        if new_recent:
-            new_recent += "\n\n"
-        new_recent += "<!-- BEGIN Recent Turns -->\n" + "\n".join(lines) + "\n<!-- END Recent Turns -->"
-        store.write_recent_context(event.team_id, event.user_id, event.space_id, new_recent)
+        store.transform_document(event.team_id, event.user_id, event.space_id, "recent_context", update)
 
     # ------------------------------------------------------------------
     # Consolidation
@@ -164,20 +163,13 @@ class MemoryConsolidationService:
             long_term_tags = {"identity", "preference", "key_info", "health_long_term"}
             lt_items = [p for p in pending if p.get("tag", "") in long_term_tags]
             if lt_items:
-                existing_mem = store.read_long_term(event.team_id, event.user_id, event.space_id)
-                new_lines = []
-                for p in lt_items:
-                    new_lines.append(f"- [{p['tag']}] {p['content']}")
-                merged = existing_mem
-                if merged and not merged.endswith("\n"):
-                    merged += "\n"
-                merged += "\n".join(new_lines) + "\n"
-                store.write_long_term(event.team_id, event.user_id, event.space_id, merged)
+                new_text = "\n".join(f"- [{p['tag']}] {p['content']}" for p in lt_items) + "\n"
+
+                def append_memory(existing: str) -> str:
+                    return existing + ("\n" if existing and not existing.endswith("\n") else "") + new_text
+
+                store.transform_document(event.team_id, event.user_id, event.space_id, "long_term", append_memory)
         if context_update:
-            existing = store.read_recent_context(
-                event.team_id, event.user_id, event.space_id,
-                include_recent_turns=True,
-            )
             # Insert compression/threads BEFORE the Recent Turns markers so
             # they survive future rotations of the turns block.
             insert = ""
@@ -188,14 +180,13 @@ class MemoryConsolidationService:
             if threads:
                 insert += "## Ongoing Threads\n" + "\n".join(f"- {t}" for t in threads) + "\n\n"
             if insert:
-                marker_pos = existing.find("<!-- BEGIN Recent Turns -->")
-                if marker_pos >= 0:
-                    merged = existing[:marker_pos] + insert + existing[marker_pos:]
-                else:
-                    merged = existing + "\n\n" + insert
-                store.write_recent_context(
-                    event.team_id, event.user_id, event.space_id, merged,
-                )
+                def append_context(existing: str) -> str:
+                    marker_pos = existing.find("<!-- BEGIN Recent Turns -->")
+                    if marker_pos >= 0:
+                        return existing[:marker_pos] + insert + existing[marker_pos:]
+                    return existing + "\n\n" + insert
+
+                store.transform_document(event.team_id, event.user_id, event.space_id, "recent_context", append_context)
 
         # Emit events
         committed = ConsolidationCommitted(

@@ -37,6 +37,22 @@ def _make_turn(**kwargs) -> TurnCommitted:
 
 
 class TestConsolidationRecentContext:
+    @pytest.mark.parametrize("channel", ["companion", " COMPANION "])
+    def test_companion_conversation_never_becomes_automatic_long_term_memory(self, bus, store, channel):
+        llm = mock.Mock()
+        MemoryConsolidationService(bus, store, llm_service=llm)
+        committed = []
+        bus.observe("ConsolidationCommitted", committed.append)
+
+        for index in range(8):
+            bus.observe_event(_make_turn(run_id=f"companion-{index}", channel=channel))
+
+        # The chat history is owned by AgentService. This observer must not
+        # create a separate memory workspace or spend an extra generation call.
+        assert not list(store.root.iterdir())
+        llm.complete_chat.assert_not_called()
+        assert committed == []
+
     def test_turn_committed_writes_recent_turns(self, bus, store):
         svc = MemoryConsolidationService(bus, store)
         event = _make_turn()

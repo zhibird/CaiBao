@@ -252,8 +252,10 @@ def get_tool_service(
     catalog: ToolCatalogService = Depends(get_tool_catalog_service),
     safety: ToolSafetyService = Depends(get_tool_safety_service),
     mcp_manager: MCPManager = Depends(get_mcp_manager),
+    memory_service: MemoryService = Depends(get_memory_service),
 ) -> ToolService:
-    svc = ToolService(db=db, catalog=catalog, safety=safety, plugin_manager=get_plugin_manager())
+    svc = ToolService(db=db, catalog=catalog, safety=safety, plugin_manager=get_plugin_manager(),
+                      memory_service=memory_service)
     _register_generic_handlers(svc)
     _register_mcp_handlers(svc, catalog, mcp_manager)
     return svc
@@ -555,6 +557,7 @@ def create_background_agent_service(db: Session) -> AgentService:
     tool_service = get_tool_service(
         db=db, catalog=get_tool_catalog_service(), safety=get_tool_safety_service(),
         mcp_manager=get_mcp_manager(),
+        memory_service=memory_service,
     )
     rag_chat_service = get_rag_chat_service(
         user_service=user_service, chat_history_service=chat_history_service,

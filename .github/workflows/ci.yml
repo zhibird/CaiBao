@@ -41,7 +41,7 @@ jobs:
         run: python -m pytest -q
 
   companion-state:
-    name: Companion state and SSE
+    name: Companion state, memory and SSE
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -54,7 +54,7 @@ jobs:
       - name: Validate browser module syntax
         run: node --check app/web/companion.js
       - name: Test real task state, stream parsing and speech text
-        run: node --test tests/companion-state.test.mjs tests/companion-recovery.test.mjs
+        run: node --test tests/companion-*.test.mjs
 
   macos:
     name: macOS native companion build

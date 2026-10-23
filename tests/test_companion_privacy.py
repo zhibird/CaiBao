@@ -3,6 +3,7 @@
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import select
 
 from app.core.exceptions import EntityNotFoundError
 from app.db.session import SessionLocal
@@ -100,6 +101,21 @@ def test_memory_recall_without_space_is_private_and_skips_inaccessible_spaces(pr
             arguments={"query": "privacy", "limit": 20},
         )
     assert {item["title"] for item in result["memories"]} == {"privacy-mine-space", "privacy-mine-global"}
+
+
+def test_forget_memory_cannot_delete_another_teammates_card(private_workspace_data):
+    data = private_workspace_data
+    with SessionLocal() as db:
+        foreign = db.scalar(select(MemoryCard).where(
+            MemoryCard.team_id == data["team_id"], MemoryCard.user_id != data["user_id"],
+        ))
+        foreign_id = foreign.memory_id
+        with pytest.raises(EntityNotFoundError):
+            _service(db).execute(
+                team_id=data["team_id"], user_id=data["user_id"], action="forget_memory",
+                arguments={"memory_id": foreign_id}, confirmed=True,
+            )
+        assert db.get(MemoryCard, foreign_id) is not None
 
 
 @pytest.mark.parametrize("tool", ["recall_memory", "search_knowledge", "list_recent_documents"])

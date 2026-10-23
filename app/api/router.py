@@ -5,6 +5,7 @@ from app.api.routes.agent import router as agent_router
 from app.api.routes.apps import router as apps_router
 from app.api.routes.auth import router as auth_router
 from app.api.routes.companion import router as companion_router
+from app.api.routes.companion_memory import router as companion_memory_router
 from app.api.routes.chat import router as chat_router
 from app.api.routes.conclusion import router as conclusion_router
 from app.api.routes.conversation import router as conversation_router
@@ -27,6 +28,7 @@ api_router = APIRouter()
 api_router.include_router(health_router, tags=["health"])
 api_router.include_router(auth_router, tags=["auth"])
 api_router.include_router(companion_router, tags=["companion"])
+api_router.include_router(companion_memory_router, tags=["companion-memory"])
 api_router.include_router(admin_router, tags=["admin"])
 api_router.include_router(team_router, tags=["teams"])
 api_router.include_router(user_router, tags=["users"])

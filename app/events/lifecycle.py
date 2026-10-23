@@ -75,6 +75,7 @@ class TurnCommitted:
     assistant_response: str
     tools_used: list[str] = field(default_factory=list)
     timestamp: str = field(default_factory=_now)
+    channel: str = "agent"
 
 
 @dataclass

@@ -18,6 +18,15 @@ from app.services.space_service import SpaceService
 from app.services.user_service import UserService
 
 
+def _utc_expiry(value: datetime | None) -> datetime | None:
+    """Persist UTC before SQLite discards timezone offsets; naive means UTC."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 class MemoryService:
     _ALLOWED_STATUSES = {"active", "disabled", "expired"}
 
@@ -64,21 +73,29 @@ class MemoryService:
             confidence=float(payload.confidence),
             status=status,
             source_message_id=payload.source_message_id,
-            expires_at=payload.expires_at,
+            expires_at=_utc_expiry(payload.expires_at),
             created_at=now,
             updated_at=now,
         )
         self.db.add(memory)
-        self.db.commit()
+        try:
+            # Keep the card and its index in one transaction. An upstream
+            # embedding failure must not leave an active but unreadable card.
+            self.db.flush()
+            self._upsert_embedding(
+                memory=memory,
+                runtime=self._resolve_runtime(
+                    team_id=payload.team_id,
+                    user_id=payload.user_id,
+                    embedding_model=None,
+                ),
+                commit=False,
+            )
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
         self.db.refresh(memory)
-        self._upsert_embedding(
-            memory=memory,
-            runtime=self._resolve_runtime(
-                team_id=payload.team_id,
-                user_id=payload.user_id,
-                embedding_model=None,
-            ),
-        )
         return memory
 
     def list(
@@ -117,6 +134,9 @@ class MemoryService:
         if payload.content is not None:
             memory.content = payload.content.strip()
             content_changed = True
+            if "summary" not in payload.model_fields_set:
+                # A user correction invalidates an old derived summary as well.
+                memory.summary = None
         if payload.summary is not None:
             memory.summary = payload.summary.strip() or None
         if payload.weight is not None:
@@ -126,20 +146,27 @@ class MemoryService:
         if payload.status is not None:
             memory.status = self._normalize_status(payload.status)
         if payload.expires_at is not None:
-            memory.expires_at = payload.expires_at
+            memory.expires_at = _utc_expiry(payload.expires_at)
 
         memory.updated_at = datetime.now(timezone.utc)
-        self.db.commit()
+        try:
+            self.db.flush()
+            if content_changed:
+                self._upsert_embedding(
+                    memory=memory,
+                    runtime=self._resolve_runtime(
+                        team_id=payload.team_id,
+                        user_id=payload.user_id,
+                        embedding_model=None,
+                    ),
+                    commit=False,
+                )
+            self.db.commit()
+        except Exception:
+            # Preserve both the previous fact/summary and its previous vector.
+            self.db.rollback()
+            raise
         self.db.refresh(memory)
-        if content_changed:
-            self._upsert_embedding(
-                memory=memory,
-                runtime=self._resolve_runtime(
-                    team_id=payload.team_id,
-                    user_id=payload.user_id,
-                    embedding_model=None,
-                ),
-            )
         return memory
 
     def delete(self, *, memory_id: str, team_id: str, user_id: str) -> None:
@@ -187,15 +214,15 @@ class MemoryService:
                 MemoryCard.user_id == user_id,
                 MemoryCard.status == "active",
                 or_(
-                    MemoryCard.scope_level == "global",
-                    MemoryCard.space_id == space_id,
+                    (MemoryCard.scope_level == "global") & MemoryCard.space_id.is_(None),
+                    (MemoryCard.scope_level == "space") & (MemoryCard.space_id == space_id),
                 ),
             )
         )
         rows = self.db.execute(stmt).all()
         hits: list[dict[str, object]] = []
         for embedding, memory in rows:
-            expires_at = memory.expires_at
+            expires_at = _utc_expiry(memory.expires_at)
             if expires_at is not None and expires_at <= now:
                 continue
 
@@ -236,11 +263,12 @@ class MemoryService:
             raise EntityNotFoundError(f"Memory card '{memory_id}' not found.")
         if memory.team_id != team_id or memory.user_id != user_id:
             raise EntityNotFoundError(f"Memory card '{memory_id}' not found.")
-        self.space_service.ensure_access(
-            space_id=memory.space_id,
-            team_id=team_id,
-            user_id=user_id,
-        )
+        if memory.scope_level != "global" or memory.space_id is not None:
+            self.space_service.ensure_access(
+                space_id=memory.space_id,
+                team_id=team_id,
+                user_id=user_id,
+            )
         return memory
 
     def _normalize_status(self, raw_status: str) -> str:
@@ -270,6 +298,7 @@ class MemoryService:
         *,
         memory: MemoryCard,
         runtime: EmbeddingRuntimeConfig | None,
+        commit: bool = True,
     ) -> None:
         vector = self.embedding_service.embed_text(memory.content, runtime=runtime)
         payload = json.dumps(vector, separators=(",", ":"))
@@ -297,7 +326,8 @@ class MemoryService:
             existing.vector_dim = len(vector)
             existing.updated_at = datetime.now(timezone.utc)
             self.db.add(existing)
-        self.db.commit()
+        if commit:
+            self.db.commit()
 
     def _resolve_runtime(
         self,

@@ -2339,6 +2339,7 @@ class AgentService:
                 input_message=run.task,
                 assistant_response=run.final_answer,
                 tools_used=self._extract_tool_names(run),
+                channel=run.trigger_channel,
             ))
 
     def _extract_tool_names(self, run: AgentRun) -> list[str]:
