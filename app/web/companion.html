@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light"><title>彩宝 · 你桌面上的小小伙伴</title>
+  <link rel="stylesheet" href="/web/companion.css?v=1">
+  <script type="module" src="/web/companion.js?v=1"></script>
+</head>
+<body>
+  <header class="topbar"><a class="brand" href="/companion"><span class="brand-mark">c.</span> cai<span>bao</span><small>陪伴，也能干</small></a><nav><a class="selected" href="/companion">我的桌宠</a><a href="/">Agent 工作台 ↗</a></nav><span class="local-tag"><i></i> 本地优先 · macOS</span></header>
+  <main class="shell">
+    <section class="pet-column" aria-label="彩宝桌宠">
+      <div class="intro"><span class="eyebrow">A LITTLE COMPANY, A LOT OF POSSIBILITY</span><h1>日子很忙，<br>我陪你慢慢来<span>。</span></h1><p>会听你说，也会认真帮你做。<br>这是彩宝，你桌面上的小小伙伴。</p></div>
+      <div class="habitat" id="habitat" data-activity="idle" data-emotion="idle">
+        <span class="habitat-caption">CAIBAO'S LITTLE CORNER</span><span class="spark spark-one">✧</span><span class="spark spark-two">+</span><span class="sleep-z">z z Z</span>
+        <div class="pet-shadow"></div>
+        <button class="pet" id="pet" aria-label="摸摸彩宝的头" title="摸摸头 · 桌面模式可拖动">
+          <svg viewBox="0 0 300 290" role="img" aria-label="薄荷绿的小猫彩宝">
+            <defs><linearGradient id="fur" x1="0" y1="0" x2="0.7" y2="1"><stop stop-color="#b7e9d4"/><stop offset="1" stop-color="#73bca2"/></linearGradient><linearGradient id="belly" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#ecf5df"/><stop offset="1" stop-color="#d1e6c7"/></linearGradient></defs>
+            <g class="tail"><path d="M217 215 C283 233 285 171 256 175 C239 179 273 211 221 202" fill="none" stroke="#70b99f" stroke-width="19" stroke-linecap="round"/><path d="M252 177 Q270 175 270 196" fill="none" stroke="#e7efda" stroke-width="15" stroke-linecap="round"/></g>
+            <g class="cat-body"><path d="M91 174 Q72 207 83 245 Q100 267 150 265 Q205 268 220 245 Q227 205 208 174Z" fill="url(#fur)" stroke="#5c9a82" stroke-width="2.5"/><ellipse cx="151" cy="225" rx="42" ry="35" fill="url(#belly)"/><path d="M99 248 Q84 266 113 267 M192 249 Q211 267 182 267" fill="#a3d7bb" stroke="#5c9a82" stroke-width="2.5" stroke-linecap="round"/><g class="paw"><path d="M96 205 Q74 224 81 234 Q89 241 104 222" fill="#9dd8bd" stroke="#5c9a82" stroke-width="2.5" stroke-linecap="round"/></g><path d="M207 207 Q225 228 216 235 Q208 241 197 224" fill="#9dd8bd" stroke="#5c9a82" stroke-width="2.5" stroke-linecap="round"/></g>
+            <g class="cat-head"><path d="M71 115 Q56 83 68 42 Q95 47 117 72 Q150 63 181 73 Q206 48 231 45 Q242 83 228 118 Q242 159 218 184 Q192 207 149 205 Q100 208 77 183 Q54 158 71 115Z" fill="url(#fur)" stroke="#5c9a82" stroke-width="3" stroke-linejoin="round"/><path d="M76 62 Q81 84 86 93 L103 79Z M219 64 Q216 83 211 94 L195 81Z" fill="#d3e6c1"/><path d="M132 76 Q141 93 147 75 M155 74 Q165 91 170 76" fill="none" stroke="#60a98c" stroke-width="4" stroke-linecap="round"/>
+              <g class="face"><g class="eyes"><ellipse class="eye left-eye" cx="111" cy="134" rx="8" ry="12" fill="#284c40"/><ellipse class="eye right-eye" cx="190" cy="134" rx="8" ry="12" fill="#284c40"/><circle cx="113" cy="131" r="2.4" fill="#f3f6e6"/><circle cx="192" cy="131" r="2.4" fill="#f3f6e6"/></g><g class="closed-eyes" fill="none" stroke="#284c40" stroke-width="4" stroke-linecap="round"><path d="M102 136 Q111 126 121 136 M180 136 Q190 126 200 136"/></g><ellipse cx="93" cy="153" rx="13" ry="7" fill="#e7b2a3" opacity=".65"/><ellipse cx="208" cy="153" rx="13" ry="7" fill="#e7b2a3" opacity=".65"/><path d="M145 147 Q151 143 157 147 L151 153Z" fill="#496a55"/><path class="mouth" d="M151 153 Q151 164 140 160 M151 153 Q151 164 162 160" fill="none" stroke="#395d49" stroke-width="2.8" stroke-linecap="round"/><ellipse class="talk-mouth" cx="151" cy="162" rx="9" ry="7" fill="#496a55"/><path d="M77 143 L61 138 M78 153 L58 155 M224 143 L240 137 M224 153 L245 155" stroke="#659d80" stroke-width="2.5" stroke-linecap="round"/></g>
+              <g class="leaf"><path d="M151 70 Q129 37 155 23 Q177 43 151 70Z" fill="#6a9c62"/><path d="M151 64 L155 34" stroke="#d3e3ac" stroke-width="2.5" stroke-linecap="round"/></g>
+            </g>
+          </svg>
+        </button>
+        <div class="pet-bubble" id="pet-bubble" role="status">今天，也一起好好过吧。</div>
+        <button class="compact-open" id="compact-open">聊一会儿 ↗</button>
+      </div>
+      <div class="pet-meta"><div><h2>彩宝 <span>CAIBAO</span></h2><p id="pet-status"><i></i><span>在这里，陪着你</span></p></div><span class="mood-chip" id="mood-chip">悠闲</span></div>
+      <div class="pet-actions"><button id="pet-action" title="摸摸头">♡ <span>摸摸头</span></button><button id="feed-action">♧ <span>小鱼干</span></button><button id="rest-action">☾ <span>歇一会儿</span></button></div>
+      <div class="task-card"><span class="eyebrow">正在发生</span><p id="task-status">没有任务的时候，发会儿呆也很好。</p><div class="task-log" id="task-log"></div></div>
+      <p class="presence-note">一点陪伴感，加上一颗认真做事的芯。</p>
+    </section>
+    <section class="conversation" aria-label="与彩宝聊天">
+      <header class="chat-header"><div><span class="eyebrow">OUR LITTLE CONVERSATION</span><h2>想说什么，都可以。</h2></div><button class="icon-button" id="settings-toggle" title="偏好设置" aria-label="偏好设置">⚙</button><button class="icon-button desktop-only" id="collapse" title="收起到桌宠" aria-label="收起到桌宠">⌄</button></header>
+      <div class="connection"><i id="connection-dot"></i><span id="connection-label">正在连接彩宝…</span><button id="account-button" hidden>退出</button></div>
+      <div class="settings" id="settings" hidden><label><input type="checkbox" id="voice"> 读出彩宝的回复</label><label><input type="checkbox" id="memory" checked> 使用我的长期记忆卡</label><label>交互模式 <select id="mode"><option value="agent">帮我做事 · 可调用工具</option><option value="chat">聊聊天 · 不调用工具</option></select></label><label>回答模型 <select id="model-select"><option value="">默认模型</option></select></label><button id="new-chat">开启新对话</button><a href="/" target="_blank" rel="noopener">模型、记忆与工具设置 ↗</a><p>语音默认关闭；表情代表交互状态。发送内容会交给你配置的模型服务。</p></div>
+      <div class="messages" id="messages" role="log" aria-label="聊天记录" aria-live="polite"><div class="welcome" id="welcome"><span class="tiny-leaf">❋</span><h3>嗨，我是彩宝。</h3><p>你可以和我碎碎念，<br>也可以把需要动脑筋的事交给我。</p><div class="suggestions"><button data-prompt="今天有点累，陪我聊聊吧。">今天有点累，陪我聊聊</button><button data-prompt="帮我制定一个轻松的今日计划。">一起安排今天的事</button><button data-prompt="你目前能使用哪些工具？请如实介绍。">看看你能帮我做什么 ↗</button></div></div></div>
+      <div class="approval" id="approval" hidden><strong>这个操作，需要你确认</strong><pre id="approval-detail"></pre><div><button id="approve">确认执行</button><button id="decline">暂不执行</button></div></div>
+      <form class="composer" id="composer"><label class="sr-only" for="message">发消息给彩宝</label><textarea id="message" rows="2" maxlength="4000" placeholder="和彩宝说说话…" required></textarea><div class="composer-bottom"><div><button type="button" class="icon-button" id="mic" title="语音输入" aria-label="语音输入">♩</button><button type="button" class="icon-button" id="mute" title="停止朗读" aria-label="停止朗读">◌</button><span>Enter 发送 · Shift + Enter 换行</span></div><button type="submit" class="send" id="send" aria-label="发送">↑</button></div></form>
+      <footer class="chat-footer"><span>彩宝会认真，也会有不确定的时候。</span><span id="model-label">LOCAL COMPANION</span></footer>
+    </section>
+  </main>
+  <dialog id="auth-dialog"><form id="auth-form"><span class="eyebrow">LET'S GET TO KNOW EACH OTHER</span><h2 id="auth-title">和彩宝认识一下</h2><p>用你的 CaiBao 账号登录，接着聊。</p><label>账号<input name="user_id" autocomplete="username" required maxlength="64"></label><label id="display-name-label" hidden>怎么称呼你<input name="display_name" autocomplete="nickname" maxlength="128"></label><label>密码<input name="password" type="password" autocomplete="current-password" minlength="8" maxlength="128" required></label><p class="form-error" id="auth-error" role="alert"></p><button class="primary" type="submit" id="auth-submit">登录</button><button type="button" class="text-button" id="auth-switch">第一次见面？创建本地账号</button><button type="button" class="text-button" id="auth-later">先看看彩宝</button></form></dialog>
+  <div class="toast" id="toast" role="status" hidden></div>
+</body>
+</html>

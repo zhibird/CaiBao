@@ -474,6 +474,13 @@ class LLMService:
             result.append(tool_call)
         return result
 
+    @staticmethod
+    def _is_companion_demo(messages: list[dict[str, object]]) -> bool:
+        return any(
+            item.get("role") == "system" and "薄荷绿小猫 AI 伙伴" in str(item.get("content", ""))
+            for item in messages
+        )
+
     def _mock_complete(self, messages: list[dict[str, object]]) -> LLMCompletionResult:
         last_user = ""
         has_tool_result = False
@@ -488,7 +495,8 @@ class LLMService:
         # When a tool result was already received, respond with text instead of more tools
         if has_tool_result:
             return LLMCompletionResult(
-                assistant_text=f"[Mock Agent] Tool completed for: {last_user[:200]}",
+                assistant_text=("演示工具流程已返回。连接模型后，我就能理解工具结果、认真回答你的问题。"
+                                if self._is_companion_demo(messages) else f"[Mock Agent] Tool completed for: {last_user[:200]}"),
                 model="mock",
             )
 
@@ -555,7 +563,8 @@ class LLMService:
 
         assistant_text = ""
         if not tool_calls:
-            assistant_text = f"[Mock Agent] {last_user}" if last_user else "[Mock Agent] No user input."
+            assistant_text = ("嗨，彩宝的桌面小窝准备好了。现在是演示模式；在工作台配置模型后，我就能认真回应你。"
+                              if self._is_companion_demo(messages) else f"[Mock Agent] {last_user}" if last_user else "[Mock Agent] No user input.")
         return LLMCompletionResult(
             assistant_text=assistant_text,
             tool_calls=tool_calls,
@@ -569,7 +578,8 @@ class LLMService:
             if msg.get("role") == "user":
                 last_user = str(msg.get("content", ""))
                 break
-        answer = f"[Mock Agent] {last_user}" if last_user else "[Mock Agent] No user input."
+        answer = ("嗨，彩宝的桌面小窝准备好了。现在是演示模式；在工作台配置模型后，我就能认真回应你。"
+                  if self._is_companion_demo(messages) else f"[Mock Agent] {last_user}" if last_user else "[Mock Agent] No user input.")
         yield LLMStreamChunk(delta_text=answer, finish_reason="stop")
 
     def _detect_tools_unsupported(self, error_detail: str) -> bool:

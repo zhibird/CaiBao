@@ -82,6 +82,10 @@ def create_app() -> FastAPI:
         # 但入口页本身被缓存会让旧表单（如运行模式选项）静默丢数据。
         return FileResponse(web_dir / "index.html", headers={"Cache-Control": "no-cache"})
 
+    @app.api_route("/companion", methods=["GET", "HEAD"], include_in_schema=False)
+    def serve_companion() -> FileResponse:
+        return FileResponse(web_dir / "companion.html", headers={"Cache-Control": "no-cache"})
+
     @app.get("/favicon.ico", include_in_schema=False)
     def serve_favicon() -> Response:
         favicon_path = web_dir / "favicon.ico"

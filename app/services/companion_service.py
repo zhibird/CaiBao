@@ -76,7 +76,9 @@ class CompanionService:
     def profile(self, *, team_id: str, user_id: str) -> CompanionProfile:
         self.agent_service.user_service.ensure_user_in_team(team_id=team_id, user_id=user_id)
         settings = self.agent_service.llm_service.settings
-        demo = settings.llm_provider.strip().lower() == "mock"
+        demo = settings.llm_provider.strip().lower() == "mock" and not (
+            settings.llm_base_url.strip() and (settings.llm_api_key or "").strip()
+        )
         return CompanionProfile(
             state=self.state(team_id=team_id, user_id=user_id),
             capabilities=[
