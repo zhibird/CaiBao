@@ -325,14 +325,18 @@ class AgentService:
         tools = self._build_tools(payload=payload, run=run)
 
         step_index = next_index + 1
-        final_answer, final_status, _ = self._tool_loop(
+        final_answer, final_status, requires_confirmation = self._tool_loop(
             run=run, messages=messages, tools=tools,
             team_id=team_id, user_id=user_id, space_id=run.space_id,
             base_url=planner["base_url"],
             api_key=planner["api_key"],
             model_name=planner["model_name"],
             step_index=step_index, started=started,
-            enable_tool_execution=True, confirm_dangerous_actions=True, dry_run=False,
+            enable_tool_execution=True,
+            # Companion consent covers the displayed call, not future writes
+            # proposed after the model sees its result.
+            confirm_dangerous_actions=payload.trigger_channel.strip().lower() != "companion",
+            dry_run=False,
             enabled_tools=payload.enabled_tools,
             max_tool_calls=payload.max_steps,
         )
@@ -343,9 +347,10 @@ class AgentService:
             input_payload={"run_id": run_id},
             output_payload={"answer": final_answer, "status": final_status},
         )
+        pending = self._load_pending_tool_call(run) if requires_confirmation else None
         self._finish_run(
             run=run, status=final_status, final_answer=final_answer,
-            required_confirmations=[], started=started,
+            required_confirmations=[pending] if pending else [], started=started,
         )
         return self.get_run(run_id=run_id, team_id=team_id, user_id=user_id)
 
@@ -756,6 +761,10 @@ class AgentService:
 
                 # Validate arguments
                 normalized_args = definition.normalize_arguments(args)
+                normalized_args = self._enrich_tool_call(
+                    call=AgentToolCall(tool_name=tool_name, arguments=normalized_args),
+                    space_id=space_id, task=run.task,
+                ).arguments
                 arg_errors = definition.validate_arguments(normalized_args)
                 if arg_errors:
                     tool_calls_used += 1
@@ -995,6 +1004,10 @@ class AgentService:
                     continue
 
                 normalized_args = definition.normalize_arguments(args)
+                normalized_args = self._enrich_tool_call(
+                    call=AgentToolCall(tool_name=tool_name, arguments=normalized_args),
+                    space_id=space_id, task=run.task,
+                ).arguments
                 if definition.validate_arguments(normalized_args):
                     tool_calls_used += 1
                     messages.append(self._assistant_tool_call_message(tc))

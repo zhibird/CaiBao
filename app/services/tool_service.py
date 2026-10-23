@@ -4,11 +4,12 @@ import json
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import or_, select
+from sqlalchemy import Select, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import DomainValidationError, EntityNotFoundError
 from app.models.conclusion import Conclusion
+from app.models.conversation import Conversation
 from app.models.document import Document
 from app.models.incident import Incident
 from app.models.memory_card import MemoryCard
@@ -176,8 +177,7 @@ class ToolService:
 
         escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         like_query = f"%{escaped}%"
-        stmt = select(Document).where(
-            Document.team_id == team_id,
+        stmt = self._user_documents(team_id=team_id, user_id=user_id).where(
             Document.retrieval_enabled.is_(True),
             Document.status.in_(["ready", "uploaded"]),
             or_(
@@ -258,9 +258,10 @@ class ToolService:
         limit = self._parse_limit(arguments.get("limit", 5))
         space_id = self._optional_space_id(team_id=team_id, user_id=user_id, arguments=arguments)
 
-        stmt = select(Document).where(Document.team_id == team_id).order_by(Document.created_at.desc()).limit(limit)
+        stmt = self._user_documents(team_id=team_id, user_id=user_id)
         if space_id is not None:
             stmt = stmt.where(Document.space_id == space_id)
+        stmt = stmt.order_by(Document.created_at.desc()).limit(limit)
         documents = list(self.db.scalars(stmt).all())
 
         return {
@@ -376,6 +377,11 @@ class ToolService:
 
         stmt = select(MemoryCard).where(
             MemoryCard.team_id == team_id,
+            MemoryCard.user_id == user_id,
+            or_(
+                MemoryCard.space_id.is_(None),
+                MemoryCard.space_id.in_(self._user_space_ids(team_id=team_id, user_id=user_id)),
+            ),
             MemoryCard.status == "active",
             or_(
                 MemoryCard.title.ilike(like_query, escape="\\"),
@@ -419,10 +425,21 @@ class ToolService:
 
         conv_id = str(arguments.get("conversation_id", "")).strip() or None
         limit = self._parse_limit(arguments.get("limit", 5))
+        if conv_id:
+            conversation = self.db.get(Conversation, conv_id)
+            if (conversation is None or conversation.team_id != team_id
+                    or conversation.user_id != user_id or conversation.status == "deleted"):
+                raise EntityNotFoundError(f"Conversation '{conv_id}' not found.")
+            if conversation.space_id is not None:
+                self._ensure_space_access(space_id=conversation.space_id, team_id=team_id, user_id=user_id)
 
         stmt = select(ChatHistory).where(
             ChatHistory.team_id == team_id,
             ChatHistory.user_id == user_id,
+            or_(
+                ChatHistory.space_id.is_(None),
+                ChatHistory.space_id.in_(self._user_space_ids(team_id=team_id, user_id=user_id)),
+            ),
         )
         if conv_id:
             stmt = stmt.where(ChatHistory.conversation_id == conv_id)
@@ -537,6 +554,31 @@ class ToolService:
             "message": "Incident report generated.",
             "report_markdown": report,
         }
+
+    @staticmethod
+    def _user_space_ids(*, team_id: str, user_id: str) -> Select[tuple[str]]:
+        return select(ProjectSpace.space_id).where(
+            ProjectSpace.team_id == team_id,
+            ProjectSpace.owner_user_id == user_id,
+            ProjectSpace.status != "deleted",
+        )
+
+    def _user_documents(self, *, team_id: str, user_id: str) -> Select[tuple[Document]]:
+        owned_conversations = select(Conversation.conversation_id).where(
+            Conversation.team_id == team_id,
+            Conversation.user_id == user_id,
+            Conversation.status != "deleted",
+        )
+        # Legacy unscoped team-library documents remain shared. Documents
+        # attached to a conversation or space must belong to this user.
+        return select(Document).where(
+            Document.team_id == team_id,
+            or_(Document.conversation_id.is_(None), Document.conversation_id.in_(owned_conversations)),
+            or_(
+                Document.space_id.is_(None),
+                Document.space_id.in_(self._user_space_ids(team_id=team_id, user_id=user_id)),
+            ),
+        )
 
     def _optional_space_id(
         self,
