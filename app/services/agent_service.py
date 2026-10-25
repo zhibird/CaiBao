@@ -49,6 +49,11 @@ from app.services.execution_identity import (
     build_api_execution_identity, build_cli_execution_identity, safe_execution_endpoint,
 )
 from app.services.execution_ledger import ToolLoopLedger
+from app.services.task_plan_control import (
+    MAX_MODEL_CALLS, MAX_PLAN_ATTEMPTS, PLAN_GUIDANCE, PLAN_TOOL, PLAN_TOOL_NAME,
+    PlanUpdateArguments, RunLoopControl,
+)
+from app.services.task_plan_service import TaskPlanService
 from app.services.document_service import DocumentService
 from app.services.llm_model_service import LLMModelService
 from app.services.llm_router import LLMRouter
@@ -61,7 +66,6 @@ from app.services.rag_chat_service import RagChatService
 from app.services.tool_service import ToolService
 from app.services.user_service import UserService
 
-_MAX_TOOL_LOOP_ITERATIONS = 15
 _MAX_CONSECUTIVE_DUPLICATE_CALLS = 2
 _CANCELLED_ANSWER = "任务已停止。已经开始的工具可能仍会完成，后续操作不会继续。"
 
@@ -395,6 +399,7 @@ class AgentService:
         loop_state = self._load_loop_state(run)
         real_routes = None
         ledger = None
+        loop_control = None
         if loop_state is None and self._requires_tool_loop_checkpoint(run):
             raise DomainValidationError(
                 "本次待确认任务的执行检查点已丢失，暂不执行。请取消后新建任务。"
@@ -403,6 +408,7 @@ class AgentService:
             # Reconstruct/check before claiming consent or invoking any handler.
             # An old or corrupt checkpoint must never grant a new budget.
             ledger = self._restore_execution_ledger(run, loop_state, pending_calls[0])
+            loop_control = self._restore_loop_control(run, loop_state)
             payload = self._load_request_payload(run)
             real_routes = self._resolve_routes(team_id=team_id, user_id=user_id, payload=payload)
             frozen = self._safe_json_dict(run.execution_identity_json) if run.execution_identity_json else {}
@@ -516,6 +522,7 @@ class AgentService:
             enabled_tools=payload.enabled_tools,
             max_tool_calls=payload.max_steps,
             ledger=ledger,
+            loop_control=loop_control,
         )
 
         self._record_step(
@@ -612,6 +619,7 @@ class AgentService:
             execution_identity=self._safe_json_dict(run.execution_identity_json) if run.execution_identity_json else None,
             context_snapshot=self._safe_json_dict(run.context_snapshot_json) if run.context_snapshot_json else None,
             execution_receipt=self._load_execution_receipt(run),
+            task_plan=TaskPlanService(self.db).load(run),
             conversation_id=run.conversation_id, space_id=run.space_id,
             app_id=run.app_id, app_version=run.app_version,
             trigger_channel=run.trigger_channel, task=run.task,
@@ -874,6 +882,7 @@ class AgentService:
         model_name: str, step_index: int, started: float, enable_tool_execution: bool,
         confirm_dangerous_actions: bool, dry_run: bool, enabled_tools: list[str] | None = None,
         max_tool_calls: int = 5, ledger: ToolLoopLedger | None = None,
+        loop_control: RunLoopControl | None = None,
     ) -> tuple[str, str, bool]:
         engine = self._iterate_tool_loop(
             run=run, messages=messages, tools=tools, team_id=team_id, user_id=user_id,
@@ -881,6 +890,7 @@ class AgentService:
             step_index=step_index, start_seq=0, streaming=False,
             confirm_dangerous_actions=confirm_dangerous_actions, dry_run=dry_run or not enable_tool_execution,
             enabled_tools=enabled_tools, max_tool_calls=max_tool_calls, ledger=ledger,
+            loop_control=loop_control,
         )
         while True:
             try:
@@ -945,6 +955,7 @@ class AgentService:
         model_name: str, step_index: int, start_seq: int, streaming: bool,
         confirm_dangerous_actions: bool, dry_run: bool, enabled_tools: list[str] | None = None,
         max_tool_calls: int = 5, ledger: ToolLoopLedger | None = None,
+        loop_control: RunLoopControl | None = None,
     ) -> Generator[AgentStreamEvent, None, tuple[str, str, bool]]:
         """One accounting/execution path for sync, stream and approval resume.
 
@@ -953,27 +964,52 @@ class AgentService:
         action. Receipt counts never include private arguments or model thoughts.
         """
         ledger = ledger or ToolLoopLedger(budget=max(1, min(int(max_tool_calls or 5), 10)))
+        loop_control = loop_control or RunLoopControl()
         ledger.stop_reason = "in_progress"
         allowed = ({str(name).strip().lower() for name in enabled_tools if str(name).strip()}
                    if enabled_tools is not None else None)
         text_parts = []
         seq, current_step = start_seq, step_index
         stop = None
-        for _ in range(_MAX_TOOL_LOOP_ITERATIONS):
+        plan_enabled = any(self._is_plan_tool(tool) for tool in tools)
+        if plan_enabled and not any(message.get("role") == "system" and message.get("content") == PLAN_GUIDANCE
+                                    for message in messages):
+            messages.insert(1 if messages and messages[0].get("role") == "system" else 0,
+                            {"role": "system", "content": PLAN_GUIDANCE})
+        while loop_control.model_calls < MAX_MODEL_CALLS:
             if self._is_run_cancelled(run):
                 return _CANCELLED_ANSWER, "cancelled", False
-            no_tools = ledger.used >= ledger.budget or stop is not None
-            if no_tools:
+            external_stopped = ledger.used >= ledger.budget or stop is not None
+            final_slot = loop_control.model_calls == MAX_MODEL_CALLS - 1
+            active_tools = [] if final_slot or stop else [
+                tool for tool in tools if (
+                    loop_control.plan_attempts < MAX_PLAN_ATTEMPTS if self._is_plan_tool(tool)
+                    else not external_stopped
+                )
+            ]
+            force_summary = final_slot or bool(stop) or (external_stopped and not active_tools)
+            if final_slot:
+                ledger.stop_reason = "iteration_limit"
+                messages.append({"role": "user", "content":
+                                 "This tool loop's model call limit is reached. No more tools or plan updates. "
+                                 "Summarize observed results and unfinished work without claiming it is complete."})
+            elif external_stopped:
                 ledger.stop_reason = stop or "tool_budget"
-                prompt = (self._tool_budget_prompt(ledger.budget) if stop is None else
-                          "Tool execution stopped by the repeated-call guard. Do not call more tools. "
-                          "Summarize the observed results, what is unfinished, and a useful next step.")
+                if stop:
+                    prompt = ("Tool execution stopped by the repeated-call guard. Do not call more tools. "
+                              "Summarize the observed results, what is unfinished, and a useful next step.")
+                elif active_tools:
+                    prompt = ("The external action budget is exhausted. Do not propose external actions. "
+                              "Only update_plan metadata is still available; preserve unfinished steps and summarize actual results.")
+                else:
+                    prompt = self._tool_budget_prompt(ledger.budget)
                 messages.append({"role": "user", "content": prompt})
+            loop_control.model_calls += 1
             if streaming:
                 names, args, indices, reasoning = {}, {}, {}, []
                 for chunk in self.llm_service.stream_chat(
-                    messages=messages, model=model_name, base_url=base_url, api_key=api_key,
-                    tools=None if no_tools else (tools or None),
+                    messages=self._model_loop_messages(messages), model=model_name, base_url=base_url, api_key=api_key,
+                    tools=active_tools or None,
                 ):
                     if self._is_run_cancelled(run):
                         return _CANCELLED_ANSWER, "cancelled", False
@@ -1000,28 +1036,82 @@ class AgentService:
                 )
             else:
                 result = self.llm_service.complete_chat(
-                    messages=messages, model=model_name, base_url=base_url, api_key=api_key,
-                    tools=None if no_tools else (tools or None),
+                    messages=self._model_loop_messages(messages), model=model_name, base_url=base_url, api_key=api_key,
+                    tools=active_tools or None,
                 )
                 if self._is_run_cancelled(run):
                     return _CANCELLED_ANSWER, "cancelled", False
                 if result.assistant_text:
                     text_parts.append(result.assistant_text)
                 calls = result.tool_calls
-            if no_tools:
+            if force_summary:
                 # Even a provider which ignores tools=None cannot execute more.
-                ledger.record_omitted(len(calls))
+                ledger.record_omitted(self._external_call_count(calls))
                 break
             if not calls:
-                ledger.stop_reason = "model_finished"
+                ledger.stop_reason = "tool_budget" if ledger.used >= ledger.budget else "model_finished"
                 break
+            plan_limit_noted = False
             for position, tc in enumerate(calls):
                 if self._is_run_cancelled(run):
                     return _CANCELLED_ANSWER, "cancelled", False
-                if ledger.used >= ledger.budget:
-                    ledger.record_omitted(len(calls) - position)
-                    break
+                # Private batch provenance is checkpointed with the transcript,
+                # and stripped before every upstream request. Parallel calls
+                # share one index rather than pretending each was a model turn.
+                tc = {**(tc if isinstance(tc, dict) else {"id": f"invalid-{loop_control.model_calls}-{position}"}),
+                      "_caibao_model_call": loop_control.model_calls}
                 tool_name, raw_args, parse_error = self._parse_tool_proposal(tc)
+                if tool_name == PLAN_TOOL_NAME:
+                    # One refusal per provider batch is enough to communicate
+                    # exhaustion; ignored metadata cannot amplify DB writes.
+                    if loop_control.plan_attempts >= MAX_PLAN_ATTEMPTS and plan_limit_noted:
+                        continue
+                    current_step += 1
+                    error = None
+                    updated_plan = None
+                    if not loop_control.attempt_plan():
+                        plan_limit_noted = True
+                        error = "This run has no plan update attempts remaining. Return actual results or continue allowed external actions."
+                    elif not plan_enabled or (allowed is not None and PLAN_TOOL_NAME not in allowed):
+                        error = "update_plan is not enabled for this run."
+                    elif parse_error:
+                        error = parse_error
+                    else:
+                        try:
+                            update_args = PlanUpdateArguments.model_validate(raw_args)
+                            updated_plan = TaskPlanService(self.db).update(
+                                run, source="api.update_plan", steps=update_args.public_steps(),
+                                explanation=update_args.explanation,
+                            )
+                        except (ValueError, TypeError, DomainValidationError):
+                            error = "Invalid public plan. Use at most 10 short steps, known statuses, at most one in_progress, and an optional short explanation."
+                    if self._is_run_cancelled(run):
+                        return _CANCELLED_ANSWER, "cancelled", False
+                    snapshot = updated_plan or TaskPlanService(self.db).load(run)
+                    plan_result = ({"error": error, "rejected": True} if error else {
+                        "result": {"task_plan": snapshot.model_dump(mode="json") if snapshot else None,
+                                   "updates_remaining": MAX_PLAN_ATTEMPTS - loop_control.plan_attempts},
+                    })
+                    self._record_step(
+                        run=run, step_index=current_step, step_type="task_plan", title="Update public work plan",
+                        status="failed" if error else "completed", tool_name=PLAN_TOOL_NAME,
+                        input_payload={}, output_payload={"error": error} if error else {
+                            "task_plan": snapshot.model_dump(mode="json") if snapshot else None,
+                        }, error_message=error,
+                    )
+                    self._append_tool_result(messages, tc, plan_result)
+                    seq += 1
+                    if updated_plan:
+                        yield AgentStreamEvent(event="plan.updated", run_id=run.run_id,
+                                               step_index=current_step, seq=seq,
+                                               payload={"task_plan": updated_plan.model_dump(mode="json")})
+                    elif error:
+                        yield AgentStreamEvent(event="plan.rejected", run_id=run.run_id,
+                                               step_index=current_step, seq=seq, payload={"error": error})
+                    continue
+                if ledger.used >= ledger.budget:
+                    ledger.record_omitted(1)
+                    continue
                 seq += 1
                 yield AgentStreamEvent(event="tool.proposed", run_id=run.run_id,
                                        step_index=current_step, seq=seq,
@@ -1030,7 +1120,7 @@ class AgentService:
                     return _CANCELLED_ANSWER, "cancelled", False
                 signature = self._tool_call_signature(tool_name, raw_args)
                 if self._count_consecutive(ledger.history, signature) >= _MAX_CONSECUTIVE_DUPLICATE_CALLS:
-                    ledger.record_omitted(len(calls) - position)
+                    ledger.record_omitted(self._external_call_count(calls[position:]))
                     stop = "duplicate_guard"
                     break
                 definition = self.tool_service.get_tool_definition(tool_name) if not parse_error else None
@@ -1057,7 +1147,7 @@ class AgentService:
                 if not error:
                     signature = self._tool_call_signature(tool_name, normalized)
                     if self._count_consecutive(ledger.history, signature) >= _MAX_CONSECUTIVE_DUPLICATE_CALLS:
-                        ledger.record_omitted(len(calls) - position); stop = "duplicate_guard"; break
+                        ledger.record_omitted(self._external_call_count(calls[position:])); stop = "duplicate_guard"; break
                 ledger.reserve(signature)
                 current_step += 1
                 if error:
@@ -1081,14 +1171,15 @@ class AgentService:
                 if definition.dangerous and not dry_run and not confirm_dangerous_actions:
                     # Only the reviewed call is retained for approval. Other
                     # proposals in that model batch are never silently executed.
-                    ledger.record_omitted(len(calls) - position - 1)
+                    ledger.record_omitted(self._external_call_count(calls[position + 1:]))
                     call = AgentToolCall(tool_name=tool_name, arguments=normalized,
                                          dangerous=True, requires_confirmation=True)
                     self._save_pending_tool_call(run, call)
                     messages.append(self._assistant_tool_call_message(tc))
                     ledger.stop_reason = "waiting_confirmation"
                     self._save_loop_state(run, messages=messages,
-                                          pending_tool_call_id=str(tc.get("id", "unknown")), ledger=ledger)
+                                          pending_tool_call_id=str(tc.get("id", "unknown")), ledger=ledger,
+                                          loop_control=loop_control)
                     self._persist_execution_receipt(run, ledger)
                     return self._loop_text(text_parts, streaming), "requires_confirmation", True
                 if self.event_bus:
@@ -1147,6 +1238,77 @@ class AgentService:
     @staticmethod
     def _loop_text(parts: list[str], streaming: bool) -> str:
         return ("" if streaming else "\n").join(parts).strip()
+
+    @staticmethod
+    def _is_plan_tool(tool: object) -> bool:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        return isinstance(function, dict) and str(function.get("name", "")).lower() == PLAN_TOOL_NAME
+
+    @staticmethod
+    def _model_loop_messages(messages: list[dict[str, object]]) -> list[dict[str, object]]:
+        return [{key: value for key, value in message.items() if key != "_caibao_model_call"}
+                for message in messages]
+
+    @classmethod
+    def _external_call_count(cls, calls: list[dict[str, object]]) -> int:
+        return sum(cls._parse_tool_proposal(call)[0] != PLAN_TOOL_NAME for call in calls)
+
+    def _restore_loop_control(self, run: AgentRun, state: dict[str, Any]) -> RunLoopControl:
+        """New controls cannot disappear and silently grant planning/model quota.
+
+        Older v0.33 approvals contain only external tool transcripts. Counting
+        their tool-call assistant messages is conservative for parallel batches;
+        formal chat history never contains tool-call messages.
+        """
+        try:
+            messages = state.get("messages")
+            if not isinstance(messages, list):
+                raise ValueError("Missing run control transcript.")
+            if "version" in state and (type(state["version"]) is not int or state["version"] != 2):
+                raise ValueError("Unknown loop checkpoint version.")
+            if state.get("version") == 2 and not {"loop_control", "execution_ledger"}.issubset(state):
+                raise ValueError("A current loop checkpoint lost its counters.")
+            if "loop_control" in state and state.get("version") != 2:
+                raise ValueError("A current loop checkpoint lost its version.")
+            plan_calls = sum(
+                self._parse_tool_proposal(call)[0] == PLAN_TOOL_NAME
+                for message in messages if isinstance(message, dict)
+                for call in (message.get("tool_calls") or [])
+                if isinstance(message.get("tool_calls"), list)
+            )
+            if "loop_control" in state:
+                control = RunLoopControl.from_state(state["loop_control"])
+                if (control.model_calls < 1 or control.model_calls >= MAX_MODEL_CALLS
+                        or control.plan_attempts != min(plan_calls, MAX_PLAN_ATTEMPTS)):
+                    raise ValueError("Inconsistent run control transcript.")
+                batches = [message.get("_caibao_model_call") for message in messages
+                           if isinstance(message, dict) and message.get("role") == "assistant" and message.get("tool_calls")]
+                if state.get("version") == 2 and (
+                    not batches or any(type(index) is not int or not 1 <= index < MAX_MODEL_CALLS for index in batches)
+                    or batches != sorted(batches) or max(batches) != control.model_calls
+                ):
+                    raise ValueError("Model request count does not match the original batches.")
+                snapshot = TaskPlanService(self.db).load(run)
+                if snapshot and (snapshot.source != "api.update_plan" or snapshot.revision > control.plan_attempts):
+                    raise ValueError("Plan snapshot does not match the checkpoint.")
+                return control
+            if (getattr(run, "task_plan_json", None) is not None or plan_calls
+                    or any(isinstance(message, dict) and "_caibao_model_call" in message for message in messages)):
+                raise ValueError("Planning checkpoint disappeared.")
+            previous_calls = sum(
+                bool(message.get("tool_calls")) for message in messages
+                if isinstance(message, dict) and message.get("role") == "assistant"
+            )
+            index = 0
+            for message in messages:
+                if isinstance(message, dict) and message.get("role") == "assistant" and message.get("tool_calls"):
+                    index += 1
+                    message["_caibao_model_call"] = index
+            return RunLoopControl(model_calls=max(1, previous_calls))
+        except (ValueError, TypeError, AttributeError):
+            raise DomainValidationError(
+                "本次待确认任务的计划或模型调用预算记录不完整，暂不执行。请取消后新建任务。"
+            ) from None
 
     @staticmethod
     def _tool_value_failed(value: object) -> bool:
@@ -1566,6 +1728,25 @@ class AgentService:
                         if cli_event.text:
                             answer_parts.append(cli_event.text)
                             yield _event("llm.delta", None, {"text": cli_event.text})
+                    elif cli_event.kind == "plan":
+                        if self._is_run_cancelled(run):
+                            return
+                        try:
+                            snapshot = TaskPlanService(self.db).update(
+                                run, source=cli_event.plan_source, steps=cli_event.plan_steps,
+                            )
+                        except (ValueError, TypeError, DomainValidationError):
+                            # Optional display metadata never changes native CLI
+                            # execution, permissions, session delivery or results.
+                            continue
+                        if snapshot:
+                            step_index += 1
+                            self._record_step(
+                                run=run, step_index=step_index, step_type="task_plan",
+                                title=f"{runner.display_name} public work plan", status="completed",
+                                input_payload={}, output_payload={"task_plan": snapshot.model_dump(mode="json")},
+                            )
+                            yield _event("plan.updated", step_index, {"task_plan": snapshot.model_dump(mode="json")})
                     elif cli_event.kind == "tool_use":
                         step_index += 1
                         key = cli_event.tool_id or f"auto-{step_index}"
@@ -1927,7 +2108,12 @@ class AgentService:
         run: AgentRun,
     ) -> list[dict[str, object]]:
         enabled_tools = payload.enabled_tools if payload is not None else None
-        return self.tool_service.catalog.get_openai_tools(enabled_tools=enabled_tools)
+        # Reserved run-local metadata cannot be shadowed by a custom tool.
+        tools = [tool for tool in self.tool_service.catalog.get_openai_tools(enabled_tools=enabled_tools)
+                 if not self._is_plan_tool(tool)]
+        if enabled_tools is None or PLAN_TOOL_NAME in {str(name).strip().lower() for name in enabled_tools}:
+            tools.append(json.loads(json.dumps(PLAN_TOOL)))
+        return tools
 
     def _resolve_routes(
         self,
@@ -2032,7 +2218,7 @@ class AgentService:
         public_tool_call = {
             key: value
             for key, value in tool_call.items()
-            if not str(key).startswith("_assistant_")
+            if not str(key).startswith(("_assistant_", "_caibao_"))
         }
         normalized = json.loads(json.dumps(public_tool_call, ensure_ascii=False, default=str))
         if not isinstance(normalized, dict):
@@ -2057,6 +2243,9 @@ class AgentService:
         reasoning_content = tool_call.get("_assistant_reasoning_content")
         if isinstance(reasoning_content, str) and reasoning_content.strip():
             message["reasoning_content"] = reasoning_content
+        batch = tool_call.get("_caibao_model_call")
+        if type(batch) is int:
+            message["_caibao_model_call"] = batch
         return message
 
     def _count_consecutive(self, history: list[tuple[str, str]], sig: tuple[str, str]) -> int:
@@ -2068,11 +2257,14 @@ class AgentService:
                 break
         return count
 
-    def _save_loop_state(self, run: AgentRun, *, messages: list[dict[str, object]], pending_tool_call_id: str, ledger: ToolLoopLedger | None = None) -> None:
+    def _save_loop_state(self, run: AgentRun, *, messages: list[dict[str, object]], pending_tool_call_id: str,
+                         ledger: ToolLoopLedger | None = None, loop_control: RunLoopControl | None = None) -> None:
         loop = {
+            "version": 2,
             "messages": self._strip_non_serializable_messages(messages),
             "pending_tool_call_id": pending_tool_call_id,
             **({"execution_ledger": ledger.to_state()} if ledger is not None else {}),
+            **({"loop_control": loop_control.to_state()} if loop_control is not None else {}),
         }
         self.db.execute(
             update(AgentRun).where(AgentRun.run_id == run.run_id, AgentRun.status.not_in(("cancelled", "interrupted")))

@@ -3,6 +3,7 @@ import {CompanionRecovery, runStatusLabel} from './companion-recovery.mjs';
 import {CompanionMemory} from './companion-memory.mjs';
 import {executionSummary} from './companion-execution.mjs';
 import {receiptSummary} from './companion-receipt.mjs';
+import {taskPlanSummary} from './companion-plan.mjs';
 import {CompanionVoice} from './companion-voice.mjs';
 
 const $ = id => document.getElementById(id);
@@ -229,6 +230,28 @@ function renderReceipt(container, run) {
     const line = document.createElement('p'); line.className = className; line.textContent = summary[field]; container.append(line);
   }
 }
+function renderPlan(container, run) {
+  const plan = taskPlanSummary(run);
+  if (!plan) {container.replaceChildren(); container.hidden = true; delete container.dataset.plan; delete container.dataset.runId; return;}
+  const key = JSON.stringify([run.run_id,plan]);
+  if (!container.hidden && container.dataset.plan === key) return;
+  if (container.dataset.runId !== run.run_id) container.open = false;
+  container.replaceChildren(); container.hidden = false; container.dataset.plan = key; container.dataset.runId = run.run_id;
+  const summary = document.createElement('summary');
+  const title = document.createElement('span'); title.textContent = '模型报告的计划';
+  const progress = document.createElement('span'); progress.className = 'plan-progress'; progress.textContent = plan.progress;
+  summary.append(title,progress); container.append(summary);
+  const source = document.createElement('p'); source.className = 'plan-source'; source.textContent = `${plan.source} · 第 ${plan.revision} 版`; container.append(source);
+  if (plan.explanation) {const explanation = document.createElement('p'); explanation.className = 'plan-explanation'; explanation.textContent = plan.explanation; container.append(explanation);}
+  const list = document.createElement('ol'); list.className = 'plan-steps';
+  for (const step of plan.steps) {
+    const item = document.createElement('li'); item.dataset.status = step.status;
+    const status = document.createElement('span'); status.className = 'plan-step-status'; status.textContent = step.label;
+    const content = document.createElement('span'); content.textContent = step.content; item.append(status,content); list.append(item);
+  }
+  if (plan.steps.length) container.append(list);
+  const note = document.createElement('p'); note.className = 'plan-note'; note.textContent = plan.note; container.append(note);
+}
 function renderRun(snapshot) {
   currentRun = snapshot.run?.run_id || null;
   if (currentRun) {
@@ -252,6 +275,7 @@ function renderRun(snapshot) {
   $('task-status').textContent = hint; $('run-connection').textContent = hint;
   renderExecution($('run-execution'),snapshot.run);
   renderReceipt($('run-receipt'),snapshot.run);
+  renderPlan($('run-plan'),snapshot.run);
   $('run-strip').hidden = snapshot.phase === 'idle';
   $('run-strip').dataset.phase = snapshot.phase;
   $('run-reconnect').hidden = !['unknown','reconnecting'].includes(snapshot.phase);
@@ -281,13 +305,14 @@ function renderTaskHistory(items) {
 async function inspectTask(runId) {
   voiceInput.cancel('history');
   const generation = ++previewGeneration; $('history-preview').hidden = false; $('history-answer').textContent = '正在读取记录…';
-  $('history-title').textContent = '读取任务记录'; $('history-state').textContent = ''; $('history-timeline').replaceChildren(); renderExecution($('history-execution'),null); renderReceipt($('history-receipt'),null);
+  $('history-title').textContent = '读取任务记录'; $('history-state').textContent = ''; $('history-timeline').replaceChildren(); renderExecution($('history-execution'),null); renderReceipt($('history-receipt'),null); renderPlan($('history-plan'),null);
   try {
     const preview = await controller.inspect(runId); if (generation !== previewGeneration) return;
     $('history-title').textContent = preview.task;
     $('history-state').textContent = `${runStatusLabel(preview.run.status)} · 只读记录`;
     renderExecution($('history-execution'),preview.run);
     renderReceipt($('history-receipt'),preview.run);
+    renderPlan($('history-plan'),preview.run);
     $('history-answer').textContent = preview.text || (preview.run.status === 'queued' ? '这个任务尚未启动。查看记录不会执行任务。' : '还没有回复，已保留执行记录。');
     renderTimeline($('history-timeline'),preview.timeline,preview.run.status);
     $('history-preview').scrollIntoView({block:'nearest'});

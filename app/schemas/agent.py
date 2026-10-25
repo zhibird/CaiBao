@@ -7,6 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.schemas.chat import ChatSource
+from app.schemas.task_plan import AgentTaskPlan
 from app.services.execution_ledger import ExecutionStopReason
 
 
@@ -212,6 +213,7 @@ class AgentRunResponse(BaseModel):
     execution_identity: dict[str, Any] | None = None
     context_snapshot: dict[str, Any] | None = None
     execution_receipt: AgentExecutionReceipt | None = None
+    task_plan: AgentTaskPlan | None = None
 
 
 class AgentRunListResponse(BaseModel):

@@ -330,6 +330,10 @@ def test_legacy_approval_reconstructs_consumed_budget_from_real_tool_messages(cl
         record = db.get(AgentRun, pending["run_id"])
         state = json.loads(record.loop_state_json)
         state.pop("execution_ledger")
+        state.pop("version")
+        state.pop("loop_control")
+        for message in state["messages"]:
+            message.pop("_caibao_model_call", None)
         record.loop_state_json = json.dumps(state)
         record.execution_receipt_json = None
         db.commit()
@@ -368,6 +372,10 @@ def test_corrupt_or_unverifiable_approval_evidence_cannot_grant_a_fresh_budget(c
             state["execution_ledger"]["used"] = 0
         else:
             state.pop("execution_ledger")
+            state.pop("version")
+            state.pop("loop_control")
+            for message in state["messages"]:
+                message.pop("_caibao_model_call", None)
             next(message for message in state["messages"] if message["role"] == "tool")["content"] = "{}"
         if damage not in {"missing_checkpoint", "missing_legacy_checkpoint"}:
             record.loop_state_json = json.dumps(state)

@@ -1,4 +1,5 @@
 import {createSSEParser} from './companion-state.mjs';
+import {TaskPlanTracker} from './companion-plan.mjs';
 
 const ACTIVE = new Set(['queued', 'running']);
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'partial_success', 'interrupted']);
@@ -20,6 +21,7 @@ export class CompanionRecovery {
     Object.assign(this, {request, fetchStream, storage, userId, conversationId, onChange, onHistory, onTerminal, streamIdleMs, retryDelays, wait, requestId});
     this.key = `caibao.companion.run.${userId}.${conversationId}`;
     this.state = empty(); this.history = []; this.generation = 0; this.abort = null; this.intent = this.readIntent();
+    this.planTrackers = new WeakMap();
   }
   readIntent() {try {return JSON.parse(this.storage?.getItem(this.key) || 'null');} catch {return null;}}
   persist(intent) {
@@ -86,6 +88,7 @@ export class CompanionRecovery {
     // Do not manufacture admission for a queued run merely found in history.
     if (admitted || run.status !== 'queued') this.persist({run_id:run.run_id, task:run.task || intent?.task || ''});
     this.state = {...empty(), run:{...run}, task:run.task || intent?.task || '', phase:recovered ? 'reconnecting' : 'running', recovered, blocked:true};
+    this.state.run.task_plan = this.planTracker(this.state).plan;
     this.publish();
     void this.refreshHistory().catch(() => {});
     let attempt = 0;
@@ -135,6 +138,12 @@ export class CompanionRecovery {
     if (!Number.isSafeInteger(seq) || seq <= target.cursor) return;
     target.cursor = seq;
     const payload = event.payload || {};
+    if (event.event === 'plan.updated') {
+      const tracker = this.planTracker(target);
+      if (tracker.event(event.run_id,payload.task_plan)) target.run.task_plan = tracker.plan;
+      // A checklist update is not a tool, emotional state, or task completion.
+      return;
+    }
     if (event.event === 'llm.delta') target.text += payload.text || '';
     if (event.event === 'tool.started' || event.event === 'tool.result') {
       let item = target.timeline.find(item => item.step === event.step_index && item.tool === payload.tool_name && item.status === 'running');
@@ -142,16 +151,20 @@ export class CompanionRecovery {
       item.status = event.event === 'tool.started' ? 'running' : payload.result?.error ? 'failed' : 'completed';
     }
     if (event.event === 'run.completed') {
-      target.run = {...target.run, ...payload};
+      const tracker = this.planTracker(target);
+      tracker.event(event.run_id,payload.task_plan);
+      target.run = {...target.run, ...payload, task_plan:tracker.plan};
+      if (TERMINAL.has(payload.status)) tracker.lock();
       if (payload.answer !== undefined) target.text = payload.answer;
     }
     if (event.event === 'confirmation.required') target.run = {...target.run, status:'requires_confirmation', approval_token:payload.approval_token, required_confirmations:[payload]};
-    if (event.event === 'run.cancelled') target.run.status = 'cancelled';
-    if (event.event === 'run.failed') {target.run.status = 'failed'; target.error = payload.error;}
+    if (event.event === 'run.cancelled') {target.run.status = 'cancelled'; this.planTracker(target).lock();}
+    if (event.event === 'run.failed') {target.run.status = 'failed'; target.error = payload.error; this.planTracker(target).lock();}
     target.lastEvent = event;
   }
   reconcile(target, run) {
-    target.run = {...target.run, ...run}; target.task = run.task || target.task;
+    const plan = this.planTracker(target).snapshot(run);
+    target.run = {...target.run, ...run, task_plan:plan}; target.task = run.task || target.task;
     if (!ACTIVE.has(run.status) && run.answer) target.text = run.answer;
     for (const step of run.steps || []) {
       if (!step.tool_name || step.step_type !== 'tool_call') continue;
@@ -159,6 +172,13 @@ export class CompanionRecovery {
       if (!item) {item = {id:step.step_id, step:step.step_index, tool:step.tool_name}; target.timeline.push(item);}
       item.status = step.status;
     }
+  }
+  planTracker(target) {
+    let tracker = this.planTrackers.get(target);
+    if (!tracker || tracker.runId !== target.run.run_id) {
+      tracker = new TaskPlanTracker(target.run); this.planTrackers.set(target,tracker);
+    }
+    return tracker;
   }
   settle(run) {
     const phase = run.status === 'requires_confirmation' ? 'waiting' : TERMINAL.has(run.status) ? 'finished' : 'unknown';

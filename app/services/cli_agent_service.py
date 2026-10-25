@@ -36,6 +36,8 @@ CLI_AGENT_MODES = {"claude_code", "codex", "pi"}
 _SESSION_FILE_NAME = ".caibao_cli_sessions.json"
 _STDERR_TAIL_LINES = 60
 _PATH_SAFE_RE = re.compile(r"[^A-Za-z0-9_-]")
+_PLAN_STATUSES = frozenset({"pending", "in_progress", "completed", "cancelled"})
+_MAX_CLAUDE_PLAN_CALLS = 128
 
 # 传给 CLI 子进程的环境变量白名单：仅运行所需的无害变量，绝不含应用密钥。
 # 需要额外变量（如 provider API key）时走 CLI_AGENT_EXTRA_ENV_JSON 显式注入。
@@ -53,7 +55,7 @@ _ENV_ALLOWLIST = (
 class CliAgentEvent:
     """Normalized event parsed from a CLI agent's JSONL output."""
 
-    kind: str  # session | text | tool_use | tool_result | warning | result | error
+    kind: str  # session | text | tool_use | tool_result | plan | warning | result | error
     text: str = ""
     tool_id: str = ""
     tool_name: str = ""
@@ -61,6 +63,53 @@ class CliAgentEvent:
     tool_output: str = ""
     session_id: str = ""
     ok: bool = True
+    plan_source: str = ""
+    plan_steps: list[dict[str, str]] = field(default_factory=list)
+
+
+def _validated_plan_steps(value: object) -> list[dict[str, str]] | None:
+    """Validate one complete projection; never truncate a misleading subset."""
+    if not isinstance(value, list) or len(value) > 10:
+        return None
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    active = 0
+    for item in value:
+        if not isinstance(item, dict):
+            return None
+        identifier, content, status = item.get("id"), item.get("content"), item.get("status")
+        if (not isinstance(identifier, str) or not 1 <= len(identifier) <= 64
+                or identifier in seen or not isinstance(content, str)
+                or not 1 <= len(content) <= 160 or not content.strip()
+                or not isinstance(status, str) or status not in _PLAN_STATUSES):
+            return None
+        active += status == "in_progress"
+        if active > 1:
+            return None
+        seen.add(identifier)
+        result.append({"id": identifier, "content": content, "status": status})
+    return result
+
+
+def _claude_todo_steps(todos: object) -> list[dict[str, str]] | None:
+    if not isinstance(todos, list) or len(todos) > 10:
+        return None
+    steps = []
+    for index, todo in enumerate(todos, 1):
+        if (not isinstance(todo, dict) or not isinstance(todo.get("status"), str)
+                or todo["status"] not in {"pending", "in_progress", "completed"}):
+            return None
+        steps.append({"id": f"s{index}", "content": todo.get("content"), "status": todo["status"]})
+    return _validated_plan_steps(steps)
+
+
+@dataclass
+class _ClaudePlanCall:
+    name: str
+    arguments: dict[str, object]
+    received: bool = False
+    succeeded: bool = False
+    output: object = None
 
 
 def resolve_cli_workspace(
@@ -123,6 +172,9 @@ class BaseCliAgentRunner:
     def parse_line(self, line: str) -> list[CliAgentEvent]:
         raise NotImplementedError
 
+    def _reset_parser_state(self) -> None:
+        """Subclasses may keep correlation state for this dispatch only."""
+
     # -- shared execution --------------------------------------------------
     def run(
         self,
@@ -133,6 +185,7 @@ class BaseCliAgentRunner:
         resume_session_id: str | None,
         dry_run: bool,
     ) -> Iterator[CliAgentEvent]:
+        self._reset_parser_state()
         command, stdin_payload = self.build_command(
             task=task, system_prompt=system_prompt,
             resume_session_id=resume_session_id, workdir=workdir, dry_run=dry_run,
@@ -260,6 +313,20 @@ class ClaudeCodeRunner(BaseCliAgentRunner):
     name = "claude_code"
     display_name = "Claude Code"
 
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(settings)
+        self._reset_parser_state()
+
+    def _reset_parser_state(self) -> None:
+        self._plan_calls: dict[str, _ClaudePlanCall] = {}
+        self._plan_order: deque[str] = deque()
+        self._plan_seen: set[str] = set()
+        self._plan_tasks: dict[str, dict[str, str]] = {}
+        self._plan_next_id = 1
+        self._plan_source = ""
+        self._plan_signature: tuple[object, ...] | None = None
+        self._plan_closed = False
+
     def build_command(
         self,
         *,
@@ -305,6 +372,9 @@ class ClaudeCodeRunner(BaseCliAgentRunner):
         if kind == "user":
             return self._parse_tool_results(obj)
         if kind == "result":
+            self._plan_closed = True
+            self._plan_calls.clear()
+            self._plan_order.clear()
             return [CliAgentEvent(
                 kind="result",
                 ok=not bool(obj.get("is_error")),
@@ -324,6 +394,8 @@ class ClaudeCodeRunner(BaseCliAgentRunner):
                 events.append(CliAgentEvent(kind="text", text=str(block["text"])))
             elif block.get("type") == "tool_use":
                 tool_input = block.get("input")
+                if obj.get("parent_tool_use_id") is None:
+                    self._remember_plan_call(block)
                 events.append(CliAgentEvent(
                     kind="tool_use",
                     tool_id=str(block.get("id") or ""),
@@ -336,6 +408,7 @@ class ClaudeCodeRunner(BaseCliAgentRunner):
         events: list[CliAgentEvent] = []
         message = obj.get("message")
         content = message.get("content") if isinstance(message, dict) else None
+        results = [block for block in content if isinstance(block, dict) and block.get("type") == "tool_result"] if isinstance(content, list) else []
         for block in content if isinstance(content, list) else []:
             if isinstance(block, dict) and block.get("type") == "tool_result":
                 events.append(CliAgentEvent(
@@ -344,12 +417,156 @@ class ClaudeCodeRunner(BaseCliAgentRunner):
                     tool_output=_stringify_content(block.get("content")),
                     ok=not bool(block.get("is_error")),
                 ))
+                if obj.get("parent_tool_use_id") is None and not self._plan_closed:
+                    # The structured field is message-scoped. With multiple
+                    # result blocks its TaskCreate owner is ambiguous.
+                    output = obj.get("tool_use_result") if len(results) == 1 else None
+                    events.extend(self._receive_plan_result(block, output))
         return events
+
+    def _remember_plan_call(self, block: dict[str, object]) -> None:
+        name, identifier, arguments = block.get("name"), block.get("id"), block.get("input")
+        if (self._plan_closed or not isinstance(name, str) or name not in {"TodoWrite", "TaskCreate", "TaskUpdate"}
+                or not isinstance(identifier, str) or not identifier
+                or identifier in self._plan_seen or len(self._plan_seen) >= _MAX_CLAUDE_PLAN_CALLS):
+            return
+        self._plan_seen.add(identifier)
+        if not isinstance(arguments, dict):
+            return
+        source = "claude.TodoWrite" if name == "TodoWrite" else "claude.tasks"
+        if self._plan_source and self._plan_source != source:
+            return
+        # Keep only bounded display fields. Description, activeForm, raw tool
+        # output and reasoning never become plan presentation data.
+        if name == "TodoWrite":
+            normalized = _claude_todo_steps(arguments.get("todos"))
+            if normalized is None:
+                return
+            data: dict[str, object] = {"steps": normalized}
+        elif name == "TaskCreate":
+            subject = arguments.get("subject")
+            if _validated_plan_steps([{"id": "s1", "content": subject, "status": "pending"}]) is None:
+                return
+            data = {"subject": subject}
+        else:
+            aliases = [arguments[key] for key in ("taskId", "id", "task_id") if key in arguments]
+            if (not aliases or not all(isinstance(value, str) and 1 <= len(value) <= 64 for value in aliases)
+                    or len(set(aliases)) != 1):
+                return
+            data = {"task_id": aliases[0]}
+            if arguments.get("status") is not None:
+                status = arguments["status"]
+                if not isinstance(status, str) or status not in {"pending", "in_progress", "completed", "deleted"}:
+                    return
+                data["status"] = status
+            if arguments.get("subject") is not None:
+                subject = arguments["subject"]
+                if _validated_plan_steps([{"id": "s1", "content": subject, "status": "pending"}]) is None:
+                    return
+                data["subject"] = subject
+            if len(data) == 1:
+                return
+        self._plan_calls[identifier] = _ClaudePlanCall(name=str(name), arguments=data)
+        self._plan_order.append(identifier)
+
+    def _receive_plan_result(self, block: dict[str, object], output: object) -> list[CliAgentEvent]:
+        identifier = block.get("tool_use_id")
+        if not isinstance(identifier, str):
+            return []
+        call = self._plan_calls.get(identifier)
+        if call is None or call.received:
+            return []
+        call.received = True
+        call.succeeded = block.get("is_error", False) is False
+        if isinstance(output, dict):
+            if call.name == "TaskCreate":
+                task = output.get("task")
+                call.output = {"task": {key: task[key] for key in ("id", "subject") if key in task}} if isinstance(task, dict) else None
+            elif call.name == "TaskUpdate":
+                call.output = {key: output[key] for key in ("success", "taskId", "updatedFields", "error", "statusChange") if key in output}
+            elif "newTodos" in output:
+                call.output = {"newTodos": output["newTodos"]}
+        events: list[CliAgentEvent] = []
+        # Match out-of-order results by id, but project in original call order.
+        # Missing results block later projections rather than guessing state.
+        while self._plan_order and self._plan_calls[self._plan_order[0]].received:
+            current = self._plan_calls.pop(self._plan_order.popleft())
+            if current.succeeded:
+                event = self._apply_plan_result(current)
+                if event is not None:
+                    events.append(event)
+        return events
+
+    def _apply_plan_result(self, call: _ClaudePlanCall) -> CliAgentEvent | None:
+        source = "claude.TodoWrite" if call.name == "TodoWrite" else "claude.tasks"
+        if self._plan_source and self._plan_source != source:
+            return None
+        if call.name == "TodoWrite":
+            candidate = call.arguments["steps"]
+            if isinstance(call.output, dict) and "newTodos" in call.output:
+                candidate = _claude_todo_steps(call.output["newTodos"])
+                if candidate is None:
+                    return None
+        else:
+            if call.name == "TaskCreate":
+                task = call.output.get("task") if isinstance(call.output, dict) else None
+                identifier = task.get("id") if isinstance(task, dict) else None
+                if (not isinstance(identifier, str) or not 1 <= len(identifier) <= 64
+                        or identifier in self._plan_tasks):
+                    return None
+                subject = task.get("subject", call.arguments["subject"])
+                if _validated_plan_steps([{"id": "s1", "content": subject, "status": "pending"}]) is None:
+                    return None
+                self._plan_tasks[identifier] = {"id": f"s{self._plan_next_id}", "content": subject, "status": "pending"}
+                self._plan_next_id += 1
+            else:
+                identifier = str(call.arguments["task_id"])
+                task = self._plan_tasks.get(identifier)
+                if task is None:
+                    return None
+                output = call.output
+                if (not isinstance(output, dict) or output.get("success") is not True
+                        or output.get("taskId") != identifier or output.get("error")
+                        or not isinstance(output.get("updatedFields"), list)):
+                    return None
+                requested = {key for key in ("subject", "status") if key in call.arguments}
+                changed = output["updatedFields"]
+                if not all(isinstance(key, str) for key in changed) or not requested.issubset(changed):
+                    return None
+                change = output.get("statusChange")
+                if isinstance(change, dict) and change.get("to") != call.arguments.get("status"):
+                    return None
+                if call.arguments.get("status") == "deleted":
+                    del self._plan_tasks[identifier]
+                else:
+                    if "status" in requested:
+                        task["status"] = str(call.arguments["status"])
+                    if "subject" in requested:
+                        task["content"] = str(call.arguments["subject"])
+            # Retain the observed internal registry even if it currently exceeds
+            # display limits. Never publish only its first ten tasks or discard
+            # a second active item to make an invalid snapshot appear valid.
+            candidate = list(self._plan_tasks.values())
+        steps = _validated_plan_steps(candidate)
+        if steps is None:
+            return None
+        signature = (source, tuple((item["id"], item["content"], item["status"]) for item in steps))
+        if signature == self._plan_signature:
+            return None
+        self._plan_source, self._plan_signature = source, signature
+        return CliAgentEvent(kind="plan", plan_source=source, plan_steps=steps)
 
 
 class CodexRunner(BaseCliAgentRunner):
     name = "codex"
     display_name = "Codex"
+
+    def __init__(self, settings: Settings) -> None:
+        super().__init__(settings)
+        self._reset_parser_state()
+
+    def _reset_parser_state(self) -> None:
+        self._plan_closed = False
 
     def build_command(
         self,
@@ -394,12 +611,30 @@ class CodexRunner(BaseCliAgentRunner):
         if kind == "thread.started":
             session_id = str(obj.get("thread_id") or "")
             return [CliAgentEvent(kind="session", session_id=session_id)] if session_id else []
-        if kind == "item.completed":
+        if isinstance(kind, str) and kind in {"item.started", "item.updated", "item.completed"}:
             item = obj.get("item")
-            return self._parse_item(item) if isinstance(item, dict) else []
+            if not isinstance(item, dict):
+                return []
+            if item.get("type") == "todo_list":
+                if self._plan_closed:
+                    return []
+                items = item.get("items")
+                if not isinstance(items, list) or len(items) > 10:
+                    return []
+                steps = []
+                for index, todo in enumerate(items, 1):
+                    if not isinstance(todo, dict) or type(todo.get("completed")) is not bool:
+                        return []
+                    steps.append({"id": f"s{index}", "content": todo.get("text"),
+                                  "status": "completed" if todo["completed"] else "pending"})
+                normalized = _validated_plan_steps(steps)
+                return [CliAgentEvent(kind="plan", plan_source="codex.todo_list", plan_steps=normalized)] if normalized is not None else []
+            return self._parse_item(item) if kind == "item.completed" else []
         if kind == "turn.completed":
+            self._plan_closed = True
             return [CliAgentEvent(kind="result", ok=True)]
         if kind == "turn.failed":
+            self._plan_closed = True
             error = obj.get("error")
             message = error.get("message") if isinstance(error, dict) else None
             return [CliAgentEvent(kind="result", ok=False, text=str(message or "Codex 执行失败"))]
@@ -451,7 +686,7 @@ class CodexRunner(BaseCliAgentRunner):
             ]
         if item_type == "error":
             return [CliAgentEvent(kind="warning", text=str(item.get("message") or ""))]
-        # reasoning / todo_list 等对最终轨迹无意义，忽略。
+        # Reasoning is deliberately not projected into task plans or answers.
         return []
 
 

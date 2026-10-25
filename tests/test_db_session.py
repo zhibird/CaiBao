@@ -123,6 +123,7 @@ def test_ensure_phase1_columns_normalizes_legacy_agent_runs_table(tmp_path, monk
                     status VARCHAR(24) NOT NULL,
                     max_steps INTEGER NOT NULL,
                     current_step INTEGER NOT NULL,
+                    task_plan_json TEXT,
                     result_summary TEXT,
                     error_message TEXT,
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
@@ -133,9 +134,9 @@ def test_ensure_phase1_columns_normalizes_legacy_agent_runs_table(tmp_path, monk
             connection.exec_driver_sql(
                 """
                 INSERT INTO agent_runs (
-                    run_id, team_id, user_id, task, status, max_steps, current_step
+                    run_id, team_id, user_id, task, status, max_steps, current_step, task_plan_json
                 )
-                VALUES ('run-old', 'team-a', 'user-a', 'hello', 'queued', 5, 0)
+                VALUES ('run-old', 'team-a', 'user-a', 'hello', 'queued', 5, 0, '{"preserved":"plan"}')
                 """
             )
 
@@ -151,12 +152,16 @@ def test_ensure_phase1_columns_normalizes_legacy_agent_runs_table(tmp_path, monk
                 """
             )
             row_count = connection.exec_driver_sql("SELECT COUNT(*) FROM agent_runs").scalar_one()
+            preserved_plan = connection.exec_driver_sql(
+                "SELECT task_plan_json FROM agent_runs WHERE run_id = 'run-old'"
+            ).scalar_one()
     finally:
         engine.dispose()
 
     assert not {"current_step", "result_summary", "error_message", "updated_at"} & columns
-    assert {"final_answer", "dry_run", "request_payload_json", "completed_at", "execution_receipt_json"} <= columns
+    assert {"final_answer", "dry_run", "request_payload_json", "completed_at", "execution_receipt_json", "task_plan_json"} <= columns
     assert row_count == 2
+    assert preserved_plan == '{"preserved":"plan"}'
 
 
 def test_ensure_phase1_columns_adds_memory_source_ref_columns(tmp_path, monkeypatch):

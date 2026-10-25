@@ -16,7 +16,7 @@ from sqlalchemy.schema import CreateColumn
 from app.db.base import Base
 from app.models import *  # noqa: F401,F403
 
-HEAD_REVISION = "20260602_00"
+HEAD_REVISION = "20260603_00"
 EXPECTED_TABLES = {
     "teams",
     "users",
@@ -199,6 +199,7 @@ def test_migration_removes_legacy_agent_run_required_columns(tmp_path) -> None:
         "execution_identity_json",
         "context_snapshot_json",
         "execution_receipt_json",
+        "task_plan_json",
         "latency_ms",
         "completed_at",
     } <= columns
@@ -311,6 +312,64 @@ def test_execution_receipt_bootstrap_then_alembic_is_idempotent(tmp_path, monkey
             assert connection.execute(text(
                 "SELECT execution_receipt_json FROM agent_runs WHERE run_id = 'bootstrap'"
             )).scalar_one() == '{"version":1,"source":"api_tool_loop"}'
+        assert _current_revision(database_url) == HEAD_REVISION
+    finally:
+        engine.dispose()
+
+
+def test_task_plan_migration_preserves_previous_facts_and_round_trips(tmp_path) -> None:
+    database_url = _sqlite_database_url(tmp_path / "task-plan.db")
+    config = _make_alembic_config(database_url)
+    command.upgrade(config, "20260602_00")
+    engine = _create_engine(database_url)
+    try:
+        with engine.begin() as connection:
+            connection.execute(text(
+                "INSERT INTO agent_runs (run_id, team_id, user_id, task, execution_receipt_json) "
+                "VALUES ('existing', 'team', 'user', 'preserved task', :receipt)"
+            ), {"receipt": '{"existing":"receipt must remain"}'})
+        command.upgrade(config, "head")
+        with engine.begin() as connection:
+            assert connection.execute(text(
+                "SELECT task, execution_receipt_json, task_plan_json FROM agent_runs WHERE run_id = 'existing'"
+            )).one() == ("preserved task", '{"existing":"receipt must remain"}', None)
+            columns = {column["name"]: column for column in inspect(connection).get_columns("agent_runs")}
+            assert columns["task_plan_json"]["nullable"] is True
+        command.downgrade(config, "20260602_00")
+        with engine.connect() as connection:
+            columns = {column["name"] for column in inspect(connection).get_columns("agent_runs")}
+            assert "task_plan_json" not in columns and "execution_receipt_json" in columns
+            assert connection.execute(text(
+                "SELECT execution_receipt_json FROM agent_runs WHERE run_id = 'existing'"
+            )).scalar_one() == '{"existing":"receipt must remain"}'
+        command.upgrade(config, "head")
+        command.upgrade(config, "head")
+        assert _current_revision(database_url) == HEAD_REVISION
+    finally:
+        engine.dispose()
+
+
+def test_task_plan_bootstrap_and_alembic_share_existing_snapshot_without_reset(tmp_path, monkeypatch) -> None:
+    import app.db.session as session_module
+
+    database_url = _sqlite_database_url(tmp_path / "bootstrap-task-plan.db")
+    config = _make_alembic_config(database_url)
+    command.upgrade(config, "20260602_00")
+    engine = _create_engine(database_url)
+    try:
+        monkeypatch.setattr(session_module, "engine", engine)
+        session_module._ensure_phase1_columns()
+        with engine.begin() as connection:
+            connection.execute(text(
+                "INSERT INTO agent_runs (run_id, team_id, user_id, task, task_plan_json) "
+                "VALUES ('bootstrap', 'team', 'user', 'task', :snapshot)"
+            ), {"snapshot": '{"already":"persisted snapshot"}'})
+        session_module._ensure_phase1_columns()
+        command.upgrade(config, "head")
+        with engine.connect() as connection:
+            assert connection.execute(text(
+                "SELECT task_plan_json FROM agent_runs WHERE run_id = 'bootstrap'"
+            )).scalar_one() == '{"already":"persisted snapshot"}'
         assert _current_revision(database_url) == HEAD_REVISION
     finally:
         engine.dispose()

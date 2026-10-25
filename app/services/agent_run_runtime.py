@@ -29,6 +29,7 @@ from app.models.agent_run_event import AgentRunEvent
 from app.models.agent_run_worker import AgentRunWorker
 from app.models.agent_step import AgentStep
 from app.schemas.agent import AgentExecutionReceipt, AgentRunResponse, AgentStepResponse, AgentStreamEvent
+from app.schemas.task_plan import AgentTaskPlan
 from app.services.cli_agent_service import CLI_AGENT_MODES
 
 logger = logging.getLogger(__name__)
@@ -427,6 +428,7 @@ class AgentRunRuntime:
                 execution_identity=json.loads(run.execution_identity_json) if run.execution_identity_json else None,
                 context_snapshot=json.loads(run.context_snapshot_json) if run.context_snapshot_json else None,
                 execution_receipt=AgentExecutionReceipt.from_snapshot(run.execution_receipt_json, run_status=run.status),
+                task_plan=AgentTaskPlan.from_snapshot(run.task_plan_json),
                 conversation_id=run.conversation_id, space_id=run.space_id,
                 app_id=run.app_id, app_version=run.app_version, trigger_channel=run.trigger_channel,
                 task=run.task, status=run.status, answer=run.final_answer, model=run.model,

@@ -50,7 +50,7 @@ _EVENT_REACTIONS = {
 }
 _AGENT_TOOLS = (
     "web_search", "web_fetch", "bilibili_latest_videos", "search_knowledge",
-    "list_recent_documents", "recall_memory", "message_lookup", "create_memory_card",
+    "list_recent_documents", "recall_memory", "message_lookup", "create_memory_card", "update_plan",
 )
 _MEMORY_TOOLS = {"recall_memory", "create_memory_card"}
 _CLI_BACKENDS = (

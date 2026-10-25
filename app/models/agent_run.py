@@ -54,6 +54,7 @@ class AgentRun(Base):
     execution_identity_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     context_snapshot_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     execution_receipt_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    task_plan_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
