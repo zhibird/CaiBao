@@ -6,7 +6,7 @@ import hmac
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Iterator
+from typing import Any, Generator, Iterator
 from uuid import uuid4
 
 from sqlalchemy import select, update
@@ -19,6 +19,7 @@ from app.models.agent_step import AgentStep
 from app.models.chat_history import ChatHistory
 from app.schemas.agent import (
     AgentRunRequest,
+    AgentExecutionReceipt,
     AgentRunResponse,
     AgentRunStartResponse,
     AgentStepResponse,
@@ -47,6 +48,7 @@ from app.services.conversation_context import build_conversation_context, render
 from app.services.execution_identity import (
     build_api_execution_identity, build_cli_execution_identity, safe_execution_endpoint,
 )
+from app.services.execution_ledger import ToolLoopLedger
 from app.services.document_service import DocumentService
 from app.services.llm_model_service import LLMModelService
 from app.services.llm_router import LLMRouter
@@ -325,10 +327,12 @@ class AgentService:
                 return
             self._finish_run(run=run, status="failed", final_answer=f"Agent execution failed: {exc}",
                              required_confirmations=[], started=started)
+            response = self.get_run(run_id=run.run_id, team_id=team_id, user_id=user_id)
+            self._record_agent_history(payload=payload, response=response)
             seq = (seq or 0) + 1
             yield AgentStreamEvent(
                 event="run.failed", run_id=run.run_id, seq=seq,
-                payload={"error": str(exc)},
+                payload={**response.model_dump(mode="json"), "error": str(exc)},
             )
             return
 
@@ -390,7 +394,15 @@ class AgentService:
 
         loop_state = self._load_loop_state(run)
         real_routes = None
+        ledger = None
+        if loop_state is None and self._requires_tool_loop_checkpoint(run):
+            raise DomainValidationError(
+                "本次待确认任务的执行检查点已丢失，暂不执行。请取消后新建任务。"
+            )
         if loop_state is not None:
+            # Reconstruct/check before claiming consent or invoking any handler.
+            # An old or corrupt checkpoint must never grant a new budget.
+            ledger = self._restore_execution_ledger(run, loop_state, pending_calls[0])
             payload = self._load_request_payload(run)
             real_routes = self._resolve_routes(team_id=team_id, user_id=user_id, payload=payload)
             frozen = self._safe_json_dict(run.execution_identity_json) if run.execution_identity_json else {}
@@ -450,8 +462,7 @@ class AgentService:
                 action=call.tool_name, arguments=call.arguments,
                 run_id=run.run_id, confirmed=True,
             )
-            tool_result_entry = {"tool_name": call.tool_name, "arguments": call.arguments, "result": result}
-            tool_status = "completed"
+            tool_result_entry, tool_status = self._observed_tool_result(call.tool_name, call.arguments, result)
         except Exception as exc:  # noqa: BLE001
             tool_result_entry = {"tool_name": call.tool_name, "arguments": call.arguments, "error": str(exc)}
             tool_status = "failed"
@@ -471,6 +482,10 @@ class AgentService:
             error_message=str(tool_result_entry.get("error")) if "error" in tool_result_entry else None,
             latency_ms=self._elapsed_ms(tool_started),
         )
+
+        ledger.resolve(tool_status)
+        ledger.stop_reason = "in_progress"
+        self._persist_execution_receipt(run, ledger)
 
         # Add tool result to messages and resume LLM loop.
         # The loop state already contains the assistant message with tool_calls
@@ -500,6 +515,7 @@ class AgentService:
             dry_run=False,
             enabled_tools=payload.enabled_tools,
             max_tool_calls=payload.max_steps,
+            ledger=ledger,
         )
 
         self._record_step(
@@ -595,6 +611,7 @@ class AgentService:
             client_request_id=run.client_request_id, approval_token=self._approval_token(run),
             execution_identity=self._safe_json_dict(run.execution_identity_json) if run.execution_identity_json else None,
             context_snapshot=self._safe_json_dict(run.context_snapshot_json) if run.context_snapshot_json else None,
+            execution_receipt=self._load_execution_receipt(run),
             conversation_id=run.conversation_id, space_id=run.space_id,
             app_id=run.app_id, app_version=run.app_version,
             trigger_channel=run.trigger_channel, task=run.task,
@@ -654,7 +671,7 @@ class AgentService:
                 space_id=space_id, started=started, routes=routes,
             )
         except DomainValidationError as exc:
-            if self._should_fallback_to_keyword(str(exc)):
+            if self._should_fallback_to_keyword(str(exc)) and self._can_fallback_tool_loop(run):
                 return self._run_agent_auto_fallback(
                     run=run, payload=payload, team_id=team_id, user_id=user_id,
                     space_id=space_id, started=started,
@@ -852,511 +869,449 @@ class AgentService:
     # ------------------------------------------------------------------
 
     def _tool_loop(
-        self,
-        *,
-        run: AgentRun,
-        messages: list[dict[str, object]],
-        tools: list[dict[str, object]],
-        team_id: str,
-        user_id: str,
-        space_id: str | None,
-        base_url: str,
-        api_key: str,
-        model_name: str,
-        step_index: int,
-        started: float,
-        enable_tool_execution: bool,
-        confirm_dangerous_actions: bool,
-        dry_run: bool,
-        enabled_tools: list[str] | None = None,
-        max_tool_calls: int = 5,
+        self, *, run: AgentRun, messages: list[dict[str, object]], tools: list[dict[str, object]],
+        team_id: str, user_id: str, space_id: str | None, base_url: str, api_key: str,
+        model_name: str, step_index: int, started: float, enable_tool_execution: bool,
+        confirm_dangerous_actions: bool, dry_run: bool, enabled_tools: list[str] | None = None,
+        max_tool_calls: int = 5, ledger: ToolLoopLedger | None = None,
     ) -> tuple[str, str, bool]:
-        """Run the LLM tool loop synchronously.
-
-        Returns (final_answer, status, requires_confirmation).
-        """
-        tool_call_history: list[tuple[str, str]] = []
-        accumulated_text: list[str] = []
-        pending_confirmation = False
-        current_step = step_index
-        tool_calls_used = 0
-        tool_budget = max(1, min(int(max_tool_calls or 5), _MAX_TOOL_LOOP_ITERATIONS))
-        enabled_tool_names = (
-            {name.strip().lower() for name in enabled_tools if name.strip()}
-            if enabled_tools is not None else None
+        engine = self._iterate_tool_loop(
+            run=run, messages=messages, tools=tools, team_id=team_id, user_id=user_id,
+            space_id=space_id, base_url=base_url, api_key=api_key, model_name=model_name,
+            step_index=step_index, start_seq=0, streaming=False,
+            confirm_dangerous_actions=confirm_dangerous_actions, dry_run=dry_run or not enable_tool_execution,
+            enabled_tools=enabled_tools, max_tool_calls=max_tool_calls, ledger=ledger,
         )
-
-        for iteration in range(min(_MAX_TOOL_LOOP_ITERATIONS, tool_budget + 2)):
-            if self._is_run_cancelled(run):
-                return _CANCELLED_ANSWER, "cancelled", False
-            if tool_calls_used >= tool_budget:
-                messages.append({"role": "user", "content": self._tool_budget_prompt(tool_budget)})
-                final_result = self.llm_service.complete_chat(
-                    messages=messages,
-                    model=model_name,
-                    base_url=base_url,
-                    api_key=api_key,
-                    tools=None,
-                )
-                if self._is_run_cancelled(run):
-                    return _CANCELLED_ANSWER, "cancelled", False
-                if final_result.assistant_text:
-                    accumulated_text.append(final_result.assistant_text)
-                final_text = "\n".join(accumulated_text).strip()
-                return final_text or "Agent stopped after reaching the tool-call budget.", "completed", False
-
-            result = self.llm_service.complete_chat(
-                messages=messages,
-                model=model_name,
-                base_url=base_url,
-                api_key=api_key,
-                tools=tools if tools else None,
-            )
-            if self._is_run_cancelled(run):
-                return _CANCELLED_ANSWER, "cancelled", False
-
-            if result.assistant_text:
-                accumulated_text.append(result.assistant_text)
-
-            if not result.tool_calls:
-                # No more tool calls — LLM is done
-                final_text = "\n".join(accumulated_text).strip()
-                if not final_text:
-                    final_text = self._build_final_answer(
-                        status="completed", task=run.task, rag_answer="",
-                        tool_results=[], skipped_calls=[], tool_errors=[], dry_run=dry_run,
-                    )
-                return final_text, "completed", False
-
-            # Process tool calls
-            for tc in result.tool_calls:
-                if self._is_run_cancelled(run):
-                    return _CANCELLED_ANSWER, "cancelled", False
-                if tool_calls_used >= tool_budget:
-                    break
-                fn = tc.get("function", {})
-                tool_name = str(fn.get("name", "")).strip()
-                raw_args = fn.get("arguments", {})
-                if isinstance(raw_args, str):
-                    try:
-                        raw_args = json.loads(raw_args)
-                    except (TypeError, ValueError):
-                        raw_args = {}
-                args = raw_args if isinstance(raw_args, dict) else {}
-
-                # Duplicate guard
-                call_sig = self._tool_call_signature(tool_name, args)
-                if self._count_consecutive(tool_call_history, call_sig) >= _MAX_CONSECUTIVE_DUPLICATE_CALLS:
-                    accumulated_text.append(f"\n[Tool call loop stopped: repeated {tool_name} {_MAX_CONSECUTIVE_DUPLICATE_CALLS}+ times.]")
-                    final_text = "\n".join(accumulated_text).strip()
-                    return final_text, "completed", False
-
-                # Validate tool exists
-                definition = self.tool_service.get_tool_definition(tool_name)
-                if definition is None:
-                    tool_calls_used += 1
-                    messages.append(self._assistant_tool_call_message(tc))
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": str(tc.get("id", "unknown")),
-                        "content": json.dumps({"error": f"Unknown tool: {tool_name}"}),
-                    })
-                    continue
-
-                # Validate arguments
-                normalized_args = definition.normalize_arguments(args)
-                normalized_args = self._enrich_tool_call(
-                    call=AgentToolCall(tool_name=tool_name, arguments=normalized_args),
-                    space_id=space_id, task=run.task,
-                ).arguments
-                arg_errors = definition.validate_arguments(normalized_args)
-                if arg_errors:
-                    tool_calls_used += 1
-                    messages.append(self._assistant_tool_call_message(tc))
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": str(tc.get("id", "unknown")),
-                        "content": json.dumps({"error": f"Argument validation failed: {'; '.join(arg_errors)}"}),
-                    })
-                    continue
-
-                # Filter by enabled_tools (case-insensitive, like streaming)
-                if enabled_tool_names is not None and tool_name.lower() not in enabled_tool_names:
-                    tool_calls_used += 1
-                    messages.append(self._assistant_tool_call_message(tc))
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": str(tc.get("id", "unknown")),
-                        "content": json.dumps({"error": f"Tool '{tool_name}' is not enabled for this run."}),
-                    })
-                    continue
-
-                # Check dangerous + confirmation
-                if definition.dangerous and not dry_run and not confirm_dangerous_actions:
-                    pending_confirmation = True
-                    call_obj = AgentToolCall(
-                        tool_name=tool_name, arguments=normalized_args,
-                        dangerous=True, requires_confirmation=True,
-                    )
-                    self._save_pending_tool_call(run, call_obj)
-                    # Append assistant tool_calls message so confirm can resume the loop.
-                    messages.append(self._assistant_tool_call_message(tc))
-                    self._save_loop_state(run, messages=messages, pending_tool_call_id=str(tc.get("id", "unknown")))
-                    final_text = "\n".join(accumulated_text).strip()
-                    return final_text, "requires_confirmation", True
-
-                # Record step
-                current_step += 1
-                if self.event_bus:
-                    self.event_bus.emit(ToolCalled(
-                        run_id=run.run_id, step_index=current_step,
-                        tool_name=tool_name, arguments=normalized_args,
-                    ))
-                tool_started = time.perf_counter()
-                if self._is_run_cancelled(run):
-                    return _CANCELLED_ANSWER, "cancelled", False
-                if dry_run:
-                    tool_result = {"tool_name": tool_name, "arguments": normalized_args, "result": {"dry_run": True}}
-                    tool_status = "skipped"
-                else:
-                    try:
-                        exec_result = self.tool_service.execute(
-                            team_id=team_id, user_id=user_id,
-                            action=tool_name, arguments=normalized_args,
-                            run_id=run.run_id, dry_run=dry_run,
-                            confirmed=confirm_dangerous_actions or not definition.dangerous,
-                        )
-                        tool_result = {"tool_name": tool_name, "arguments": normalized_args, "result": exec_result}
-                        tool_status = "completed"
-                    except Exception as exc:  # noqa: BLE001
-                        tool_result = {"tool_name": tool_name, "arguments": normalized_args, "error": str(exc)}
-                        tool_status = "failed"
-
-                if self.event_bus:
-                    self.event_bus.emit(ToolResulted(
-                        run_id=run.run_id, step_index=current_step,
-                        tool_name=tool_name, status=tool_status,
-                        error=str(tool_result.get("error")) if "error" in tool_result else None,
-                    ))
-                self._record_step(
-                    run=run, step_index=current_step, step_type="tool_call",
-                    title=f"Execute: {tool_name}", status=tool_status,
-                    tool_name=tool_name,
-                    input_payload={"calls": [{"tool_name": tool_name, "arguments": normalized_args}]},
-                    output_payload={"executed": [tool_result], "errors": [str(tool_result["error"])] if "error" in tool_result else []},
-                    error_message=str(tool_result.get("error")) if "error" in tool_result else None,
-                    latency_ms=self._elapsed_ms(tool_started),
-                )
-                tool_call_history.append(call_sig)
-                tool_calls_used += 1
-
-                # Append tool result to messages
-                messages.append(self._assistant_tool_call_message(tc))
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": str(tc.get("id", "unknown")),
-                    "content": json.dumps(tool_result, ensure_ascii=False, default=str),
-                })
-
-        # Max iterations reached
-        final_text = "\n".join(accumulated_text).strip()
-        if not final_text:
-            final_text = "Agent has run the maximum number of tool loop iterations."
-        return final_text, "completed", False
+        while True:
+            try:
+                next(engine)
+            except StopIteration as done:
+                return done.value
 
     def _tool_loop_stream(
-        self,
-        *,
-        run: AgentRun,
-        messages: list[dict[str, object]],
-        tools: list[dict[str, object]],
-        team_id: str,
-        user_id: str,
-        space_id: str | None,
-        base_url: str,
-        api_key: str,
-        model_name: str,
-        started: float,
-        start_seq: int,
-        enable_tool_execution: bool,
-        confirm_dangerous_actions: bool,
-        dry_run: bool,
-        enabled_tools: list[str] | None = None,
+        self, *, run: AgentRun, messages: list[dict[str, object]], tools: list[dict[str, object]],
+        team_id: str, user_id: str, space_id: str | None, base_url: str, api_key: str,
+        model_name: str, started: float, start_seq: int, enable_tool_execution: bool,
+        confirm_dangerous_actions: bool, dry_run: bool, enabled_tools: list[str] | None = None,
         max_tool_calls: int = 5,
     ) -> Iterator[AgentStreamEvent]:
-        """Streaming variant of the LLM tool loop."""
-        tool_call_history: list[tuple[str, str]] = []
-        accumulated_text: list[str] = []
-        seq = start_seq
-        current_step = 3
-        tool_calls_used = 0
-        tool_budget = max(1, min(int(max_tool_calls or 5), _MAX_TOOL_LOOP_ITERATIONS))
-        enabled_tool_names = (
-            {name.strip().lower() for name in enabled_tools if name.strip()}
-            if enabled_tools is not None else None
+        engine = self._iterate_tool_loop(
+            run=run, messages=messages, tools=tools, team_id=team_id, user_id=user_id,
+            space_id=space_id, base_url=base_url, api_key=api_key, model_name=model_name,
+            step_index=3, start_seq=start_seq, streaming=True,
+            confirm_dangerous_actions=confirm_dangerous_actions, dry_run=dry_run or not enable_tool_execution,
+            enabled_tools=enabled_tools, max_tool_calls=max_tool_calls,
         )
-
-        for iteration in range(min(_MAX_TOOL_LOOP_ITERATIONS, tool_budget + 2)):
-            if self._is_run_cancelled(run):
+        try:
+            while True:
+                try:
+                    yield next(engine)
+                except StopIteration as done:
+                    final_answer, status, waiting = done.value
+                    break
+        except DomainValidationError as exc:
+            if self._should_fallback_to_keyword(str(exc)) and self._can_fallback_tool_loop(run):
+                text = self._run_agent_auto_fallback_sync(
+                    run=run, team_id=team_id, user_id=user_id, space_id=space_id, started=started,
+                )
+                if not self._is_run_cancelled(run):
+                    yield AgentStreamEvent(event="llm.delta", run_id=run.run_id, payload={"text": text})
                 return
-            accumulated_names: dict[str, str] = {}
-            accumulated_args: dict[str, str] = {}
-            accumulated_reasoning: list[str] = []
-            ordered_indices: dict[str, int] = {}
-            current_tool_calls: list[dict[str, object]] = []
+            raise
+        finally:
+            engine.close()
+        if self._is_run_cancelled(run):
+            return
+        pending = self._load_pending_tool_call(run) if waiting else None
+        self._record_step(
+            run=run, step_index=self._next_step_index(run.run_id), step_type="final",
+            title="Summarize result", status=status, input_payload={"run_id": run.run_id},
+            output_payload={"answer": final_answer, "status": status},
+        )
+        if not waiting:
+            self._run_plugin_phase("AfterReasoning", run.run_id, team_id, user_id, space_id,
+                                   run=run, final_answer=final_answer)
+        self._finish_run(run=run, status=status, final_answer=final_answer,
+                         required_confirmations=[pending] if pending else [], started=started)
+        if waiting and pending:
+            yield AgentStreamEvent(event="confirmation.required", run_id=run.run_id,
+                                   payload={**pending.model_dump(), "approval_token": self._approval_token(run)})
+        else:
+            self._run_plugin_phase("AfterTurn", run.run_id, team_id, user_id, space_id, run=run)
 
-            if tool_calls_used >= tool_budget:
-                messages.append({"role": "user", "content": self._tool_budget_prompt(tool_budget)})
+    def _iterate_tool_loop(
+        self, *, run: AgentRun, messages: list[dict[str, object]], tools: list[dict[str, object]],
+        team_id: str, user_id: str, space_id: str | None, base_url: str, api_key: str,
+        model_name: str, step_index: int, start_seq: int, streaming: bool,
+        confirm_dangerous_actions: bool, dry_run: bool, enabled_tools: list[str] | None = None,
+        max_tool_calls: int = 5, ledger: ToolLoopLedger | None = None,
+    ) -> Generator[AgentStreamEvent, None, tuple[str, str, bool]]:
+        """One accounting/execution path for sync, stream and approval resume.
+
+        A reservation precedes any handler or approval. Only observed outcomes
+        resolve it; a stopped owner cannot manufacture success for an in-flight
+        action. Receipt counts never include private arguments or model thoughts.
+        """
+        ledger = ledger or ToolLoopLedger(budget=max(1, min(int(max_tool_calls or 5), 10)))
+        ledger.stop_reason = "in_progress"
+        allowed = ({str(name).strip().lower() for name in enabled_tools if str(name).strip()}
+                   if enabled_tools is not None else None)
+        text_parts = []
+        seq, current_step = start_seq, step_index
+        stop = None
+        for _ in range(_MAX_TOOL_LOOP_ITERATIONS):
+            if self._is_run_cancelled(run):
+                return _CANCELLED_ANSWER, "cancelled", False
+            no_tools = ledger.used >= ledger.budget or stop is not None
+            if no_tools:
+                ledger.stop_reason = stop or "tool_budget"
+                prompt = (self._tool_budget_prompt(ledger.budget) if stop is None else
+                          "Tool execution stopped by the repeated-call guard. Do not call more tools. "
+                          "Summarize the observed results, what is unfinished, and a useful next step.")
+                messages.append({"role": "user", "content": prompt})
+            if streaming:
+                names, args, indices, reasoning = {}, {}, {}, []
                 for chunk in self.llm_service.stream_chat(
-                    messages=messages,
-                    model=model_name,
-                    base_url=base_url,
-                    api_key=api_key,
-                    tools=None,
+                    messages=messages, model=model_name, base_url=base_url, api_key=api_key,
+                    tools=None if no_tools else (tools or None),
                 ):
                     if self._is_run_cancelled(run):
-                        return
+                        return _CANCELLED_ANSWER, "cancelled", False
                     if chunk.delta_text:
-                        accumulated_text.append(chunk.delta_text)
-                        seq += 1
-                        yield AgentStreamEvent(
-                            event="llm.delta", run_id=run.run_id, step_index=current_step, seq=seq,
-                            payload={"text": chunk.delta_text},
-                        )
-                break
-
-            try:
-                for chunk in self.llm_service.stream_chat(
-                    messages=messages,
-                    model=model_name,
-                    base_url=base_url,
-                    api_key=api_key,
-                    tools=tools if tools else None,
-                ):
-                    if self._is_run_cancelled(run):
-                        return
-                    if chunk.delta_text:
-                        accumulated_text.append(chunk.delta_text)
-                        seq += 1
-                        yield AgentStreamEvent(
-                            event="llm.delta", run_id=run.run_id, step_index=current_step, seq=seq,
-                            payload={"text": chunk.delta_text},
-                        )
+                        text_parts.append(chunk.delta_text); seq += 1
+                        yield AgentStreamEvent(event="llm.delta", run_id=run.run_id,
+                                               step_index=current_step, seq=seq,
+                                               payload={"text": chunk.delta_text})
                     if chunk.reasoning_delta:
-                        accumulated_reasoning.append(chunk.reasoning_delta)
-                    for td in chunk.tool_call_deltas:
-                        idx = str(td.get("index", ""))
-                        if idx not in ordered_indices:
-                            ordered_indices[idx] = len(ordered_indices)
-                        fn = td.get("function", {})
+                        reasoning.append(chunk.reasoning_delta)
+                    for delta in chunk.tool_call_deltas:
+                        index = str(delta.get("index", ""))
+                        if index not in indices:
+                            indices[index] = len(indices)
+                        fn = delta.get("function", {})
                         if isinstance(fn, dict):
                             if fn.get("name"):
-                                accumulated_names[idx] = str(fn["name"])
+                                names[index] = str(fn["name"])
                             if fn.get("arguments"):
-                                accumulated_args[idx] = accumulated_args.get(idx, "") + str(fn["arguments"])
-            except DomainValidationError as exc:
-                if self._should_fallback_to_keyword(str(exc)):
-                    fallback_text = self._run_agent_auto_fallback_sync(
-                        run=run, team_id=team_id, user_id=user_id,
-                        space_id=space_id, started=started,
-                    )
-                    if self._is_run_cancelled(run):
-                        return
-                    seq += 1
-                    yield AgentStreamEvent(
-                        event="llm.delta", run_id=run.run_id, seq=seq,
-                        payload={"text": fallback_text},
-                    )
-                    return
-                raise
-
-            # Build tool calls from accumulated deltas
-            current_tool_calls = self.llm_service.finalize_tool_calls_from_stream(
-                accumulated_names=accumulated_names,
-                accumulated_args=accumulated_args,
-                ordered_indices=ordered_indices,
-                reasoning_content="".join(accumulated_reasoning) or None,
-            )
-
-            if not current_tool_calls:
+                                args[index] = args.get(index, "") + str(fn["arguments"])
+                calls = self.llm_service.finalize_tool_calls_from_stream(
+                    accumulated_names=names, accumulated_args=args, ordered_indices=indices,
+                    reasoning_content="".join(reasoning) or None,
+                )
+            else:
+                result = self.llm_service.complete_chat(
+                    messages=messages, model=model_name, base_url=base_url, api_key=api_key,
+                    tools=None if no_tools else (tools or None),
+                )
+                if self._is_run_cancelled(run):
+                    return _CANCELLED_ANSWER, "cancelled", False
+                if result.assistant_text:
+                    text_parts.append(result.assistant_text)
+                calls = result.tool_calls
+            if no_tools:
+                # Even a provider which ignores tools=None cannot execute more.
+                ledger.record_omitted(len(calls))
                 break
-
-            for tc in current_tool_calls:
+            if not calls:
+                ledger.stop_reason = "model_finished"
+                break
+            for position, tc in enumerate(calls):
                 if self._is_run_cancelled(run):
-                    return
-                if tool_calls_used >= tool_budget:
+                    return _CANCELLED_ANSWER, "cancelled", False
+                if ledger.used >= ledger.budget:
+                    ledger.record_omitted(len(calls) - position)
                     break
-                fn = tc.get("function", {})
-                tool_name = str(fn.get("name", "")).strip()
-                args = fn.get("arguments", {})
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except (TypeError, ValueError):
-                        args = {}
-                if not isinstance(args, dict):
-                    args = {}
-
+                tool_name, raw_args, parse_error = self._parse_tool_proposal(tc)
                 seq += 1
-                yield AgentStreamEvent(
-                    event="tool.proposed", run_id=run.run_id, step_index=current_step, seq=seq,
-                    payload={"tool_name": tool_name, "arguments": args},
-                )
-
-                # Duplicate guard
-                call_sig = self._tool_call_signature(tool_name, args)
-                if self._count_consecutive(tool_call_history, call_sig) >= _MAX_CONSECUTIVE_DUPLICATE_CALLS:
+                yield AgentStreamEvent(event="tool.proposed", run_id=run.run_id,
+                                       step_index=current_step, seq=seq,
+                                       payload={"tool_name": tool_name, "arguments": raw_args})
+                if self._is_run_cancelled(run):
+                    return _CANCELLED_ANSWER, "cancelled", False
+                signature = self._tool_call_signature(tool_name, raw_args)
+                if self._count_consecutive(ledger.history, signature) >= _MAX_CONSECUTIVE_DUPLICATE_CALLS:
+                    ledger.record_omitted(len(calls) - position)
+                    stop = "duplicate_guard"
                     break
-
-                definition = self.tool_service.get_tool_definition(tool_name)
-                if definition is None:
-                    tool_calls_used += 1
-                    messages.append(self._assistant_tool_call_message(tc))
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": str(tc.get("id", "unknown")),
-                        "content": json.dumps({"error": f"Unknown tool: {tool_name}"}),
-                    })
-                    continue
-
-                normalized_args = definition.normalize_arguments(args)
-                normalized_args = self._enrich_tool_call(
-                    call=AgentToolCall(tool_name=tool_name, arguments=normalized_args),
-                    space_id=space_id, task=run.task,
-                ).arguments
-                if definition.validate_arguments(normalized_args):
-                    tool_calls_used += 1
-                    messages.append(self._assistant_tool_call_message(tc))
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": str(tc.get("id", "unknown")),
-                        "content": json.dumps({"error": f"Argument validation failed for {tool_name}."}),
-                    })
-                    continue
-                if enabled_tool_names is not None and tool_name.lower() not in enabled_tool_names:
-                    tool_calls_used += 1
-                    messages.append(self._assistant_tool_call_message(tc))
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": str(tc.get("id", "unknown")),
-                        "content": json.dumps({"error": f"Tool '{tool_name}' is not enabled for this run."}),
-                    })
-                    continue
-
-                if definition.dangerous and not dry_run and not confirm_dangerous_actions:
-                    pending = AgentToolCall(
-                        tool_name=tool_name, arguments=normalized_args,
-                        dangerous=True, requires_confirmation=True,
-                    )
-                    self._save_pending_tool_call(run, pending)
-                    # Append assistant tool_calls so confirm can resume the loop properly.
-                    messages.append(self._assistant_tool_call_message(tc))
-                    self._save_loop_state(run, messages=messages, pending_tool_call_id=str(tc.get("id", "unknown")))
-                    # Persist the requires_confirmation status so confirm_run can find it.
-                    self._finish_run(
-                        run=run, status="requires_confirmation",
-                        final_answer="".join(accumulated_text).strip() or "Agent requires confirmation to proceed.",
-                        required_confirmations=[pending], started=started,
-                    )
-
-                    seq += 1
-                    yield AgentStreamEvent(
-                        event="confirmation.required", run_id=run.run_id, step_index=current_step, seq=seq,
-                        payload={"tool_name": tool_name, "arguments": normalized_args,
-                                 "approval_token": self._approval_token(run)},
-                    )
-                    return
-
+                definition = self.tool_service.get_tool_definition(tool_name) if not parse_error else None
+                normalized = raw_args
+                error = parse_error
+                if not error:
+                    if definition is None or not getattr(definition, "enabled", True):
+                        error = f"Unknown or disabled tool: {tool_name}"
+                    elif allowed is not None and tool_name.lower() not in allowed:
+                        error = f"Tool '{tool_name}' is not enabled for this run."
+                    else:
+                        try:
+                            normalized = definition.normalize_arguments(raw_args)
+                            normalized = self._enrich_tool_call(
+                                call=AgentToolCall(tool_name=tool_name, arguments=normalized),
+                                space_id=space_id, task=run.task,
+                            ).arguments
+                            errors = definition.validate_arguments(normalized)
+                            if errors:
+                                error = "Argument validation failed: " + "; ".join(errors)
+                        except (ValueError, TypeError) as exc:
+                            error = f"Argument validation failed: {exc}"
+                # Signatures describe normalized arguments for valid proposals.
+                if not error:
+                    signature = self._tool_call_signature(tool_name, normalized)
+                    if self._count_consecutive(ledger.history, signature) >= _MAX_CONSECUTIVE_DUPLICATE_CALLS:
+                        ledger.record_omitted(len(calls) - position); stop = "duplicate_guard"; break
+                ledger.reserve(signature)
                 current_step += 1
+                if error:
+                    ledger.resolve("rejected")
+                    tool_result = {"tool_name": tool_name, "error": error, "rejected": True}
+                    self._persist_execution_receipt(run, ledger)
+                    self._record_step(
+                        run=run, step_index=current_step, step_type="tool_call",
+                        title=f"Reject: {tool_name}", status="failed", tool_name=tool_name,
+                        input_payload={"calls": [{"tool_name": tool_name, "arguments": raw_args}]},
+                        output_payload={"executed": [], "errors": [error], "rejected": True},
+                        error_message=error,
+                    )
+                    self._append_tool_result(messages, tc, tool_result)
+                    seq += 1
+                    yield AgentStreamEvent(event="tool.rejected", run_id=run.run_id,
+                                           step_index=current_step, seq=seq,
+                                           payload={"tool_name": tool_name, "result": tool_result})
+                    continue
+                self._persist_execution_receipt(run, ledger)
+                if definition.dangerous and not dry_run and not confirm_dangerous_actions:
+                    # Only the reviewed call is retained for approval. Other
+                    # proposals in that model batch are never silently executed.
+                    ledger.record_omitted(len(calls) - position - 1)
+                    call = AgentToolCall(tool_name=tool_name, arguments=normalized,
+                                         dangerous=True, requires_confirmation=True)
+                    self._save_pending_tool_call(run, call)
+                    messages.append(self._assistant_tool_call_message(tc))
+                    ledger.stop_reason = "waiting_confirmation"
+                    self._save_loop_state(run, messages=messages,
+                                          pending_tool_call_id=str(tc.get("id", "unknown")), ledger=ledger)
+                    self._persist_execution_receipt(run, ledger)
+                    return self._loop_text(text_parts, streaming), "requires_confirmation", True
                 if self.event_bus:
-                    self.event_bus.emit(ToolCalled(
-                        run_id=run.run_id, step_index=current_step,
-                        tool_name=tool_name, arguments=normalized_args,
-                    ))
+                    self.event_bus.emit(ToolCalled(run_id=run.run_id, step_index=current_step,
+                                                  tool_name=tool_name, arguments=normalized))
                 seq += 1
-                yield AgentStreamEvent(
-                    event="tool.started", run_id=run.run_id, step_index=current_step, seq=seq,
-                    payload={"tool_name": tool_name},
-                )
-
-                tool_started = time.perf_counter()
+                yield AgentStreamEvent(event="tool.started", run_id=run.run_id,
+                                       step_index=current_step, seq=seq, payload={"tool_name": tool_name})
                 if self._is_run_cancelled(run):
-                    return
+                    return _CANCELLED_ANSWER, "cancelled", False
+                tool_started = time.perf_counter()
                 if dry_run:
-                    tool_result = {"tool_name": tool_name, "arguments": normalized_args, "result": {"dry_run": True}}
-                    tool_status = "skipped"
+                    tool_result = {"tool_name": tool_name, "arguments": normalized, "result": {"dry_run": True}}
+                    outcome = "skipped"
                 else:
                     try:
-                        exec_result = self.tool_service.execute(
-                            team_id=team_id, user_id=user_id,
-                            action=tool_name, arguments=normalized_args,
-                            run_id=run.run_id, dry_run=dry_run,
+                        value = self.tool_service.execute(
+                            team_id=team_id, user_id=user_id, action=tool_name, arguments=normalized,
+                            run_id=run.run_id, dry_run=False,
                             confirmed=confirm_dangerous_actions or not definition.dangerous,
                         )
-                        tool_result = {"tool_name": tool_name, "arguments": normalized_args, "result": exec_result}
-                        tool_status = "completed"
+                        tool_result, outcome = self._observed_tool_result(tool_name, normalized, value)
                     except Exception as exc:  # noqa: BLE001
-                        tool_result = {"tool_name": tool_name, "arguments": normalized_args, "error": str(exc)}
-                        tool_status = "failed"
-
+                        tool_result = {"tool_name": tool_name, "arguments": normalized, "error": str(exc)}
+                        outcome = "failed"
+                ledger.resolve(outcome)
+                self._persist_execution_receipt(run, ledger)
                 if self.event_bus:
-                    self.event_bus.emit(ToolResulted(
-                        run_id=run.run_id, step_index=current_step,
-                        tool_name=tool_name, status=tool_status,
-                        error=str(tool_result.get("error")) if "error" in tool_result else None,
-                    ))
+                    self.event_bus.emit(ToolResulted(run_id=run.run_id, step_index=current_step,
+                                                    tool_name=tool_name, status=outcome,
+                                                    error=str(tool_result.get("error")) if "error" in tool_result else None))
                 self._record_step(
-                    run=run, step_index=current_step, step_type="tool_call",
-                    title=f"Execute: {tool_name}", status=tool_status,
-                    tool_name=tool_name,
-                    input_payload={"calls": [{"tool_name": tool_name, "arguments": normalized_args}]},
+                    run=run, step_index=current_step, step_type="tool_call", title=f"Execute: {tool_name}",
+                    status=outcome, tool_name=tool_name,
+                    input_payload={"calls": [{"tool_name": tool_name, "arguments": normalized}]},
                     output_payload={"executed": [tool_result], "errors": [str(tool_result["error"])] if "error" in tool_result else []},
                     error_message=str(tool_result.get("error")) if "error" in tool_result else None,
                     latency_ms=self._elapsed_ms(tool_started),
                 )
-                tool_call_history.append(call_sig)
-                tool_calls_used += 1
-
+                self._append_tool_result(messages, tc, tool_result)
                 if self._is_run_cancelled(run):
-                    return
-
+                    return _CANCELLED_ANSWER, "cancelled", False
                 seq += 1
-                yield AgentStreamEvent(
-                    event="tool.result", run_id=run.run_id, step_index=current_step, seq=seq,
-                    payload={"tool_name": tool_name, "result": tool_result},
-                )
+                yield AgentStreamEvent(event="tool.result", run_id=run.run_id,
+                                       step_index=current_step, seq=seq,
+                                       payload={"tool_name": tool_name, "result": tool_result})
+        else:
+            ledger.stop_reason = "iteration_limit"
+        self._persist_execution_receipt(run, ledger)
+        text = self._loop_text(text_parts, streaming)
+        if not text:
+            text = ("本轮工具处理已结束，请查看执行回执。" if ledger.final_status() == "completed"
+                    else "本轮未确认全部完成，请查看执行回执中的失败或停止原因。")
+        return text, ledger.final_status(), False
 
-                messages.append(self._assistant_tool_call_message(tc))
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": str(tc.get("id", "unknown")),
-                    "content": json.dumps(tool_result, ensure_ascii=False, default=str),
-                })
+    @staticmethod
+    def _loop_text(parts: list[str], streaming: bool) -> str:
+        return ("" if streaming else "\n").join(parts).strip()
 
-            if not current_tool_calls:
-                break
+    @staticmethod
+    def _tool_value_failed(value: object) -> bool:
+        # MCP's explicit error flag is a failed tool result even if transport
+        # succeeded. Do not infer failure from arbitrary business status text.
+        return isinstance(value, dict) and (value.get("is_error") is True or value.get("isError") is True)
 
-        if self._is_run_cancelled(run):
+    @classmethod
+    def _observed_tool_result(cls, name: str, arguments: dict[str, object], value: object) -> tuple[dict[str, object], str]:
+        entry = {"tool_name": name, "arguments": arguments, "result": value}
+        if cls._tool_value_failed(value):
+            entry["error"] = "Tool reported an error result."
+            return entry, "failed"
+        return entry, "completed"
+
+    @staticmethod
+    def _parse_tool_proposal(tc: object) -> tuple[str, dict[str, object], str | None]:
+        fn = tc.get("function") if isinstance(tc, dict) else None
+        if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"].strip():
+            return "unknown", {}, "Invalid tool call."
+        name = fn["name"].strip().lower()
+        raw = fn.get("arguments", {})
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (TypeError, ValueError):
+                return name, {"invalid_arguments": raw}, "Arguments must be a valid JSON object."
+        if not isinstance(raw, dict):
+            return name, {}, "Arguments must be a JSON object."
+        return name, raw, None
+
+    def _append_tool_result(self, messages: list[dict[str, object]], tc: dict[str, object], result: dict[str, object]) -> None:
+        messages.append(self._assistant_tool_call_message(tc))
+        messages.append({"role": "tool", "tool_call_id": str(tc.get("id", "unknown")),
+                         "content": json.dumps(result, ensure_ascii=False, default=str)})
+
+    def _persist_execution_receipt(self, run: AgentRun, ledger: ToolLoopLedger) -> None:
+        if not isinstance(run, AgentRun):
             return
-        final_text = "".join(accumulated_text).strip()
-        if not final_text:
-            final_text = "Agent has completed its analysis."
-        self._record_step(
-            run=run, step_index=50, step_type="final", title="Summarize result",
-            status="completed",
-            input_payload={"run_id": run.run_id},
-            output_payload={"answer": final_text, "status": "completed"},
+        self.db.execute(update(AgentRun).where(
+            AgentRun.run_id == run.run_id, AgentRun.status == "running",
+        ).values(execution_receipt_json=self._to_json(ledger.receipt()))
+          .execution_options(synchronize_session=False))
+        self.db.commit()
+        self.db.refresh(run)
+
+    def _load_execution_receipt(self, run: AgentRun) -> AgentExecutionReceipt | None:
+        return AgentExecutionReceipt.from_snapshot(
+            getattr(run, "execution_receipt_json", None), run_status=getattr(run, "status", "running"),
         )
-        self._run_plugin_phase("AfterReasoning", run.run_id, run.team_id, run.user_id, run.space_id,
-                               run=run, final_answer=final_text)
-        self._finish_run(run=run, status="completed", final_answer=final_text,
-                         required_confirmations=[], started=started)
-        self._run_plugin_phase("AfterTurn", run.run_id, run.team_id, run.user_id, run.space_id, run=run)
-        seq += 1
-        yield AgentStreamEvent(
-            event="step.completed", run_id=run.run_id, step_index=50, seq=seq,
-            payload={"answer": final_text},
-        )
+
+    def _can_fallback_tool_loop(self, run: AgentRun) -> bool:
+        receipt = self._load_execution_receipt(run)
+        # An unreadable existing receipt is not evidence that nothing executed.
+        if getattr(run, "execution_receipt_json", None):
+            return receipt is not None and receipt.tool_calls_used == 0
+        return True
+
+    def _requires_tool_loop_checkpoint(self, run: AgentRun) -> bool:
+        if run.execution_receipt_json is not None:
+            return True
+        # A non-loop approval needs positive provenance too. In particular,
+        # deleting a loop checkpoint must not turn its consent into fallback.
+        plans = sorted((step for step in self._load_steps(run.run_id) if step.step_type == "plan"),
+                       key=lambda step: (step.created_at, step.step_id), reverse=True)
+        for step in plans:
+            output = self._safe_json_dict(step.output_json)
+            if output.get("strategy") == "keyword_fallback" or "planned_tool_calls" in output:
+                return False
+            if output.get("strategy") == "llm_function_calling":
+                return True
+            if self._load_request_payload(run).run_mode.strip().lower() == "workflow":
+                return False
+        return True
+
+    def _restore_execution_ledger(self, run: AgentRun, state: dict[str, Any], pending_call: AgentToolCall) -> ToolLoopLedger:
+        """Resume the same reservations, including pre-ledger approval records.
+
+        Legacy messages are execution transcripts, not instructions. Only paired
+        assistant/tool messages can establish consumed budget; an unmatched final
+        call must be the exact operation currently awaiting consent.
+        """
+        try:
+            budget = int(run.max_steps)
+            expected = self._tool_call_signature(pending_call.tool_name, pending_call.arguments)
+            messages = state.get("messages")
+            pending_id = state.get("pending_tool_call_id")
+            if not isinstance(messages, list) or not isinstance(pending_id, str) or not pending_id:
+                raise ValueError("Missing approval transcript.")
+            if "execution_ledger" in state:
+                ledger = ToolLoopLedger.from_state(state["execution_ledger"], budget=budget)
+            else:
+                ledger = ToolLoopLedger(budget=budget)
+                unresolved = []
+                for message in messages:
+                    if not isinstance(message, dict):
+                        raise ValueError("Invalid approval transcript.")
+                    if message.get("role") == "assistant" and message.get("tool_calls"):
+                        calls = message["tool_calls"]
+                        if not isinstance(calls, list):
+                            raise ValueError("Invalid historical tool calls.")
+                        for call in calls:
+                            name, args, error = self._parse_tool_proposal(call)
+                            raw_effective = self._enrich_tool_call(
+                                call=AgentToolCall(tool_name=name, arguments=args),
+                                space_id=run.space_id, task=run.task,
+                            ).arguments
+                            if not error:
+                                definition = self.tool_service.get_tool_definition(name)
+                                args = definition.normalize_arguments(args) if definition else args
+                                args = self._enrich_tool_call(
+                                    call=AgentToolCall(tool_name=name, arguments=args),
+                                    space_id=run.space_id, task=run.task,
+                                ).arguments
+                            signature = self._tool_call_signature(name, args)
+                            if str(call.get("id", "")) == pending_id and self._tool_call_signature(name, raw_effective) == expected:
+                                signature = expected
+                            if not ledger.reserve(signature):
+                                raise ValueError("Legacy approval exceeds the original budget.")
+                            unresolved.append((str(call.get("id", "")), signature))
+                    elif message.get("role") == "tool":
+                        match = next((i for i, item in enumerate(unresolved)
+                                      if item[0] == message.get("tool_call_id")), None)
+                        if match is None:
+                            raise ValueError("Unpaired historical tool result.")
+                        content = message.get("content")
+                        result = json.loads(content) if isinstance(content, str) else content
+                        if not isinstance(result, dict) or not ({"result", "error"} & set(result)):
+                            raise ValueError("Unverifiable historical result.")
+                        outcome = ("rejected" if result.get("rejected") else "failed") if "error" in result else (
+                            "skipped" if isinstance(result.get("result"), dict) and result["result"].get("dry_run") else
+                            "failed" if self._tool_value_failed(result.get("result")) else "completed")
+                        ledger.resolve(outcome)
+                        unresolved.pop(match)
+                if unresolved != [(pending_id, expected)]:
+                    raise ValueError("Legacy pending operation is ambiguous.")
+            if ledger.pending != 1 or not ledger.history or ledger.history[-1] != expected:
+                raise ValueError("Approval reservation does not match the current operation.")
+            # The checkpoint and the reviewed operation must name the same call.
+            last = messages[-1] if messages else None
+            calls = last.get("tool_calls") if isinstance(last, dict) and last.get("role") == "assistant" else None
+            if not isinstance(calls, list) or len(calls) != 1 or str(calls[0].get("id", "")) != pending_id:
+                raise ValueError("Approval call id does not match the checkpoint.")
+            name, args, error = self._parse_tool_proposal(calls[0])
+            raw_effective = self._enrich_tool_call(
+                call=AgentToolCall(tool_name=name, arguments=args),
+                space_id=run.space_id, task=run.task,
+            ).arguments
+            definition = self.tool_service.get_tool_definition(name)
+            args = definition.normalize_arguments(args) if definition else args
+            # Context enrichment (e.g. resolved space_id) is frozen in the
+            # reviewed call, so compare the effective arguments, not guesses.
+            normalized = self._enrich_tool_call(
+                call=AgentToolCall(tool_name=name, arguments=args),
+                space_id=run.space_id, task=run.task,
+            ).arguments
+            if error or expected not in {
+                self._tool_call_signature(name, normalized), self._tool_call_signature(name, raw_effective),
+            }:
+                raise ValueError("Approval arguments do not match the checkpoint.")
+            return ledger
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise DomainValidationError(
+                "本次待确认任务的工具预算记录不完整或已超出原预算，暂不执行。请取消后新建任务。"
+            ) from exc
 
     # ------------------------------------------------------------------
     # Fallback: keyword-based planning
@@ -1450,6 +1405,13 @@ class AgentService:
         """Run keyword fallback, persist final state, return final answer text."""
         payload = self._load_request_payload(run)
         planned_calls = self._plan_tool_calls(run.task, enabled_tools=payload.enabled_tools, space_id=space_id)
+        self._record_step(
+            run=run, step_index=self._next_step_index(run.run_id), step_type="plan",
+            title="Build execution plan (fallback)", status="completed",
+            input_payload={"task": run.task},
+            output_payload={"strategy": "keyword_fallback",
+                            "planned_tool_calls": [call.model_dump() for call in planned_calls]},
+        )
         tool_results, skipped_calls, tool_errors = [], [], []
         if planned_calls:
             step_index = self._next_step_index(run.run_id)
@@ -2106,10 +2068,11 @@ class AgentService:
                 break
         return count
 
-    def _save_loop_state(self, run: AgentRun, *, messages: list[dict[str, object]], pending_tool_call_id: str) -> None:
+    def _save_loop_state(self, run: AgentRun, *, messages: list[dict[str, object]], pending_tool_call_id: str, ledger: ToolLoopLedger | None = None) -> None:
         loop = {
             "messages": self._strip_non_serializable_messages(messages),
             "pending_tool_call_id": pending_tool_call_id,
+            **({"execution_ledger": ledger.to_state()} if ledger is not None else {}),
         }
         self.db.execute(
             update(AgentRun).where(AgentRun.run_id == run.run_id, AgentRun.status.not_in(("cancelled", "interrupted")))

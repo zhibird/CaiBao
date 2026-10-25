@@ -2,7 +2,7 @@ import {createSSEParser} from './companion-state.mjs';
 
 const ACTIVE = new Set(['queued', 'running']);
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'partial_success', 'interrupted']);
-export const runStatusLabel = status => ({queued:'排队中', running:'进行中', requires_confirmation:'等待确认', completed:'已完成', failed:'失败', cancelled:'已停止', partial_success:'部分完成', interrupted:'已中断'}[status] || '状态待核对');
+export const runStatusLabel = status => ({queued:'排队中', running:'进行中', requires_confirmation:'等待确认', completed:'已返回', failed:'失败', cancelled:'已停止', partial_success:'需核对', interrupted:'已中断'}[status] || '状态待核对');
 const empty = () => ({run:null, task:'', text:'', cursor:0, timeline:[], phase:'idle', recovered:false, error:null, blocked:false});
 const copy = state => ({...state, run:state.run ? {...state.run} : null, timeline:state.timeline.map(item => ({...item}))});
 

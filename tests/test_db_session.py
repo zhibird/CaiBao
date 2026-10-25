@@ -155,7 +155,7 @@ def test_ensure_phase1_columns_normalizes_legacy_agent_runs_table(tmp_path, monk
         engine.dispose()
 
     assert not {"current_step", "result_summary", "error_message", "updated_at"} & columns
-    assert {"final_answer", "dry_run", "request_payload_json", "completed_at"} <= columns
+    assert {"final_answer", "dry_run", "request_payload_json", "completed_at", "execution_receipt_json"} <= columns
     assert row_count == 2
 
 

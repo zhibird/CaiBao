@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.schemas.chat import ChatSource
+from app.services.execution_ledger import ExecutionStopReason
 
 
 class AgentRunRequest(BaseModel):
@@ -122,6 +123,67 @@ class AgentStepResponse(BaseModel):
         )
 
 
+class AgentExecutionReceipt(BaseModel):
+    """Public execution facts only; checkpoints and raw errors are private."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    version: Literal[1]
+    source: Literal["api_tool_loop"]
+    tool_budget: int = Field(ge=1, le=10)
+    tool_calls_used: int = Field(ge=0, le=10)
+    tool_calls_succeeded: int = Field(ge=0, le=10)
+    tool_calls_failed: int = Field(ge=0, le=10)
+    tool_calls_rejected: int = Field(ge=0, le=10)
+    tool_calls_skipped: int = Field(ge=0, le=10)
+    pending_tool_calls: int = Field(ge=0, le=10)
+    omitted_tool_calls: int = Field(ge=0)
+    stop_reason: ExecutionStopReason
+    incomplete: bool
+
+    @classmethod
+    def from_snapshot(cls, raw: str | None, *, run_status: str) -> "AgentExecutionReceipt | None":
+        """Read a public receipt safely and overlay authoritative terminal state.
+
+        A late worker must not turn cancellation/interruption into success. A
+        worker failure outside the tool loop may leave an in-progress receipt;
+        retain its counters but make that incomplete outcome explicit.
+        """
+        if not isinstance(raw, str) or not raw:
+            return None
+        try:
+            receipt = cls.model_validate(json.loads(raw))
+        except (ValueError, TypeError, RecursionError):
+            return None
+        if run_status in {"cancelled", "interrupted"}:
+            return receipt.model_copy(update={"stop_reason": run_status, "incomplete": True})
+        if run_status == "failed" and (
+            receipt.stop_reason in {"in_progress", "waiting_confirmation"} or not receipt.incomplete
+        ):
+            return receipt.model_copy(update={"stop_reason": "execution_error", "incomplete": True})
+        return receipt
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def _strict_version(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("Receipt version must be an integer.")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_accounting(self) -> "AgentExecutionReceipt":
+        resolved = self.tool_calls_succeeded + self.tool_calls_failed + self.tool_calls_rejected + self.tool_calls_skipped
+        if self.tool_calls_used > self.tool_budget or self.tool_calls_used != resolved + self.pending_tool_calls:
+            raise ValueError("Execution receipt counts are inconsistent.")
+        incomplete = bool(
+            self.tool_calls_failed or self.tool_calls_rejected or self.pending_tool_calls or self.omitted_tool_calls
+            or self.stop_reason not in {"model_finished", "tool_budget"}
+        )
+        if self.incomplete != incomplete:
+            raise ValueError("Execution receipt incomplete flag is inconsistent.")
+        return self
+
+
 class AgentRunResponse(BaseModel):
     run_id: str
     client_request_id: str | None = None
@@ -149,6 +211,7 @@ class AgentRunResponse(BaseModel):
     model_routes: dict[str, Any] | None = None
     execution_identity: dict[str, Any] | None = None
     context_snapshot: dict[str, Any] | None = None
+    execution_receipt: AgentExecutionReceipt | None = None
 
 
 class AgentRunListResponse(BaseModel):

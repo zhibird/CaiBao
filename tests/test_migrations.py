@@ -16,7 +16,7 @@ from sqlalchemy.schema import CreateColumn
 from app.db.base import Base
 from app.models import *  # noqa: F401,F403
 
-HEAD_REVISION = "20260601_00"
+HEAD_REVISION = "20260602_00"
 EXPECTED_TABLES = {
     "teams",
     "users",
@@ -198,6 +198,7 @@ def test_migration_removes_legacy_agent_run_required_columns(tmp_path) -> None:
         "model_routes_json",
         "execution_identity_json",
         "context_snapshot_json",
+        "execution_receipt_json",
         "latency_ms",
         "completed_at",
     } <= columns
@@ -249,6 +250,67 @@ def test_execution_identity_bootstrap_and_alembic_upgrade_can_share_columns(tmp_
         with engine.connect() as connection:
             columns = {column["name"] for column in inspect(connection).get_columns("agent_runs")}
         assert {"execution_identity_json", "context_snapshot_json"} <= columns
+        assert _current_revision(database_url) == HEAD_REVISION
+    finally:
+        engine.dispose()
+
+
+def test_execution_receipt_migration_preserves_runs_and_downgrades_cleanly(tmp_path) -> None:
+    database_url = _sqlite_database_url(tmp_path / "execution-receipt.db")
+    config = _make_alembic_config(database_url)
+    command.upgrade(config, "20260601_00")
+    engine = _create_engine(database_url)
+    try:
+        with engine.begin() as connection:
+            connection.execute(text(
+                "INSERT INTO agent_runs (run_id, team_id, user_id, task, request_payload_json) "
+                "VALUES ('existing', 'team', 'user', 'preserved task', '{}')"
+            ))
+        command.upgrade(config, "head")
+        with engine.begin() as connection:
+            row = connection.execute(text(
+                "SELECT task, execution_receipt_json FROM agent_runs WHERE run_id = 'existing'"
+            )).one()
+            assert row == ("preserved task", None)
+            columns = {column["name"]: column for column in inspect(connection).get_columns("agent_runs")}
+            assert columns["execution_receipt_json"]["nullable"] is True
+            connection.execute(text(
+                "UPDATE agent_runs SET execution_receipt_json = :receipt WHERE run_id = 'existing'"
+            ), {"receipt": '{"version":1,"source":"api_tool_loop"}'})
+        command.downgrade(config, "20260601_00")
+        with engine.connect() as connection:
+            columns = {column["name"] for column in inspect(connection).get_columns("agent_runs")}
+            assert "execution_receipt_json" not in columns
+            assert {"execution_identity_json", "context_snapshot_json"} <= columns
+            assert connection.execute(text("SELECT task FROM agent_runs WHERE run_id = 'existing'")).scalar_one() == "preserved task"
+        command.upgrade(config, "head")
+        command.upgrade(config, "head")
+        assert _current_revision(database_url) == HEAD_REVISION
+    finally:
+        engine.dispose()
+
+
+def test_execution_receipt_bootstrap_then_alembic_is_idempotent(tmp_path, monkeypatch) -> None:
+    import app.db.session as session_module
+
+    database_url = _sqlite_database_url(tmp_path / "bootstrap-receipt.db")
+    config = _make_alembic_config(database_url)
+    command.upgrade(config, "20260601_00")
+    engine = _create_engine(database_url)
+    try:
+        monkeypatch.setattr(session_module, "engine", engine)
+        session_module._ensure_phase1_columns()
+        with engine.begin() as connection:
+            connection.execute(text(
+                "INSERT INTO agent_runs (run_id, team_id, user_id, task, execution_receipt_json) "
+                "VALUES ('bootstrap', 'team', 'user', 'preserve receipt', :receipt)"
+            ), {"receipt": '{"version":1,"source":"api_tool_loop"}'})
+        session_module._ensure_phase1_columns()
+        command.upgrade(config, "head")
+        with engine.connect() as connection:
+            assert connection.execute(text(
+                "SELECT execution_receipt_json FROM agent_runs WHERE run_id = 'bootstrap'"
+            )).scalar_one() == '{"version":1,"source":"api_tool_loop"}'
         assert _current_revision(database_url) == HEAD_REVISION
     finally:
         engine.dispose()

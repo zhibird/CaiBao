@@ -2,6 +2,7 @@ import {initialState, reduceEvent, speechText} from './companion-state.mjs';
 import {CompanionRecovery, runStatusLabel} from './companion-recovery.mjs';
 import {CompanionMemory} from './companion-memory.mjs';
 import {executionSummary} from './companion-execution.mjs';
+import {receiptSummary} from './companion-receipt.mjs';
 import {CompanionVoice} from './companion-voice.mjs';
 
 const $ = id => document.getElementById(id);
@@ -190,7 +191,7 @@ const taskHint = snapshot => {
   if (snapshot.phase === 'waiting') return '等待你的确认，操作尚未执行。';
   if (snapshot.phase === 'running') return '正在处理，离开页面后也会继续。';
   if (!snapshot.run) return '没有任务的时候，发会儿呆也很好。';
-  return {completed:'这一件事，完成了。', partial_success:'有些步骤没完成，详情见回复。', failed:'执行遇到问题，详情见回复。', cancelled:'已停止后续步骤。已经开始的操作可能仍会结束。', interrupted:'运行中断，已保留结果；检查记录后再决定下一步。'}[snapshot.run.status] || snapshot.error || '任务记录已保留。';
+  return {completed:'这次回复已返回，请查看结果。', partial_success:'有些步骤没完成，详情见回复。', failed:'执行遇到问题，详情见回复。', cancelled:'已停止后续步骤。已经开始的操作可能仍会结束。', interrupted:'运行中断，已保留结果；检查记录后再决定下一步。'}[snapshot.run.status] || snapshot.error || '任务记录已保留。';
 };
 function renderTimeline(container, timeline, status) {
   container.replaceChildren();
@@ -212,6 +213,22 @@ function renderExecution(container, run) {
   const context = document.createElement('p'); context.className = 'execution-context'; context.textContent = summary.context;
   heading.append(label,identity); container.append(heading,context);
 }
+function renderReceipt(container, run) {
+  if (!run) {container.replaceChildren(); container.hidden = true; delete container.dataset.receipt; return;}
+  const summary = receiptSummary(run);
+  const key = JSON.stringify(summary);
+  if (!container.hidden && container.dataset.receipt === key) return;
+  container.replaceChildren(); container.hidden = false; container.dataset.receipt = key;
+  container.dataset.review = String(summary.needsReview);
+  const heading = document.createElement('div'); heading.className = 'receipt-heading';
+  const label = document.createElement('span'); label.className = 'execution-label'; label.textContent = '执行回执';
+  const usage = document.createElement('span'); usage.className = 'receipt-usage'; usage.textContent = summary.usage;
+  heading.append(label,usage); container.append(heading);
+  for (const [field,className] of [['outcomes','receipt-outcomes'],['pending','receipt-pending'],['ending','receipt-ending'],['note','receipt-note']]) {
+    if (!summary[field]) continue;
+    const line = document.createElement('p'); line.className = className; line.textContent = summary[field]; container.append(line);
+  }
+}
 function renderRun(snapshot) {
   currentRun = snapshot.run?.run_id || null;
   if (currentRun) {
@@ -224,7 +241,6 @@ function renderRun(snapshot) {
   if (currentContent && (snapshot.text || snapshot.phase === 'finished')) {
     currentContent.textContent = snapshot.text || snapshot.error || (snapshot.run?.status === 'cancelled' ? '任务已停止。' : '这次没有生成回复。');
     currentContent.parentElement.classList.toggle('error',['failed','partial_success','interrupted'].includes(snapshot.run?.status));
-    scrollMessages();
   }
   clearApproval();
   // Confirmation controls only use the authoritative GET run snapshot after
@@ -235,6 +251,7 @@ function renderRun(snapshot) {
   const hint = taskHint(snapshot);
   $('task-status').textContent = hint; $('run-connection').textContent = hint;
   renderExecution($('run-execution'),snapshot.run);
+  renderReceipt($('run-receipt'),snapshot.run);
   $('run-strip').hidden = snapshot.phase === 'idle';
   $('run-strip').dataset.phase = snapshot.phase;
   $('run-reconnect').hidden = !['unknown','reconnecting'].includes(snapshot.phase);
@@ -245,6 +262,9 @@ function renderRun(snapshot) {
   else if (snapshot.phase === 'finished' && snapshot.run) setState(reduceEvent(state,{event:snapshot.run.status === 'interrupted' ? 'run.interrupted' : snapshot.run.status === 'cancelled' ? 'run.cancelled' : 'run.completed',payload:snapshot.run}));
   else if (snapshot.lastEvent) setState(reduceEvent(state,snapshot.lastEvent));
   else if (snapshot.phase === 'running') setState({activity:'thinking',emotion:'focused',label:'接着做，进度还在'});
+  // The receipt changes the chat viewport height. Scroll only after all run
+  // details and visibility have settled so the returned reply stays visible.
+  if (currentContent && (snapshot.text || snapshot.phase === 'finished')) scrollMessages();
 }
 function renderTaskHistory(items) {
   $('history-count').textContent = items.length ? ` · ${items.length}` : '';
@@ -261,12 +281,13 @@ function renderTaskHistory(items) {
 async function inspectTask(runId) {
   voiceInput.cancel('history');
   const generation = ++previewGeneration; $('history-preview').hidden = false; $('history-answer').textContent = '正在读取记录…';
-  $('history-title').textContent = '读取任务记录'; $('history-state').textContent = ''; $('history-timeline').replaceChildren(); renderExecution($('history-execution'),null);
+  $('history-title').textContent = '读取任务记录'; $('history-state').textContent = ''; $('history-timeline').replaceChildren(); renderExecution($('history-execution'),null); renderReceipt($('history-receipt'),null);
   try {
     const preview = await controller.inspect(runId); if (generation !== previewGeneration) return;
     $('history-title').textContent = preview.task;
     $('history-state').textContent = `${runStatusLabel(preview.run.status)} · 只读记录`;
     renderExecution($('history-execution'),preview.run);
+    renderReceipt($('history-receipt'),preview.run);
     $('history-answer').textContent = preview.text || (preview.run.status === 'queued' ? '这个任务尚未启动。查看记录不会执行任务。' : '还没有回复，已保留执行记录。');
     renderTimeline($('history-timeline'),preview.timeline,preview.run.status);
     $('history-preview').scrollIntoView({block:'nearest'});
@@ -504,14 +525,22 @@ $('pet').addEventListener('pointermove', event => {
 });
 $('pet').addEventListener('pointerup', () => {pointerStart = null;});
 $('pet').addEventListener('click', () => {if (!dragged) interact('pet');});
-function compact(value) {voiceInput.cancel('compact'); document.body.classList.toggle('compact', value); native('mode',{compact:value});}
+function applyCompact(value) {
+  document.body.classList.toggle('compact', value);
+  // Recovery can finish while compact mode has no chat layout. Once expanded,
+  // wait for its viewport before restoring the latest reply's scroll position.
+  if (!value) requestAnimationFrame(() => {
+    if (!document.body.classList.contains('compact')) scrollMessages();
+  });
+}
+function compact(value) {voiceInput.cancel('compact'); applyCompact(value); native('mode',{compact:value});}
 $('native-hide').onclick = () => {voiceInput.cancel('hidden'); stopSpeech(); native('hide');};
 $('native-quit').onclick = () => {voiceInput.cancel('quit'); stopSpeech(); native('quit');};
 $('compact-open').onclick = () => compact(false); $('collapse').onclick = () => compact(true);
-window.addEventListener('caibao-native-mode', event => {voiceInput.cancel('compact'); document.body.classList.toggle('compact', Boolean(event.detail.compact));});
+window.addEventListener('caibao-native-mode', event => {voiceInput.cancel('compact'); applyCompact(Boolean(event.detail.compact));});
 window.addEventListener('caibao-native-ready', event => {
   window.caibaoNative = {...window.caibaoNative,...event.detail};
-  document.body.classList.add('desktop'); document.body.classList.toggle('compact', Boolean(event.detail.compact));
+  document.body.classList.add('desktop'); applyCompact(Boolean(event.detail.compact));
 });
 window.addEventListener('caibao-native-speech', event => showSpeaking(event.detail.state === 'start'));
 window.addEventListener('caibao-native-listen', event => voiceInput.handleNative(event.detail));

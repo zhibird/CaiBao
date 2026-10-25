@@ -79,7 +79,9 @@ def _run_hallucinated_tool(*, streaming, enabled_tools, dangerous=False):
     service.event_bus = None
     service._record_step = lambda **kwargs: None
     service._run_plugin_phase = lambda *args, **kwargs: None
-    service._finish_run = lambda **kwargs: None
+    finished = []
+    service._finish_run = lambda **kwargs: finished.append(kwargs)
+    service._next_step_index = lambda run_id: 50
     # A forbidden dangerous call must not even become an approvable pending call.
     service._save_pending_tool_call = lambda *args: pytest.fail("Forbidden tool queued for approval")
     messages = [{"role": "user", "content": "Just chat with me."}]
@@ -99,12 +101,16 @@ def _run_hallucinated_tool(*, streaming, enabled_tools, dangerous=False):
         dry_run=False,
         enabled_tools=enabled_tools,
     )
+    expected_status = "completed" if enabled_tools is None or "write_note" in {
+        item.strip().lower() for item in enabled_tools
+    } else "failed"
     if streaming:
         events = list(service._tool_loop_stream(**arguments, start_seq=0))
+        assert finished[-1]["status"] == expected_status
     else:
         answer, status, requires_confirmation = service._tool_loop(**arguments, step_index=1)
         assert answer == "Finished."
-        assert status == "completed"
+        assert status == expected_status
         assert requires_confirmation is False
         events = []
     return service, messages, events
@@ -120,7 +126,9 @@ def test_forbidden_hallucinated_tool_never_executes(streaming, enabled_tools, da
 
     assert service.tool_service.executed == []
     errors = [json.loads(item["content"]) for item in messages if item["role"] == "tool"]
-    assert errors == [{"error": "Tool 'write_note' is not enabled for this run."}]
+    assert len(errors) == 1
+    assert errors[0]["error"] == "Tool 'write_note' is not enabled for this run."
+    assert errors[0]["rejected"] is True
     assert not {event.event for event in events} & {"tool.started", "tool.result", "confirmation.required"}
 
 

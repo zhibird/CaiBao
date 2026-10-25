@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/framework-FastAPI-009688?logo=fastapi">
   <img src="https://img.shields.io/badge/db-PostgreSQL%20|%20SQLite-336791">
   <img src="https://img.shields.io/badge/deploy-Docker-2496ED?logo=docker">
-  <img src="https://img.shields.io/badge/version-0.32.0-success">
+  <img src="https://img.shields.io/badge/version-0.33.0-success">
 </p>
 
 ---
@@ -31,6 +31,7 @@ CaiBao（彩宝）是一只住在桌面上的薄荷绿小猫，也是一个可�
 - 🤖 **Agent App Builder** — 创建/配置/发布/调用，含版本快照
 - 🧠 **Function Calling 引擎** — 自实现 OpenAI 兼容 tool_calls 多轮循环
 - 📡 **可恢复任务** — 后台执行与持久 SSE 事件，断线接回文字、工具进度与审批；任务历史只读查看
+- 🧾 **执行回执** — API 工具整轮共用预算，审批不重置次数；失败、拒绝与未执行提议如实记录
 - 📚 **RAG 知识库** — 上传 PDF/Word/Excel/图片，Agent 回答带来源追溯
 - 🔧 **工具注册表** — 内置 + MCP 协议 + 插件，统一管理权限和危险等级
 - 🔒 **安全边界** — 危险操作需确认 + dry_run 预览 + max_tool_calls 预算
@@ -163,6 +164,7 @@ python scripts/agent_eval.py --base-url http://127.0.0.1:8000 \
 
 ## 近期更新
 
+- **v0.33.0** — 可信执行回执、整轮工具预算与审批续接收敛；[执行说明](docs/agent-execution-receipts.md) · [更新日志](changelogs/0.33.0.md)
 - **v0.32.0** — 原生设备端语音回合，识别先进入草稿，确认发送后再执行；[语音说明](docs/companion-voice.md) · [更新日志](changelogs/0.32.0.md)
 - **v0.31.0** — 跨 API／CLI 对话衔接、真实运行身份、有界上下文与会话互斥；[连续性设计](docs/backend-continuity.md) · [更新日志](changelogs/0.31.0.md)
 - **v0.30.0** — 桌宠记忆小本、明确保存和更正、背景文本编辑与并发保护；[记忆使用说明](docs/companion-memory.md) · [更新日志](changelogs/0.30.0.md)

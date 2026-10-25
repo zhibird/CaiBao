@@ -443,15 +443,13 @@ class LLMService:
     ) -> list[dict[str, object]]:
         """After streaming ends, build final tool_calls from accumulated deltas."""
         result: list[dict[str, object]] = []
-        seen: list[tuple[int, str, dict[str, object]]] = []
+        seen: list[tuple[int, str, str]] = []
         for key, idx in ordered_indices.items():
             name = accumulated_names.get(key, "")
             args_str = accumulated_args.get(key, "")
-            try:
-                args = __import__("json").loads(args_str)
-            except (TypeError, ValueError):
-                args = {}
-            seen.append((idx, name, args))
+            # Preserve the provider's JSON string exactly. The execution gate
+            # must distinguish malformed JSON and non-object JSON from {}.
+            seen.append((idx, name, args_str))
         seen.sort(key=lambda x: x[0])
 
         # Build ids matching index-based convention.
@@ -459,14 +457,13 @@ class LLMService:
         # puts these tool_calls back into messages[], and OpenAI-compatible
         # providers require function.arguments to be a JSON string.
         import uuid
-        import json as _json2
         for _, name, args in seen:
             tool_call: dict[str, object] = {
                 "id": f"call_{uuid.uuid4().hex[:12]}",
                 "type": "function",
                 "function": {
                     "name": name,
-                    "arguments": _json2.dumps(args, ensure_ascii=False),
+                    "arguments": args,
                 },
             }
             if reasoning_content:
