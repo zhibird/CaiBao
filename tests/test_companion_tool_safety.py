@@ -175,7 +175,9 @@ def test_companion_history_survives_reload_and_enters_next_turn(client):
         messages = service._build_agent_conversation_messages(
             team_id=team_id, user_id=user_id, conversation_id=conversation_id,
         )
-        assert messages == [
+    assert messages[0]["role"] == "system"
+    assert "Past conversation" in messages[0]["content"]
+    assert messages[1:] == [
             {"role": "user", "content": "请记得我喜欢薄荷绿。"},
             {"role": "assistant", "content": "嗯，薄荷绿。"},
         ]

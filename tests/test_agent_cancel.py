@@ -245,8 +245,7 @@ def test_second_stream_does_not_execute_or_claim_a_running_run_completed(client,
     with SessionLocal() as db:
         service = _minimal_service(db)
         service.document_service = SimpleNamespace(resolve_space_id=lambda **kwargs: None)
-        service._resolve_routes = lambda **kwargs: {}
-        service._persist_routes = lambda *args: None
+        service._prepare_execution = lambda *args: {}
         first_stream = service.stream_run(run_id)
         assert next(first_stream).event == "run.started"
         second_stream = client.get(f"/api/v1{stream_url}")

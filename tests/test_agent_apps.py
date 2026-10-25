@@ -2,6 +2,7 @@ from uuid import uuid4
 
 from app.db.session import SessionLocal
 from app.models.incident import Incident
+from app.models.agent_run_worker import AgentRunWorker
 from tests.auth_helpers import register_workspace_user
 
 
@@ -73,6 +74,8 @@ def test_agent_app_crud_publish_and_invoke_plain_question(client) -> None:
     assert body["trigger_channel"] == "app"
     assert body["status"] == "completed"
     assert [step["step_type"] for step in body["steps"]] == ["plan", "retrieval", "final"]
+    with SessionLocal() as db:
+        assert db.get(AgentRunWorker, body["run_id"]).state == "finished"
 
 
 def test_agent_app_blocks_dangerous_tool_until_confirmed(client) -> None:

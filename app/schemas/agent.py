@@ -147,6 +147,8 @@ class AgentRunResponse(BaseModel):
     created_at: datetime
     completed_at: datetime | None = None
     model_routes: dict[str, Any] | None = None
+    execution_identity: dict[str, Any] | None = None
+    context_snapshot: dict[str, Any] | None = None
 
 
 class AgentRunListResponse(BaseModel):

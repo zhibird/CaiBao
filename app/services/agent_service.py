@@ -40,9 +40,12 @@ from app.services.chat_history_service import ChatHistoryService
 from app.services.cli_agent_service import (
     CLI_AGENT_MODES,
     create_cli_agent_runner,
-    load_cli_session_id,
     resolve_cli_workspace,
-    save_cli_session_id,
+)
+from app.services.cli_session_store import CliSessionStore
+from app.services.conversation_context import build_conversation_context, render_cli_context
+from app.services.execution_identity import (
+    build_api_execution_identity, build_cli_execution_identity, safe_execution_endpoint,
 )
 from app.services.document_service import DocumentService
 from app.services.llm_model_service import LLMModelService
@@ -80,6 +83,7 @@ class AgentService:
         event_bus: EventBus | None = None,
         memory_store: MemoryMarkdownStore | None = None,
         plugin_manager=None,  # optional PluginManager
+        run_runtime=None,
     ) -> None:
         self.db = db
         self.user_service = user_service
@@ -93,6 +97,8 @@ class AgentService:
         self.memory_store = memory_store
         self.persona_prompt_builder = PersonaPromptBuilder(memory_store=memory_store)
         self.plugin_manager = plugin_manager
+        self.run_runtime = run_runtime
+        self._frozen_cli_settings = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -158,6 +164,27 @@ class AgentService:
         """Synchronous run (backward-compatible)."""
         if payload.client_request_id is not None:
             raise DomainValidationError("client_request_id requires the queued /agent/runs interface.")
+        if getattr(self, "run_runtime", None) is not None:
+            admitted = self.start(payload)
+            record = self.db.get(AgentRun, admitted.run_id)
+            # Preserve the synchronous model protocol while moving ownership
+            # to the same worker/lease as streaming entry points. This marker
+            # is written internally, never accepted from request extra fields.
+            saved = self._safe_json_dict(record.request_payload_json)
+            saved["_completion_mode"] = "synchronous"
+            record.request_payload_json = self._to_json(saved)
+            self.db.commit()
+            try:
+                self.run_runtime.ensure_started(admitted.run_id)
+            except DomainValidationError:
+                # A synchronous caller has not received a run ID yet. Leave no
+                # hidden queued job which could execute after the rejection.
+                self.cancel_run(run_id=admitted.run_id, team_id=payload.team_id, user_id=payload.user_id)
+                raise
+            for _event in self.run_runtime.iter_events(admitted.run_id):
+                pass
+            self.db.expire_all()
+            return self.get_run(run_id=admitted.run_id, team_id=payload.team_id, user_id=payload.user_id)
         team_id, user_id = self._require_identity(payload.team_id, payload.user_id)
         self.user_service.ensure_user_in_team(user_id=user_id, team_id=team_id)
         self._validate_run_mode(payload.run_mode)
@@ -169,8 +196,7 @@ class AgentService:
         )
         started = time.perf_counter()
         run = self._create_run(payload=payload, team_id=team_id, user_id=user_id, space_id=effective_space_id)
-        routes = self._resolve_routes(team_id=team_id, user_id=user_id, payload=payload)
-        self._persist_routes(run, routes)
+        routes = self._prepare_execution(run, payload)
 
         if self.event_bus:
             self.event_bus.emit(TurnStarted(
@@ -232,8 +258,7 @@ class AgentService:
             space_id=run.space_id,
             user_id=user_id,
         )
-        routes = self._resolve_routes(team_id=team_id, user_id=user_id, payload=payload)
-        self._persist_routes(run, routes)
+        routes = self._prepare_execution(run, payload)
 
         seq = 0
         yield AgentStreamEvent(
@@ -273,6 +298,12 @@ class AgentService:
                     run=run, payload=payload, team_id=team_id, user_id=user_id,
                     space_id=effective_space_id, started=started, stream_sink=True,
                 )
+            elif self._safe_json_dict(run.request_payload_json).get("_completion_mode") == "synchronous":
+                response = self._run_agent_auto_tool_loop(
+                    run=run, payload=payload, team_id=team_id, user_id=user_id,
+                    space_id=effective_space_id, started=started, routes=routes,
+                )
+                self._record_agent_history(payload=payload, response=response)
             else:
                 gen = self._run_agent_auto_tool_loop_stream(
                     run=run, payload=payload, team_id=team_id, user_id=user_id,
@@ -358,6 +389,15 @@ class AgentService:
             raise DomainValidationError("This approval has changed. Review the current operation before confirming.")
 
         loop_state = self._load_loop_state(run)
+        real_routes = None
+        if loop_state is not None:
+            payload = self._load_request_payload(run)
+            real_routes = self._resolve_routes(team_id=team_id, user_id=user_id, payload=payload)
+            frozen = self._safe_json_dict(run.execution_identity_json) if run.execution_identity_json else {}
+            if frozen and frozen.get("binding") != self._api_execution_identity(real_routes, payload).get("binding"):
+                raise DomainValidationError(
+                    "本次任务的模型或连接配置已变化。请恢复原配置，或取消后新建任务；不会用另一个模型继续这次授权。"
+                )
         claimed = self.db.execute(
             update(AgentRun).where(
                 AgentRun.run_id == run_id, AgentRun.status == "requires_confirmation",
@@ -388,9 +428,9 @@ class AgentService:
 
         started = time.perf_counter()
 
-        # Re-resolve real routes (DB persisted snapshot is masked; we need live keys).
+        # The live credentials were resolved and checked before claiming this
+        # exact approval. Keep that one route object for the continuation.
         payload = self._load_request_payload(run)
-        real_routes = self._resolve_routes(team_id=team_id, user_id=user_id, payload=payload)
         planner = self._routes_to_planner_dict(real_routes)
 
         # Execute the pending tool call
@@ -553,6 +593,8 @@ class AgentService:
         return AgentRunResponse(
             run_id=run.run_id, team_id=run.team_id, user_id=run.user_id,
             client_request_id=run.client_request_id, approval_token=self._approval_token(run),
+            execution_identity=self._safe_json_dict(run.execution_identity_json) if run.execution_identity_json else None,
+            context_snapshot=self._safe_json_dict(run.context_snapshot_json) if run.context_snapshot_json else None,
             conversation_id=run.conversation_id, space_id=run.space_id,
             app_id=run.app_id, app_version=run.app_version,
             trigger_channel=run.trigger_channel, task=run.task,
@@ -671,6 +713,7 @@ class AgentService:
             conversation_id=payload.conversation_id,
             include_memory=payload.include_memory,
             channel=payload.trigger_channel,
+            run=run,
         )
         tools = self._build_tools(payload=payload, run=run)
 
@@ -780,6 +823,7 @@ class AgentService:
             conversation_id=payload.conversation_id,
             include_memory=payload.include_memory,
             channel=payload.trigger_channel,
+            run=run,
         )
         tools = self._build_tools(payload=payload, run=run)
 
@@ -1473,7 +1517,7 @@ class AgentService:
         space_id: str | None,
         started: float,
     ) -> Iterator[AgentStreamEvent]:
-        settings = get_settings()
+        settings = self._frozen_cli_settings or get_settings().model_copy(deep=True)
         if not settings.cli_agent_enabled:
             raise DomainValidationError(
                 "CLI agent 后端未启用，请在服务端设置 CLI_AGENT_ENABLED=true 后重启。"
@@ -1485,160 +1529,190 @@ class AgentService:
             settings, team_id=team_id,
             conversation_id=payload.conversation_id, run_id=run.run_id,
         )
-        resume_session_id = (
-            load_cli_session_id(workdir, runner.name) if payload.conversation_id else None
+        identity = self._safe_json_dict(run.execution_identity_json) if run.execution_identity_json else build_cli_execution_identity(
+            settings, mode, system_prompt=payload.system_prompt or "", requested_model=payload.model, dry_run=payload.dry_run,
         )
+        session_store = CliSessionStore(workdir)
+        dispatch = session_store.begin_dispatch(runner.name, identity["binding"], run_id=run.run_id)
+        resume_session_id = dispatch.resume_session_id
         max_output = max(200, int(settings.cli_agent_max_step_output_chars))
 
-        seq = 0
-
-        def _event(name: str, step_index: int | None, data: dict[str, object]) -> AgentStreamEvent:
-            nonlocal seq
-            seq += 1
-            return AgentStreamEvent(
-                event=name, run_id=run.run_id, step_index=step_index, seq=seq, payload=data,
-            )
-
-        yield _event("step.started", 1, {
-            "step_type": "plan",
-            "title": f"委派 {runner.display_name} 执行",
-        })
-        self._record_step(
-            run=run, step_index=1, step_type="plan",
-            title=f"委派 {runner.display_name} 执行", status="completed",
-            input_payload={
-                "task": payload.task, "run_mode": mode,
-                "workdir": str(workdir), "resume_session": bool(resume_session_id),
-            },
-            output_payload={"strategy": "cli_agent", "runner": runner.name},
-        )
-
-        answer_parts: list[str] = []
-        session_id = resume_session_id or ""
-        step_index = 2  # 工具步骤从 3 开始，与内置循环保持一致
-        open_tools: dict[str, tuple[str, dict[str, object], int, float]] = {}
-        tool_order: list[str] = []
-        result_ok: bool | None = None
-        result_text = ""
-        error_text = ""
-
-        cli_events = runner.run(
-            task=payload.task,
-            system_prompt=payload.system_prompt or "",
-            workdir=workdir,
-            resume_session_id=resume_session_id,
-            dry_run=payload.dry_run,
-        )
         try:
-            for cli_event in cli_events:
-                if cli_event.kind == "session":
-                    session_id = cli_event.session_id or session_id
-                    # 立即落盘：客户端中途断开（GeneratorExit）时循环后的保存不会执行，
-                    # 不即时保存会静默丢失多轮续接。
-                    if session_id and payload.conversation_id:
-                        save_cli_session_id(workdir, runner.name, session_id)
-                elif cli_event.kind == "text":
-                    if cli_event.text:
-                        answer_parts.append(cli_event.text)
-                        yield _event("llm.delta", None, {"text": cli_event.text})
-                elif cli_event.kind == "tool_use":
-                    step_index += 1
-                    key = cli_event.tool_id or f"auto-{step_index}"
-                    open_tools[key] = (
-                        cli_event.tool_name, cli_event.tool_input, step_index, time.perf_counter(),
-                    )
-                    tool_order.append(key)
-                    yield _event("tool.started", step_index, {"tool_name": cli_event.tool_name})
-                elif cli_event.kind == "tool_result":
-                    key = cli_event.tool_id if cli_event.tool_id in open_tools else (
-                        tool_order[0] if tool_order else ""
-                    )
-                    tool_name, tool_input, tool_step, tool_started = open_tools.pop(
-                        key, ("tool", {}, step_index, time.perf_counter()),
-                    )
-                    if key in tool_order:
-                        tool_order.remove(key)
-                    output_text = self._truncate_cli_text(cli_event.tool_output, max_output)
-                    self._record_step(
-                        run=run, step_index=tool_step, step_type="tool_call",
-                        title=f"{runner.display_name}: {tool_name}",
-                        status="completed" if cli_event.ok else "failed",
-                        tool_name=tool_name[:64],
-                        input_payload={"arguments": self._truncate_cli_payload(tool_input, max_output)},
-                        output_payload={"result": output_text},
-                        latency_ms=self._elapsed_ms(tool_started),
-                    )
-                    yield _event("tool.result", tool_step, {
-                        "tool_name": tool_name, "result": output_text,
-                    })
-                elif cli_event.kind == "warning":
-                    if cli_event.text:
-                        self._record_step(
-                            run=run, step_index=step_index + 1, step_type="observation",
-                            title=f"{runner.display_name} 提示", status="completed",
-                            input_payload={},
-                            output_payload={"message": self._truncate_cli_text(cli_event.text, max_output)},
-                        )
-                        step_index += 1
-                elif cli_event.kind == "result":
-                    result_ok = cli_event.ok
-                    result_text = cli_event.text
-                    session_id = cli_event.session_id or session_id
-                elif cli_event.kind == "error":
-                    result_ok = False
-                    error_text = cli_event.text
-        finally:
-            cli_events.close()
-
-        # 仍未闭合的工具调用（CLI 提前结束 / 超时被杀）补记为 skipped，
-        # 使持久化轨迹与流式事件对齐。
-        for key in list(tool_order):
-            tool_name, tool_input, tool_step, tool_started = open_tools.pop(key)
-            self._record_step(
-                run=run, step_index=tool_step, step_type="tool_call",
-                title=f"{runner.display_name}: {tool_name}", status="skipped",
-                tool_name=tool_name[:64],
-                input_payload={"arguments": self._truncate_cli_payload(tool_input, max_output)},
-                output_payload={"result": "未收到工具结果（CLI 已结束）"},
-                latency_ms=self._elapsed_ms(tool_started),
+            items = self._conversation_history(team_id=team_id, user_id=user_id, conversation_id=payload.conversation_id)
+            seen_messages, native_runs = set(dispatch.consumed_message_ids), set(dispatch.native_run_ids)
+            fresh_items = [item for item in items if (
+                str(getattr(item, "message_id", "")) not in seen_messages
+                and self._safe_json_dict(getattr(item, "response_payload_json", "{}")).get("run_id") not in native_runs
+            )]
+            context = build_conversation_context(
+                fresh_items, max_turns=max(0, int(settings.llm_history_turns)), max_chars=settings.agent_context_max_chars,
             )
-        tool_order.clear()
+            cli_context = render_cli_context(context)
+            self._record_context_snapshot(
+                run, context, continuity="native_resume" if resume_session_id else "fresh",
+                reset_reason=dispatch.fresh_reason, native_checkpoint=False,
+            )
+            effective_task = (cli_context.text + "\n\n" if cli_context.text else "") + payload.task
+            seq = 0
 
-        if session_id and payload.conversation_id:
-            save_cli_session_id(workdir, runner.name, session_id)
+            def _event(name: str, step_index: int | None, data: dict[str, object]) -> AgentStreamEvent:
+                nonlocal seq
+                seq += 1
+                return AgentStreamEvent(
+                    event=name, run_id=run.run_id, step_index=step_index, seq=seq, payload=data,
+                )
 
-        final_answer = (result_text or "").strip() or "".join(answer_parts).strip()
-        final_index = step_index + 50
+            yield _event("step.started", 1, {
+                "step_type": "plan",
+                "title": f"委派 {runner.display_name} 执行",
+            })
+            self._record_step(
+                run=run, step_index=1, step_type="plan",
+                title=f"委派 {runner.display_name} 执行", status="completed",
+                input_payload={
+                    "task": payload.task, "run_mode": mode,
+                    "workdir": str(workdir), "resume_session": bool(resume_session_id),
+                },
+                output_payload={"strategy": "cli_agent", "runner": runner.name},
+            )
 
-        if result_ok is False:
-            detail = (error_text or result_text or f"{runner.display_name} 执行失败").strip()
-            if not final_answer:
-                final_answer = detail
+            answer_parts: list[str] = []
+            session_id = resume_session_id or ""
+            step_index = 2  # 工具步骤从 3 开始，与内置循环保持一致
+            open_tools: dict[str, tuple[str, dict[str, object], int, float]] = {}
+            tool_order: list[str] = []
+            result_ok: bool | None = None
+            result_text = ""
+            error_text = ""
+
+            cli_events = runner.run(
+                task=effective_task,
+                system_prompt=payload.system_prompt or "",
+                workdir=workdir,
+                resume_session_id=resume_session_id,
+                dry_run=payload.dry_run,
+            )
+            try:
+                for cli_event in cli_events:
+                    if cli_event.kind == "session":
+                        session_id = cli_event.session_id or session_id
+                        # A session exists, but no completed delivery receipt
+                        # exists until the CLI returns a successful result.
+                        if cli_event.session_id:
+                            session_store.note_session(dispatch, cli_event.session_id)
+                    elif cli_event.kind == "text":
+                        if cli_event.text:
+                            answer_parts.append(cli_event.text)
+                            yield _event("llm.delta", None, {"text": cli_event.text})
+                    elif cli_event.kind == "tool_use":
+                        step_index += 1
+                        key = cli_event.tool_id or f"auto-{step_index}"
+                        open_tools[key] = (
+                            cli_event.tool_name, cli_event.tool_input, step_index, time.perf_counter(),
+                        )
+                        tool_order.append(key)
+                        yield _event("tool.started", step_index, {"tool_name": cli_event.tool_name})
+                    elif cli_event.kind == "tool_result":
+                        key = cli_event.tool_id if cli_event.tool_id in open_tools else (
+                            tool_order[0] if tool_order else ""
+                        )
+                        tool_name, tool_input, tool_step, tool_started = open_tools.pop(
+                            key, ("tool", {}, step_index, time.perf_counter()),
+                        )
+                        if key in tool_order:
+                            tool_order.remove(key)
+                        output_text = self._truncate_cli_text(cli_event.tool_output, max_output)
+                        self._record_step(
+                            run=run, step_index=tool_step, step_type="tool_call",
+                            title=f"{runner.display_name}: {tool_name}",
+                            status="completed" if cli_event.ok else "failed",
+                            tool_name=tool_name[:64],
+                            input_payload={"arguments": self._truncate_cli_payload(tool_input, max_output)},
+                            output_payload={"result": output_text},
+                            latency_ms=self._elapsed_ms(tool_started),
+                        )
+                        yield _event("tool.result", tool_step, {
+                            "tool_name": tool_name, "result": output_text,
+                        })
+                    elif cli_event.kind == "warning":
+                        if cli_event.text:
+                            self._record_step(
+                                run=run, step_index=step_index + 1, step_type="observation",
+                                title=f"{runner.display_name} 提示", status="completed",
+                                input_payload={},
+                                output_payload={"message": self._truncate_cli_text(cli_event.text, max_output)},
+                            )
+                            step_index += 1
+                    elif cli_event.kind == "result":
+                        result_ok = cli_event.ok
+                        result_text = cli_event.text
+                        session_id = cli_event.session_id or session_id
+                        if cli_event.session_id:
+                            session_store.note_session(dispatch, cli_event.session_id)
+                    elif cli_event.kind == "error":
+                        result_ok = False
+                        error_text = cli_event.text
+            finally:
+                cli_events.close()
+
+            # 仍未闭合的工具调用（CLI 提前结束 / 超时被杀）补记为 skipped，
+            # 使持久化轨迹与流式事件对齐。
+            for key in list(tool_order):
+                tool_name, tool_input, tool_step, tool_started = open_tools.pop(key)
+                self._record_step(
+                    run=run, step_index=tool_step, step_type="tool_call",
+                    title=f"{runner.display_name}: {tool_name}", status="skipped",
+                    tool_name=tool_name[:64],
+                    input_payload={"arguments": self._truncate_cli_payload(tool_input, max_output)},
+                    output_payload={"result": "未收到工具结果（CLI 已结束）"},
+                    latency_ms=self._elapsed_ms(tool_started),
+                )
+            tool_order.clear()
+
+            final_answer = (result_text or "").strip() or "".join(answer_parts).strip()
+            final_index = step_index + 50
+
+            if result_ok is not True:
+                detail = (error_text or result_text or f"{runner.display_name} 未返回可确认完成的结果").strip()
+                if not final_answer:
+                    final_answer = detail
+                self._record_step(
+                    run=run, step_index=final_index, step_type="final",
+                    title=f"{runner.display_name} 执行失败", status="failed",
+                    input_payload={"task": payload.task},
+                    output_payload={"error": self._truncate_cli_text(detail, max_output)},
+                    error_message=detail[:500],
+                )
+                self._finish_run(run=run, status="failed", final_answer=final_answer,
+                                 required_confirmations=[], started=started)
+                yield _event("run.failed", None, {"error": self._truncate_cli_text(detail, max_output)})
+                return
+
+            if self._is_run_cancelled(run):
+                return
+            checkpoint = session_store.commit_success(
+                dispatch, message_ids=cli_context.selected_ids,
+                history_boundary=cli_context.selected_ids[-1] if cli_context.selected_ids else None,
+            )
+            self._record_context_snapshot(
+                run, context, continuity="native_resume" if resume_session_id else "fresh",
+                reset_reason=dispatch.fresh_reason, native_checkpoint=checkpoint,
+            )
+            status = "completed"
             self._record_step(
                 run=run, step_index=final_index, step_type="final",
-                title=f"{runner.display_name} 执行失败", status="failed",
+                title="Summarize result", status=status,
                 input_payload={"task": payload.task},
-                output_payload={"error": self._truncate_cli_text(detail, max_output)},
-                error_message=detail[:500],
+                output_payload={"answer": final_answer, "status": status, "cli_session_id": session_id},
             )
-            self._finish_run(run=run, status="failed", final_answer=final_answer,
+            yield _event("step.completed", final_index, {"answer": final_answer})
+            self._run_plugin_phase("AfterReasoning", run.run_id, team_id, user_id, space_id,
+                                   run=run, final_answer=final_answer)
+            self._finish_run(run=run, status=status, final_answer=final_answer,
                              required_confirmations=[], started=started)
-            yield _event("run.failed", None, {"error": self._truncate_cli_text(detail, max_output)})
-            return
-
-        status = "completed"
-        self._record_step(
-            run=run, step_index=final_index, step_type="final",
-            title="Summarize result", status=status,
-            input_payload={"task": payload.task},
-            output_payload={"answer": final_answer, "status": status, "cli_session_id": session_id},
-        )
-        yield _event("step.completed", final_index, {"answer": final_answer})
-        self._run_plugin_phase("AfterReasoning", run.run_id, team_id, user_id, space_id,
-                               run=run, final_answer=final_answer)
-        self._finish_run(run=run, status=status, final_answer=final_answer,
-                         required_confirmations=[], started=started)
-        self._run_plugin_phase("AfterTurn", run.run_id, team_id, user_id, space_id, run=run)
+            self._run_plugin_phase("AfterTurn", run.run_id, team_id, user_id, space_id, run=run)
+        finally:
+            dispatch.close()
 
     @staticmethod
     def _truncate_cli_text(text: str, max_chars: int) -> str:
@@ -1818,6 +1892,7 @@ class AgentService:
         conversation_id: str | None = None,
         include_memory: bool = True,
         channel: str | None = None,
+        run: AgentRun | None = None,
     ) -> list[dict[str, object]]:
         persona = self.persona_prompt_builder.build(
             system_prompt=system_prompt,
@@ -1827,11 +1902,12 @@ class AgentService:
         )
 
         time_envelope = build_current_message_time_envelope()
-        history_messages = self._build_agent_conversation_messages(
-            team_id=team_id,
-            user_id=user_id,
-            conversation_id=conversation_id,
-        )
+        history = self._conversation_context(self._conversation_history(
+            team_id=team_id, user_id=user_id, conversation_id=conversation_id,
+        ))
+        history_messages = history.messages
+        if run is not None:
+            self._record_context_snapshot(run, history, continuity="api_history")
         messages: list[dict[str, object]] = [
             {"role": "system", "content": persona.system_prompt},
         ]
@@ -1844,37 +1920,43 @@ class AgentService:
         messages.append({"role": "user", "content": f"{time_envelope}\n{task}"})
         return messages
 
-    def _build_agent_conversation_messages(
-        self,
-        *,
-        team_id: str,
-        user_id: str,
-        conversation_id: str | None,
-    ) -> list[dict[str, object]]:
-        history_turns = max(0, int(self.llm_service.settings.llm_history_turns))
-        if not team_id or not user_id or conversation_id is None or history_turns < 1:
+    def _conversation_history(self, *, team_id: str, user_id: str, conversation_id: str | None):
+        if not team_id or not user_id or not conversation_id or self.llm_service.settings.llm_history_turns < 1:
             return []
-
-        history_items = self.chat_history_service.list_messages_for_context(
-            team_id=team_id,
-            user_id=user_id,
-            conversation_id=conversation_id,
-            limit=history_turns,
+        # Fetch a bounded formal history before applying mode-specific receipts.
+        # Never use a timestamp alone to skip equal-time messages.
+        return self.chat_history_service.list_messages_for_context(
+            team_id=team_id, user_id=user_id, conversation_id=conversation_id, limit=100,
         )
 
-        messages: list[dict[str, object]] = []
-        for item in history_items:
-            channel = str(getattr(item, "channel", "")).strip().lower()
-            if channel not in {"ask", "echo", "agent", "app", "qqbot", "companion"}:
-                continue
+    def _conversation_context(self, items):
+        settings = self.llm_service.settings
+        return build_conversation_context(
+            items, max_turns=max(0, int(settings.llm_history_turns)),
+            max_chars=int(getattr(settings, "agent_context_max_chars", 24000)),
+        )
 
-            request_text = str(getattr(item, "request_text", "")).strip()
-            response_text = str(getattr(item, "response_text", "")).strip()
-            if request_text:
-                messages.append({"role": "user", "content": request_text[:4000]})
-            if response_text:
-                messages.append({"role": "assistant", "content": response_text[:6000]})
-        return messages
+    def _build_agent_conversation_messages(
+        self, *, team_id: str, user_id: str, conversation_id: str | None,
+    ) -> list[dict[str, object]]:
+        return list(self._conversation_context(self._conversation_history(
+            team_id=team_id, user_id=user_id, conversation_id=conversation_id,
+        )).messages)
+
+    def _record_context_snapshot(self, run: AgentRun, context, *, continuity: str,
+                                 reset_reason: str | None = None, **extra) -> None:
+        snapshot = {
+            "version": 1, "source": "caibao.chat_history",
+            "selected_message_ids": list(context.selected_ids),
+            "selected_count": len(context.selected_ids), "omitted_count": context.omitted_count,
+            "truncated_count": context.truncated_count, "excluded_count": context.excluded_count,
+            "history_enabled": self.llm_service.settings.llm_history_turns > 0,
+            "max_chars": context.max_chars, "continuity": continuity,
+            "reset_reason": reset_reason, **extra,
+        }
+        run.context_snapshot_json = self._to_json(snapshot)
+        self.db.add(run)
+        self.db.commit()
 
     def _build_tools(
         self,
@@ -1904,6 +1986,34 @@ class AgentService:
             explicit_routes=payload.model_routes,
         )
 
+    def _prepare_execution(self, run: AgentRun, payload: AgentRunRequest) -> dict[str, object]:
+        mode = payload.run_mode.strip().lower()
+        if mode in CLI_AGENT_MODES:
+            # Freeze one settings object for identity, session binding and the
+            # actual command. API routing does not participate in CLI dispatch.
+            self._frozen_cli_settings = get_settings().model_copy(deep=True)
+            identity = build_cli_execution_identity(
+                self._frozen_cli_settings, mode, system_prompt=payload.system_prompt or "",
+                requested_model=payload.model, dry_run=payload.dry_run,
+            )
+            run.model_routes_json = None
+            routes = {}
+        else:
+            routes = self._resolve_routes(team_id=run.team_id, user_id=run.user_id, payload=payload)
+            identity = self._api_execution_identity(routes, payload)
+            self._persist_routes(run, routes)
+        run.execution_identity_json = self._to_json(identity)
+        run.model = identity.get("model")
+        self.db.add(run)
+        self.db.commit()
+        self.db.refresh(run)
+        return routes
+
+    def _api_execution_identity(self, routes: dict[str, object], payload: AgentRunRequest) -> dict[str, object]:
+        planner = self._routes_to_planner_dict(routes)
+        provider = "openai_compatible" if planner["base_url"] else self.llm_service.settings.llm_provider
+        return build_api_execution_identity(routes, requested_model=payload.model, provider=provider)
+
     @staticmethod
     def _routes_to_planner_dict(routes: dict[str, object]) -> dict[str, str]:
         """Extract {base_url, api_key, model_name} from a ModelRoute planner for _tool_loop."""
@@ -1927,6 +2037,9 @@ class AgentService:
     def _persist_routes(self, run: AgentRun, routes: dict[str, object]) -> None:
         """Persist masked routes snapshot (no raw API keys) to DB."""
         snapshot = LLMRouter.routes_snapshot(routes)
+        for route in snapshot.values():
+            if isinstance(route, dict):
+                route["base_url"] = safe_execution_endpoint(route.get("base_url")) or ""
         run.model_routes_json = self._to_json(snapshot)
         self.db.add(run)
         self.db.commit()

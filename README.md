@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/framework-FastAPI-009688?logo=fastapi">
   <img src="https://img.shields.io/badge/db-PostgreSQL%20|%20SQLite-336791">
   <img src="https://img.shields.io/badge/deploy-Docker-2496ED?logo=docker">
-  <img src="https://img.shields.io/badge/version-0.30.0-success">
+  <img src="https://img.shields.io/badge/version-0.31.0-success">
 </p>
 
 ---
@@ -163,6 +163,7 @@ python scripts/agent_eval.py --base-url http://127.0.0.1:8000 \
 
 ## 近期更新
 
+- **v0.31.0** — 跨 API／CLI 对话衔接、真实运行身份、有界上下文与会话互斥；[连续性设计](docs/backend-continuity.md) · [更新日志](changelogs/0.31.0.md)
 - **v0.30.0** — 桌宠记忆小本、明确保存和更正、背景文本编辑与并发保护；[记忆使用说明](docs/companion-memory.md) · [更新日志](changelogs/0.30.0.md)
 - **v0.29.0** — 后台任务与持久事件、断线接回、只读任务历史、幂等提交和精确审批；[运行模块设计](docs/agent-task-lifecycle.md) · [更新日志](changelogs/0.29.0.md)
 - **v0.28.0** — macOS 桌宠、系统语音、状态表情、伙伴会话与记忆审批、API／CLI 后端选择、协作式停止和访问隔离加固；[使用说明](docs/companion.md) · [更新日志](changelogs/0.28.0.md)

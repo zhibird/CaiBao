@@ -1,6 +1,7 @@
 import {initialState, reduceEvent, speechText} from './companion-state.mjs';
 import {CompanionRecovery, runStatusLabel} from './companion-recovery.mjs';
 import {CompanionMemory} from './companion-memory.mjs';
+import {executionSummary} from './companion-execution.mjs';
 
 const $ = id => document.getElementById(id);
 const desktop = new URLSearchParams(location.search).get('desktop') === '1';
@@ -176,6 +177,18 @@ function renderTimeline(container, timeline, status) {
     container.append(line);
   }
 }
+function renderExecution(container, run) {
+  if (!run) {container.replaceChildren(); container.hidden = true; delete container.dataset.execution; return;}
+  const summary = executionSummary(run);
+  const key = JSON.stringify(summary);
+  if (!container.hidden && container.dataset.execution === key) return;
+  container.replaceChildren(); container.hidden = false; container.dataset.execution = key;
+  const heading = document.createElement('div'); heading.className = 'execution-heading';
+  const label = document.createElement('span'); label.className = 'execution-label'; label.textContent = '本次执行';
+  const identity = document.createElement('span'); identity.className = 'execution-identity'; identity.textContent = summary.identity;
+  const context = document.createElement('p'); context.className = 'execution-context'; context.textContent = summary.context;
+  heading.append(label,identity); container.append(heading,context);
+}
 function renderRun(snapshot) {
   currentRun = snapshot.run?.run_id || null;
   if (currentRun) {
@@ -198,6 +211,7 @@ function renderRun(snapshot) {
   setBusy(snapshot.blocked && snapshot.phase !== 'waiting');
   const hint = taskHint(snapshot);
   $('task-status').textContent = hint; $('run-connection').textContent = hint;
+  renderExecution($('run-execution'),snapshot.run);
   $('run-strip').hidden = snapshot.phase === 'idle';
   $('run-strip').dataset.phase = snapshot.phase;
   $('run-reconnect').hidden = !['unknown','reconnecting'].includes(snapshot.phase);
@@ -223,12 +237,15 @@ function renderTaskHistory(items) {
 }
 async function inspectTask(runId) {
   const generation = ++previewGeneration; $('history-preview').hidden = false; $('history-answer').textContent = '正在读取记录…';
+  $('history-title').textContent = '读取任务记录'; $('history-state').textContent = ''; $('history-timeline').replaceChildren(); renderExecution($('history-execution'),null);
   try {
     const preview = await controller.inspect(runId); if (generation !== previewGeneration) return;
     $('history-title').textContent = preview.task;
     $('history-state').textContent = `${runStatusLabel(preview.run.status)} · 只读记录`;
+    renderExecution($('history-execution'),preview.run);
     $('history-answer').textContent = preview.text || (preview.run.status === 'queued' ? '这个任务尚未启动。查看记录不会执行任务。' : '还没有回复，已保留执行记录。');
     renderTimeline($('history-timeline'),preview.timeline,preview.run.status);
+    $('history-preview').scrollIntoView({block:'nearest'});
   } catch (error) {if (generation === previewGeneration) $('history-answer').textContent = error.message;}
 }
 $('history-close').onclick = () => {previewGeneration++; $('history-preview').hidden = true;};
@@ -284,18 +301,18 @@ function renderModelStatus() {
   if ($('backend').value !== 'api') {
     const backend = backends.find(item => item.id === $('backend').value);
     connection(`${backend?.label || 'CLI'} · 使用 CLI 自身登录与工具`,true);
-    $('model-label').textContent = backend?.model || backend?.label || 'CLI'; return;
+    $('model-label').textContent = `下次 · ${backend?.label || 'CLI'} · ${backend?.model || '由 CLI 自选'}`; return;
   }
   const selected = $('model-select').value;
   const demo = !selected && runtimeProfile?.runtime.demo_mode;
   connection(demo ? '演示模式 · 配置模型后即可真实对话' : `已连接 · ${account?.display_name || '彩宝'}`, true);
-  $('model-label').textContent = selected || (demo ? 'DEMO · MOCK MODEL' : runtimeProfile?.runtime.model || 'LOCAL COMPANION');
+  $('model-label').textContent = `下次 · API · ${selected || (demo ? '演示模型' : runtimeProfile?.runtime.model || '默认模型')}`;
 }
 function updateBackend() {
   const selected = backends.find(item => item.id === $('backend').value);
   const cli = selected?.kind === 'cli';
   $('backend-note').textContent = selected?.reason || 'DeepSeek 等 API 模型在工作台中配置。';
-  $('memory-setting-note').textContent = cli ? 'CLI 使用自己的会话与记忆。彩宝不会把记忆卡或背景文本注入 CLI。' : '包括记忆卡与可用的背景文本。关闭后，当前对话的聊天上下文仍然保留。';
+  $('memory-setting-note').textContent = cli ? 'CLI 使用自己的会话；切换后端时，会按本轮记录补充对话。彩宝不会把记忆卡或背景文本注入 CLI。' : '包括记忆卡与可用的背景文本。关闭后，当前对话的聊天上下文仍然保留。';
   if (cli) $('mode').value = 'agent';
   $('mode').disabled = cli; $('memory').disabled = cli; $('model-select').disabled = cli;
   renderModelStatus();

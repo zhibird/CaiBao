@@ -16,7 +16,7 @@ from sqlalchemy.schema import CreateColumn
 from app.db.base import Base
 from app.models import *  # noqa: F401,F403
 
-HEAD_REVISION = "20260531_00"
+HEAD_REVISION = "20260601_00"
 EXPECTED_TABLES = {
     "teams",
     "users",
@@ -196,9 +196,62 @@ def test_migration_removes_legacy_agent_run_required_columns(tmp_path) -> None:
         "request_payload_json",
         "loop_state_json",
         "model_routes_json",
+        "execution_identity_json",
+        "context_snapshot_json",
         "latency_ms",
         "completed_at",
     } <= columns
+
+
+def test_execution_identity_migration_preserves_existing_runs_and_downgrades(tmp_path) -> None:
+    database_url = _sqlite_database_url(tmp_path / "execution-identity.db")
+    config = _make_alembic_config(database_url)
+    command.upgrade(config, "20260531_00")
+    engine = _create_engine(database_url)
+    try:
+        with engine.begin() as connection:
+            connection.execute(text(
+                "INSERT INTO agent_runs (run_id, team_id, user_id, task, request_payload_json) "
+                "VALUES ('existing', 'team', 'user', 'preserved task', '{}')"
+            ))
+        command.upgrade(config, "head")
+        with engine.connect() as connection:
+            row = connection.execute(text(
+                "SELECT task, execution_identity_json, context_snapshot_json FROM agent_runs WHERE run_id = 'existing'"
+            )).one()
+            assert row == ("preserved task", None, None)
+            nullable = {column["name"]: column["nullable"] for column in inspect(connection).get_columns("agent_runs")}
+            assert nullable["execution_identity_json"] and nullable["context_snapshot_json"]
+        command.downgrade(config, "20260531_00")
+        with engine.connect() as connection:
+            columns = {column["name"] for column in inspect(connection).get_columns("agent_runs")}
+            assert not {"execution_identity_json", "context_snapshot_json"} & columns
+            assert connection.execute(text("SELECT task FROM agent_runs WHERE run_id = 'existing'")).scalar_one() == "preserved task"
+        command.upgrade(config, "head")
+        command.upgrade(config, "head")
+        assert _current_revision(database_url) == HEAD_REVISION
+    finally:
+        engine.dispose()
+
+
+def test_execution_identity_bootstrap_and_alembic_upgrade_can_share_columns(tmp_path, monkeypatch) -> None:
+    import app.db.session as session_module
+
+    database_url = _sqlite_database_url(tmp_path / "bootstrapped-identity.db")
+    config = _make_alembic_config(database_url)
+    command.upgrade(config, "20260531_00")
+    engine = _create_engine(database_url)
+    try:
+        monkeypatch.setattr(session_module, "engine", engine)
+        session_module._ensure_phase1_columns()
+        session_module._ensure_phase1_columns()
+        command.upgrade(config, "head")
+        with engine.connect() as connection:
+            columns = {column["name"] for column in inspect(connection).get_columns("agent_runs")}
+        assert {"execution_identity_json", "context_snapshot_json"} <= columns
+        assert _current_revision(database_url) == HEAD_REVISION
+    finally:
+        engine.dispose()
 
 
 def test_auth_migration_adds_auth_tables_and_user_columns(tmp_path) -> None:

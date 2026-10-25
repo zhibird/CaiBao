@@ -32,6 +32,8 @@ dev_mode = false
 
 [agent.context]
 memory_window = 40
+# 正式历史的字符预算，不包含当前任务、角色、检索和 CLI 原生上下文。
+max_chars = 24000
 
 [agent.tools]
 search_enabled = true

@@ -1,6 +1,7 @@
 """Execution lifetime, replay cursors, bounded scheduling and lease recovery."""
 
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
 import json
 import threading
 import time
@@ -75,11 +76,11 @@ def runtime_factory(tmp_path):
         runtimes.append(runtime)
         return runtime
 
-    def queued(*, status="queued", mode="agent_auto", conversation_id=None):
+    def queued(*, status="queued", mode="agent_auto", conversation_id=None, team_id="team", user_id="user"):
         run_id = str(uuid4())
         with sessions() as db:
             db.add(AgentRun(
-                run_id=run_id, team_id="team", user_id="user", status=status,
+                run_id=run_id, team_id=team_id, user_id=user_id, status=status,
                 task="A durable task", conversation_id=conversation_id,
                 request_payload_json=json.dumps({"run_mode": mode}),
             ))
@@ -294,8 +295,11 @@ def test_capacity_is_bounded_and_shutdown_explicitly_fails_queued_jobs(runtime_f
         release.set()
 
 
-@pytest.mark.parametrize("mode", ["codex", " CODEX ", "Claude_Code", " PI "])
-def test_cli_conversation_slot_is_shared_by_servers_and_released(runtime_factory, mode):
+@pytest.mark.parametrize(("mode", "second_mode"), [
+    ("codex", "codex"), (" CODEX ", "agent_auto"), ("Claude_Code", "codex"), (" PI ", "agent_auto"),
+    ("agent_auto", "agent_auto"), ("agent_auto", "codex"), ("agent_plan", "pi"),
+])
+def test_conversation_slot_is_shared_across_servers_and_modes_then_released(runtime_factory, mode, second_mode):
     make, sessions, queued, _ = runtime_factory
     entered, release = threading.Event(), threading.Event()
 
@@ -309,7 +313,7 @@ def test_cli_conversation_slot_is_shared_by_servers_and_released(runtime_factory
 
     active, other = make(slow), make()
     first = queued(mode=mode, conversation_id="shared")
-    second = queued(mode="codex", conversation_id="shared")
+    second = queued(mode=second_mode, conversation_id="shared")
     try:
         active.ensure_started(first)
         assert entered.wait(2)
@@ -326,7 +330,8 @@ def test_cli_conversation_slot_is_shared_by_servers_and_released(runtime_factory
         release.set()
 
 
-def test_expired_cli_slot_waits_for_original_owner_source_cleanup(runtime_factory):
+@pytest.mark.parametrize("second_mode", ["codex", "agent_auto"])
+def test_expired_cli_slot_waits_for_original_owner_source_cleanup(runtime_factory, second_mode):
     make, sessions, queued, _ = runtime_factory
     entered, release = threading.Event(), threading.Event()
     cleanup_entered, cleanup_release = threading.Event(), threading.Event()
@@ -348,7 +353,7 @@ def test_expired_cli_slot_waits_for_original_owner_source_cleanup(runtime_factor
 
     active, other = make(slow), make()
     first = queued(mode="codex", conversation_id="shared")
-    second = queued(mode="codex", conversation_id="shared")
+    second = queued(mode=second_mode, conversation_id="shared")
     try:
         assert active.ensure_started(first)
         assert entered.wait(2)
@@ -398,7 +403,7 @@ def test_cli_approval_cannot_reclaim_workspace_until_cleanup_finished(runtime_fa
         run = db.get(AgentRun, run_id)
         db.add(AgentRunWorker(
             run_id=run_id, owner_id="old-cli-owner", state=state,
-            slot_key=runtime._cli_slot_key(run),
+            slot_key=runtime._conversation_slot_key(run),
             lease_expires_at=datetime.now(timezone.utc) - timedelta(seconds=30),
         ))
         db.commit()
@@ -410,7 +415,8 @@ def test_cli_approval_cannot_reclaim_workspace_until_cleanup_finished(runtime_fa
     assert runtime._futures == {}
 
 
-def test_cli_source_cleanup_failure_keeps_workspace_reserved(runtime_factory):
+@pytest.mark.parametrize("second_mode", ["codex", "agent_auto"])
+def test_cli_source_cleanup_failure_keeps_workspace_reserved(runtime_factory, second_mode):
     make, sessions, queued, _ = runtime_factory
 
     class BrokenSource:
@@ -425,7 +431,7 @@ def test_cli_source_cleanup_failure_keeps_workspace_reserved(runtime_factory):
 
     runtime, other = make(lambda source, run_id: BrokenSource()), make()
     first = queued(mode="codex", conversation_id="shared")
-    second = queued(mode="codex", conversation_id="shared")
+    second = queued(mode=second_mode, conversation_id="shared")
     assert runtime.ensure_started(first)
     _until(lambda: first not in runtime._futures)
     with sessions() as db:
@@ -433,6 +439,217 @@ def test_cli_source_cleanup_failure_keeps_workspace_reserved(runtime_factory):
         assert db.get(AgentRunWorker, first).slot_key is not None
     with pytest.raises(AgentRuntimeBusy, match="conversation"):
         other.ensure_started(second)
+
+
+def test_api_source_cleanup_failure_does_not_reserve_conversation_forever(runtime_factory):
+    make, sessions, queued, _ = runtime_factory
+
+    class BrokenSource:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise RuntimeError("API source failed.")
+
+        def close(self):
+            raise RuntimeError("API source cleanup failed.")
+
+    runtime, other = make(lambda source, run_id: BrokenSource()), make()
+    first = queued(conversation_id="shared")
+    second = queued(mode="codex", conversation_id="shared")
+    assert runtime.ensure_started(first)
+    _until(lambda: first not in runtime._futures)
+    with sessions() as db:
+        assert db.get(AgentRun, first).status == "failed"
+        assert db.get(AgentRunWorker, first).slot_key is None
+    assert other.ensure_started(second)
+    _until(lambda: _worker_state(sessions, second) == "finished")
+
+
+def test_simultaneous_api_and_cli_claims_have_exactly_one_conversation_owner(runtime_factory):
+    make, sessions, queued, _ = runtime_factory
+    barrier = threading.Barrier(3)
+    entered, release = threading.Event(), threading.Event()
+    executed = []
+
+    def execution(source, run_id):
+        executed.append(run_id)
+        entered.set()
+        assert release.wait(4)
+        run = source.db.get(AgentRun, run_id)
+        run.status = "completed"
+        source.db.commit()
+        yield _event(run_id, "run.completed", status="completed")
+
+    api, cli = make(execution), make(execution)
+    first, second = queued(conversation_id="shared"), queued(mode="codex", conversation_id="shared")
+
+    def claim(runtime, run_id):
+        barrier.wait(timeout=2)
+        try:
+            return runtime.ensure_started(run_id)
+        except AgentRuntimeBusy:
+            return "busy"
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as racers:
+            claims = [racers.submit(claim, api, first), racers.submit(claim, cli, second)]
+            barrier.wait(timeout=2)
+            results = [claim.result(timeout=2) for claim in claims]
+        assert results.count(True) == 1
+        assert results.count("busy") == 1
+        assert entered.wait(2)
+        assert len(executed) == 1
+        with sessions() as db:
+            workers = [db.get(AgentRunWorker, run_id) for run_id in (first, second)]
+            assert sum(worker is not None for worker in workers) == 1
+            assert next(worker for worker in workers if worker is not None).slot_key is not None
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("new_mode", ["agent_auto", "codex"])
+def test_expired_api_releases_slot_and_late_cleanup_cannot_unlock_new_owner(runtime_factory, new_mode):
+    make, sessions, queued, _ = runtime_factory
+    old_entered, old_release = threading.Event(), threading.Event()
+    cleanup_entered, cleanup_release = threading.Event(), threading.Event()
+    new_entered, new_release = threading.Event(), threading.Event()
+
+    def stale_api(source, run_id):
+        run = source.db.get(AgentRun, run_id)
+        run.status = "running"
+        source.db.commit()
+        try:
+            yield _event(run_id, "run.started", status="running")
+            old_entered.set()
+            assert old_release.wait(4)
+            yield _event(run_id, "llm.delta", text="Stale API output must be fenced.")
+        finally:
+            cleanup_entered.set()
+            assert cleanup_release.wait(4)
+
+    def new_execution(source, run_id):
+        run = source.db.get(AgentRun, run_id)
+        run.status = "running"
+        source.db.commit()
+        new_entered.set()
+        assert new_release.wait(4)
+        run.status = "completed"
+        source.db.commit()
+        yield _event(run_id, "run.completed", status="completed")
+
+    old, other = make(stale_api), make(new_execution)
+    first = queued(conversation_id="shared")
+    second = queued(mode=new_mode, conversation_id="shared")
+    third = queued(conversation_id="shared")
+    try:
+        assert old.ensure_started(first)
+        assert old_entered.wait(2)
+        old._stop.set()
+        with sessions() as db:
+            worker = db.get(AgentRunWorker, first)
+            worker.lease_expires_at = datetime.now(timezone.utc) - timedelta(seconds=30)
+            db.commit()
+        other.start()
+        with sessions() as db:
+            assert db.get(AgentRun, first).status == "interrupted"
+            assert db.get(AgentRunWorker, first).slot_key is None
+        assert other.ensure_started(second)
+        assert new_entered.wait(2)
+        old_release.set()
+        assert cleanup_entered.wait(2)
+        cleanup_release.set()
+        _until(lambda: first not in old._futures)
+        assert all(event.event != "llm.delta" for event in old.read_events(first))
+        with sessions() as db:
+            assert db.get(AgentRunWorker, second).state == "active"
+            assert db.get(AgentRunWorker, second).slot_key is not None
+        with pytest.raises(AgentRuntimeBusy, match="Another agent task"):
+            old.ensure_started(third)
+    finally:
+        old_release.set()
+        cleanup_release.set()
+        new_release.set()
+
+
+@pytest.mark.parametrize(("confirmation_mode", "active_mode"), [
+    ("codex", "agent_auto"), ("agent_auto", "codex"), ("agent_auto", "agent_auto"),
+])
+def test_confirmation_cannot_reclaim_conversation_occupied_by_another_mode(runtime_factory, confirmation_mode, active_mode):
+    make, sessions, queued, Source = runtime_factory
+    entered, release = threading.Event(), threading.Event()
+    confirmed = []
+
+    def active_execution(source, run_id):
+        entered.set()
+        assert release.wait(4)
+        run = source.db.get(AgentRun, run_id)
+        run.status = "completed"
+        source.db.commit()
+        yield _event(run_id, "run.completed", status="completed")
+
+    class Confirming(Source):
+        def confirm_run(self, *, run_id, **kwargs):
+            confirmed.append(run_id)
+            run = self.db.get(AgentRun, run_id)
+            run.status = "completed"
+            self.db.commit()
+            return _response(self.db, run_id)
+
+    confirming, active = make(), make(active_execution)
+    confirming._service_factory = Confirming
+    pending = queued(status="requires_confirmation", mode=confirmation_mode, conversation_id="shared")
+    busy = queued(mode=active_mode, conversation_id="shared")
+    with sessions() as db:
+        db.add(AgentRunWorker(run_id=pending, owner_id="previous-owner", state="finished", slot_key=None,
+                             lease_expires_at=datetime.now(timezone.utc)))
+        db.commit()
+    try:
+        assert active.ensure_started(busy)
+        assert entered.wait(2)
+        with pytest.raises(AgentRuntimeBusy, match="Another agent task"):
+            confirming.execute_confirmation(run_id=pending, team_id="team", user_id="user")
+        assert confirmed == []
+        with sessions() as db:
+            assert db.get(AgentRun, pending).status == "requires_confirmation"
+            assert db.get(AgentRunWorker, pending).owner_id == "previous-owner"
+        release.set()
+        _until(lambda: _worker_state(sessions, busy) == "finished")
+        assert confirming.execute_confirmation(run_id=pending, team_id="team", user_id="user").status == "completed"
+        assert confirmed == [pending]
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("separate_scope", ["no-conversation", "different-conversation", "different-user", "different-team"])
+def test_conversation_slot_does_not_serialize_unrelated_runs(runtime_factory, separate_scope):
+    make, sessions, queued, _ = runtime_factory
+    entered, release = threading.Event(), threading.Event()
+
+    def active_execution(source, run_id):
+        entered.set()
+        assert release.wait(4)
+        run = source.db.get(AgentRun, run_id)
+        run.status = "completed"
+        source.db.commit()
+        yield _event(run_id, "run.completed", status="completed")
+
+    active, other = make(active_execution), make()
+    first = queued(conversation_id=None if separate_scope == "no-conversation" else "shared")
+    second = queued(
+        mode="codex", conversation_id=None if separate_scope == "no-conversation" else (
+            "different" if separate_scope == "different-conversation" else "shared"
+        ),
+        user_id="other-user" if separate_scope == "different-user" else "user",
+        team_id="other-team" if separate_scope == "different-team" else "team",
+    )
+    try:
+        assert active.ensure_started(first)
+        assert entered.wait(2)
+        assert other.ensure_started(second)
+        _until(lambda: _worker_state(sessions, second) == "finished")
+    finally:
+        release.set()
 
 
 def test_confirmation_reuses_worker_lease_and_preserves_invalid_approval(runtime_factory):

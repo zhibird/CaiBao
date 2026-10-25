@@ -4,6 +4,8 @@ from uuid import uuid4
 
 from app.db.session import SessionLocal
 from app.models.incident import Incident
+from app.models.agent_run_worker import AgentRunWorker
+from app.models.agent_run_event import AgentRunEvent
 from app.services.agent_service import AgentService
 from app.services.llm_service import LLMCompletionResult
 from app.services.persona_prompt import PersonaPromptParts
@@ -176,9 +178,11 @@ def test_agent_messages_include_qqbot_conversation_history() -> None:
     )
 
     assert messages[0] == {"role": "system", "content": "system"}
-    assert messages[1]["role"] == "user"
-    assert "怕上火暴王老菊" in messages[1]["content"]
-    assert messages[2] == {
+    assert messages[1]["role"] == "system"
+    assert "Past conversation" in messages[1]["content"]
+    assert messages[2]["role"] == "user"
+    assert "怕上火暴王老菊" in messages[2]["content"]
+    assert messages[3] == {
         "role": "assistant",
         "content": "最新一期视频是《王老菊教你暴食喷王》。",
     }
@@ -208,6 +212,11 @@ def test_agent_run_plain_question_does_not_call_tools(client) -> None:
     assert body["status"] == "completed"
     assert body["tool_calls"] == []
     assert [step["step_type"] for step in body["steps"]] == ["plan", "retrieval", "final"]
+    with SessionLocal() as db:
+        # The blocking HTTP response shares ownership and replay with the
+        # streaming API; it must not silently bypass the managed execution gate.
+        assert db.get(AgentRunWorker, body["run_id"]).state == "finished"
+        assert db.query(AgentRunEvent).filter_by(run_id=body["run_id"]).count() > 0
 
     history = client.get("/api/v1/chat/history", params={"conversation_id": conversation_id, "limit": 10})
     assert history.status_code == 200

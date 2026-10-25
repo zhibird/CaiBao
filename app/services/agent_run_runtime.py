@@ -127,7 +127,10 @@ class AgentRunRuntime:
                         raise EntityNotFoundError(f"Agent run '{run_id}' not found.")
                     if run.status != "requires_confirmation":
                         raise DomainValidationError("Only runs waiting for confirmation can be confirmed.")
-                    if worker is not None and worker.state != "active" and worker.slot_key is not None:
+                    if (
+                        worker is not None and worker.state != "active"
+                        and worker.slot_key is not None and self._is_cli_run(run)
+                    ):
                         raise AgentRuntimeBusy(
                             "The previous CLI execution has not finished closing; use a new conversation or wait for it to exit."
                         )
@@ -159,7 +162,7 @@ class AgentRunRuntime:
                                 AgentRunWorker.state.in_({"finished", "interrupted"}),
                             ).values(
                                 owner_id=self._owner_id, state="active",
-                                slot_key=self._cli_slot_key(run), lease_expires_at=self._deadline(),
+                                slot_key=self._conversation_slot_key(run), lease_expires_at=self._deadline(),
                             )
                         ).rowcount
                         if not claimed:
@@ -168,17 +171,25 @@ class AgentRunRuntime:
                     else:
                         db.add(AgentRunWorker(
                             run_id=run_id, owner_id=self._owner_id, state="active",
-                            slot_key=self._cli_slot_key(run), lease_expires_at=self._deadline(),
+                            slot_key=self._conversation_slot_key(run), lease_expires_at=self._deadline(),
                         ))
                     db.commit()
                 except IntegrityError as exc:
                     db.rollback()
                     self._slots.release()
                     # A simultaneous request/process can claim the same run.
-                    if db.get(AgentRunWorker, run_id) is not None:
-                        return None
+                    existing = db.get(AgentRunWorker, run_id)
+                    if existing is not None:
+                        # A confirmation already has a finished worker row. Its
+                        # existence alone does not prove that another caller
+                        # claimed this run: another run may own the shared
+                        # conversation slot (including in a different mode).
+                        db.refresh(existing)
+                        db.refresh(run)
+                        if not confirmation or existing.state == "active" or run.status != "requires_confirmation":
+                            return None
                     raise AgentRuntimeBusy(
-                        "Another CLI task is using this conversation; retry this queued run after it finishes."
+                        "Another agent task is using this conversation; retry this run after it finishes."
                     ) from exc
                 except BaseException:
                     self._slots.release()
@@ -196,12 +207,16 @@ class AgentRunRuntime:
             return future
 
     @staticmethod
-    def _cli_slot_key(run: AgentRun) -> str | None:
+    def _is_cli_run(run: AgentRun) -> bool:
         try:
             mode = str(json.loads(run.request_payload_json).get("run_mode", "agent_auto")).strip().lower()
         except (TypeError, ValueError, AttributeError):
-            return None
-        if mode not in CLI_AGENT_MODES or not run.conversation_id:
+            return False
+        return mode in CLI_AGENT_MODES
+
+    @staticmethod
+    def _conversation_slot_key(run: AgentRun) -> str | None:
+        if not run.conversation_id:
             return None
         scope = json.dumps([run.team_id, run.user_id, run.conversation_id])
         return hashlib.sha256(scope.encode()).hexdigest()
@@ -409,6 +424,8 @@ class AgentRunRuntime:
             response = AgentRunResponse(
                 run_id=run_id, team_id=run.team_id, user_id=run.user_id,
                 client_request_id=run.client_request_id,
+                execution_identity=json.loads(run.execution_identity_json) if run.execution_identity_json else None,
+                context_snapshot=json.loads(run.context_snapshot_json) if run.context_snapshot_json else None,
                 conversation_id=run.conversation_id, space_id=run.space_id,
                 app_id=run.app_id, app_version=run.app_version, trigger_channel=run.trigger_channel,
                 task=run.task, status=run.status, answer=run.final_answer, model=run.model,
@@ -422,8 +439,13 @@ class AgentRunRuntime:
 
     def _finish_claim(self, run_id: str, *, release_cli_slot: bool = True) -> None:
         with self._session_factory() as db:
+            run = db.get(AgentRun, run_id)
+            # API calls have no child CLI workspace to drain. Their state/event
+            # fences prevent stale continuations after interruption, so a
+            # failed source cleanup must not lock the conversation forever.
+            release_slot = release_cli_slot or run is None or not self._is_cli_run(run)
             values: dict[str, Any] = {"state": "finished"}
-            if release_cli_slot:
+            if release_slot:
                 values["slot_key"] = None
             finished = db.execute(update(AgentRunWorker).where(
                 AgentRunWorker.run_id == run_id, AgentRunWorker.owner_id == self._owner_id,
@@ -433,7 +455,7 @@ class AgentRunRuntime:
                 # Even if the first error write failed transiently, never seal
                 # a worker while leaving its run permanently queued/running.
                 self._mark_failed(db, run_id, "Agent worker ended before recording a final state.")
-            elif release_cli_slot:
+            elif release_slot:
                 # Lease expiry does not prove that the old CLI process exited.
                 # Only that owner, after its source closes, may free the shared
                 # conversation workspace. A permanently lost owner leaves the
@@ -455,10 +477,17 @@ class AgentRunRuntime:
             )))
             db.rollback()
             for run_id in expired:
+                run = db.get(AgentRun, run_id)
+                values: dict[str, Any] = {"state": "interrupted"}
+                if run is None or not self._is_cli_run(run):
+                    # An API worker can be fenced without owning a persistent
+                    # external CLI process/workspace. Let a new task acquire the
+                    # conversation while the old owner observes interruption.
+                    values["slot_key"] = None
                 changed = db.execute(update(AgentRunWorker).where(
                     AgentRunWorker.run_id == run_id, AgentRunWorker.state == "active",
                     AgentRunWorker.lease_expires_at < now,
-                ).values(state="interrupted")).rowcount
+                ).values(**values)).rowcount
                 if changed:
                     self._mark_failed(
                         db, run_id,

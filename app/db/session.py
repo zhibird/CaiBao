@@ -53,6 +53,8 @@ _AGENT_RUN_CURRENT_COLUMNS = (
     "request_payload_json",
     "loop_state_json",
     "model_routes_json",
+    "execution_identity_json",
+    "context_snapshot_json",
     "latency_ms",
     "created_at",
     "completed_at",
@@ -231,6 +233,8 @@ def _normalize_legacy_agent_runs_table() -> None:
                 request_payload_json TEXT NOT NULL DEFAULT '{}',
                 loop_state_json TEXT,
                 model_routes_json TEXT,
+                execution_identity_json TEXT,
+                context_snapshot_json TEXT,
                 latency_ms INTEGER,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
                 completed_at DATETIME,
@@ -363,6 +367,8 @@ def _ensure_phase1_columns() -> None:
     if "agent_runs" in table_names:
         agent_run_cols = {item["name"] for item in inspector.get_columns("agent_runs")}
         _add_col("agent_runs", "client_request_id", "VARCHAR(64)", agent_run_cols)
+        _add_col("agent_runs", "execution_identity_json", "TEXT", agent_run_cols)
+        _add_col("agent_runs", "context_snapshot_json", "TEXT", agent_run_cols)
         if "app_id" not in agent_run_cols:
             with engine.begin() as conn:
                 conn.exec_driver_sql("ALTER TABLE agent_runs ADD COLUMN app_id VARCHAR(36)")

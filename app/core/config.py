@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -127,7 +127,7 @@ def _load_config_toml_settings() -> dict[str, Any]:
         },
     )
     agent_context = _toml_table(agent.get("context"))
-    _copy_toml_fields(agent_context, settings, {"memory_window": "llm_history_turns"})
+    _copy_toml_fields(agent_context, settings, {"memory_window": "llm_history_turns", "max_chars": "agent_context_max_chars"})
     agent_tools = _toml_table(agent.get("tools"))
     _copy_toml_fields(agent_tools, settings, {"search_enabled": "web_tools_enabled"})
 
@@ -159,7 +159,7 @@ def _load_config_toml_settings() -> dict[str, Any]:
 
 class Settings(BaseSettings):
     app_name: str = "CaiBao"
-    app_version: str = "0.30.0"
+    app_version: str = "0.31.0"
     app_env: str = "dev"
     api_prefix: str = "/api/v1"
     database_url: str
@@ -195,6 +195,7 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 2048
     llm_timeout_seconds: float = 30.0
     llm_history_turns: int = 6
+    agent_context_max_chars: int = Field(default=24000, ge=1000, le=128000)
     llm_history_mode: str = "auto"
 
     embedding_provider: str = "mock"

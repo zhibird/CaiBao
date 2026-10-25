@@ -51,6 +51,8 @@ class AgentRun(Base):
     request_payload_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     loop_state_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     model_routes_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    execution_identity_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    context_snapshot_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

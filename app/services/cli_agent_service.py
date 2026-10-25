@@ -79,27 +79,13 @@ def resolve_cli_workspace(
 
 
 def load_cli_session_id(workdir: Path, runner_name: str) -> str | None:
-    try:
-        data = json.loads((workdir / _SESSION_FILE_NAME).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    value = data.get(runner_name) if isinstance(data, dict) else None
-    return str(value) if value else None
+    from app.services.cli_session_store import load_legacy_cli_session_id
+    return load_legacy_cli_session_id(workdir, runner_name)
 
 
 def save_cli_session_id(workdir: Path, runner_name: str, session_id: str) -> None:
-    path = workdir / _SESSION_FILE_NAME
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    data[runner_name] = session_id
-    try:
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError:
-        pass
+    from app.services.cli_session_store import save_legacy_cli_session_id
+    save_legacy_cli_session_id(workdir, runner_name, session_id)
 
 
 def create_cli_agent_runner(mode: str, settings: Settings) -> "BaseCliAgentRunner":

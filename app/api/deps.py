@@ -529,6 +529,7 @@ def get_agent_service(
         event_bus=get_event_bus(),
         memory_store=_get_memory_store(),
         plugin_manager=get_plugin_manager(),
+        run_runtime=get_agent_run_runtime(),
     )
 
 
