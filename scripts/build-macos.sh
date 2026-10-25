@@ -44,7 +44,9 @@ if ! check_sdk "$SDK_PATH"; then
 fi
 xcrun swiftc -O -sdk "$SDK_PATH" -module-cache-path "$BUILD_ROOT/swift-cache" \
   -target "$(uname -m)-apple-macosx13.0" \
-  -framework AppKit -framework WebKit -framework AVFoundation \
+  -framework AppKit -framework WebKit -framework AVFoundation -framework Speech \
+  "$REPO_ROOT/desktop/macos/NativeListeningController.swift" \
+  "$REPO_ROOT/desktop/macos/AppleSpeechDriver.swift" \
   "$REPO_ROOT/desktop/macos/main.swift" -o "$APP_ROOT/Contents/MacOS/CaiBao"
 cp "$REPO_ROOT/desktop/macos/Info.plist" "$APP_ROOT/Contents/Info.plist"
 # An ad-hoc local signature is enough for running a locally built app.

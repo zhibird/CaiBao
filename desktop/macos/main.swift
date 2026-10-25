@@ -28,6 +28,15 @@ final class CaiBaoApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
     private var activeUtterance: AVSpeechUtterance?
     private var retryItem: NSMenuItem!
     private var hideItem: NSMenuItem!
+    private lazy var listener = NativeListeningController(
+        driver: AppleSpeechDriver(),
+        contextValid: { [weak self] in
+            guard let self else { return false }
+            return self.panel.isVisible && !self.compact && NSApp.isActive && self.trusted(self.webView.url)
+        },
+        stopSpeaking: { [weak self] in self?.stopSpeaking() },
+        emit: { [weak self] detail in self?.emit("caibao-native-listen", detail: detail) }
+    )
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -42,7 +51,14 @@ final class CaiBaoApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
     private func makeWindow() {
         let configuration = WKWebViewConfiguration()
         configuration.userContentController.add(self, name: "caibao")
-        let bootstrap = "window.caibaoNative = {speech: true, recognition: false, compact: true};"
+        // These flags declare bridge support. Device/language availability is
+        // checked only after the user explicitly starts a voice turn.
+        let bootstrap = """
+        window.caibaoNative = {speech: true, recognition: true, onDeviceRecognition: true, compact: true};
+        window.addEventListener('pagehide', function () {
+          window.webkit.messageHandlers.caibao.postMessage({action: 'cancelListening'});
+        });
+        """
         configuration.userContentController.addUserScript(WKUserScript(source: bootstrap, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = self
@@ -130,9 +146,15 @@ final class CaiBaoApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    @objc private func hideCompanion() { panel.orderOut(nil) }
+    @objc private func hideCompanion() {
+        listener.cancel(reason: "hide")
+        stopSpeaking()
+        panel.orderOut(nil)
+    }
     @objc private func openWorkbench() { NSWorkspace.shared.open(serviceURL) }
     @objc private func reconnect() {
+        listener.cancel(reason: "reconnect")
+        stopSpeaking()
         showingConnectionError = false
         webView.load(URLRequest(url: companionURL, cachePolicy: .reloadIgnoringLocalCacheData))
     }
@@ -144,13 +166,18 @@ final class CaiBaoApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
             emit("caibao-native-speech", detail: ["state": "end", "text": interrupted.speechString])
         }
     }
-    @objc private func quit() { stopSpeaking(); NSApp.terminate(nil) }
+    @objc private func quit() {
+        listener.cancel(reason: "quit")
+        stopSpeaking()
+        NSApp.terminate(nil)
+    }
 
     private func desiredSize(compact: Bool) -> NSSize {
         NSSize(width: compact ? 300 : 440, height: compact ? 340 : 740)
     }
 
     private func setCompact(_ value: Bool) {
+        if value { listener.cancel(reason: "compact"); stopSpeaking() }
         compact = value
         let old = panel.frame
         let visible = (panel.screen ?? NSScreen.main)?.visibleFrame ?? old
@@ -175,6 +202,7 @@ final class CaiBaoApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
               let body = message.body as? [String: Any], let action = body["action"] as? String else { return }
         switch action {
         case "speak":
+            guard !listener.isActive else { return }
             guard let raw = body["text"] as? String else { return }
             let text = String(raw.trimmingCharacters(in: .whitespacesAndNewlines).prefix(4000))
             guard !text.isEmpty else { return }
@@ -198,7 +226,15 @@ final class CaiBaoApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
         case "hide": hideCompanion()
         case "quit": quit()
         case "openWorkbench": openWorkbench()
-        case "listen": emit("caibao-native-listen", detail: ["available": false, "reason": "browser-fallback"])
+        case "startListening":
+            guard let turnID = body["turn_id"] as? String,
+                  let language = body["lang"] as? String else { return }
+            listener.start(turnID: turnID, language: language)
+        case "finishListening":
+            guard let turnID = body["turn_id"] as? String else { return }
+            listener.finish(turnID: turnID)
+        case "cancelListening":
+            listener.cancel(turnID: body["turn_id"] as? String, reason: "user")
         default: break
         }
     }
@@ -212,6 +248,10 @@ final class CaiBaoApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        if navigationAction.targetFrame?.isMainFrame != false {
+            listener.cancel(reason: "navigation")
+            stopSpeaking()
+        }
         // Never load a remote site into a web view with native speech and window controls.
         guard let url = navigationAction.request.url else { decisionHandler(.cancel); return }
         if trusted(url) || (showingConnectionError && url.absoluteString == "about:blank") {
@@ -225,12 +265,22 @@ final class CaiBaoApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        emit("caibao-native-ready", detail: ["compact": compact, "speech": true, "recognition": false])
+        emit("caibao-native-ready", detail: ["compact": compact, "speech": true, "recognition": true, "onDeviceRecognition": true])
         emit("caibao-native-mode", detail: ["compact": compact])
     }
 
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { showConnectionError(error) }
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { showConnectionError(error) }
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        listener.cancel(reason: "navigation")
+        stopSpeaking()
+    }
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        listener.cancel(reason: "navigation")
+        showConnectionError(error)
+    }
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        listener.cancel(reason: "navigation")
+        showConnectionError(error)
+    }
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) { reconnect() }
 
     private func showConnectionError(_ error: Error) {
@@ -260,7 +310,18 @@ final class CaiBaoApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
 
     func windowShouldClose(_ sender: NSWindow) -> Bool { hideCompanion(); return false }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
-    func applicationWillTerminate(_ notification: Notification) { speaker.stopSpeaking(at: .immediate) }
+    func applicationDidResignActive(_ notification: Notification) {
+        listener.cancel(reason: "inactive")
+        stopSpeaking()
+    }
+    func applicationDidHide(_ notification: Notification) {
+        listener.cancel(reason: "hide")
+        stopSpeaking()
+    }
+    func applicationWillTerminate(_ notification: Notification) {
+        listener.cancel(reason: "quit")
+        speaker.stopSpeaking(at: .immediate)
+    }
 }
 
 let application = NSApplication.shared

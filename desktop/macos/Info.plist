@@ -6,10 +6,12 @@
     <key>CFBundleDisplayName</key><string>彩宝</string>
     <key>CFBundleExecutable</key><string>CaiBao</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.31.0</string>
-    <key>CFBundleVersion</key><string>31</string>
+    <key>CFBundleShortVersionString</key><string>0.32.0</string>
+    <key>CFBundleVersion</key><string>32</string>
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSMicrophoneUsageDescription</key><string>仅在你点击语音输入时，彩宝会短暂使用麦克风，在本机转成聊天草稿；你确认后才发送。</string>
+    <key>NSSpeechRecognitionUsageDescription</key><string>彩宝只使用设备端语音识别，把你主动录入的语音转成可编辑草稿；设备不支持时会停止，不会改用联网识别。</string>
     <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
 </dict></plist>

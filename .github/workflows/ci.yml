@@ -65,7 +65,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Validate launcher scripts
-        run: bash -n scripts/build-macos.sh scripts/run-local.sh scripts/run-macos.sh
+        run: bash -n scripts/build-macos.sh scripts/run-local.sh scripts/run-macos.sh scripts/test-macos-voice.sh
+      - name: Test native voice lifecycle without devices or permission prompts
+        run: ./scripts/test-macos-voice.sh
       - name: Compile and sign native companion
         run: ./scripts/build-macos.sh
       - name: Validate app bundle and local signature

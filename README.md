@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/framework-FastAPI-009688?logo=fastapi">
   <img src="https://img.shields.io/badge/db-PostgreSQL%20|%20SQLite-336791">
   <img src="https://img.shields.io/badge/deploy-Docker-2496ED?logo=docker">
-  <img src="https://img.shields.io/badge/version-0.31.0-success">
+  <img src="https://img.shields.io/badge/version-0.32.0-success">
 </p>
 
 ---
@@ -24,7 +24,7 @@
 CaiBao（彩宝）是一只住在桌面上的薄荷绿小猫，也是一个可使用工具、记忆和知识库的 AI Agent。macOS 桌宠提供陪伴、系统朗读和任务表情；完整工作台保留模型、Agent App 与工具管理。两种界面共用同一套真实运行记录和权限边界。
 
 - 🐾 **macOS 桌宠** — 原创动态角色、透明置顶、拖动、摸头、休息、可见的隐藏／退出按钮
-- 🗣️ **设备语音** — 系统声音朗读，嘴型跟随播放，支持停止朗读
+- 🗣️ **设备语音** — macOS 点击说话、设备端识别、草稿确认；系统声音朗读与嘴型跟随
 - 🔀 **可切换大脑** — DeepSeek 等兼容 API，或本机 Codex / Claude Code / Pi CLI；不静默替换后端
 - ⏸️ **可控执行** — API 任务可停止后续步骤，记忆写入逐项审批，个人上下文按访问权限隔离
 
@@ -163,6 +163,7 @@ python scripts/agent_eval.py --base-url http://127.0.0.1:8000 \
 
 ## 近期更新
 
+- **v0.32.0** — 原生设备端语音回合，识别先进入草稿，确认发送后再执行；[语音说明](docs/companion-voice.md) · [更新日志](changelogs/0.32.0.md)
 - **v0.31.0** — 跨 API／CLI 对话衔接、真实运行身份、有界上下文与会话互斥；[连续性设计](docs/backend-continuity.md) · [更新日志](changelogs/0.31.0.md)
 - **v0.30.0** — 桌宠记忆小本、明确保存和更正、背景文本编辑与并发保护；[记忆使用说明](docs/companion-memory.md) · [更新日志](changelogs/0.30.0.md)
 - **v0.29.0** — 后台任务与持久事件、断线接回、只读任务历史、幂等提交和精确审批；[运行模块设计](docs/agent-task-lifecycle.md) · [更新日志](changelogs/0.29.0.md)
